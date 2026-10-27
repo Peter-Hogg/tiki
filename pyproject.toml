@@ -1,0 +1,30 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "napari-tiki"
+version = "0.0.1"
+description = "TIKI Is Kinda ImageJ: an ImageJ-style toolbar that drives napari windows"
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [{ name = "Peter Hogg", email = "peterhogg@fas.harvard.edu" }]
+dependencies = [
+    "napari[pyqt6]>=0.5",
+    "numpy",
+    "tifffile",
+    "scikit-image",
+    "matplotlib",
+]
+
+[project.optional-dependencies]
+test = ["pytest", "pytest-qt"]
+
+[project.scripts]
+tiki = "tiki.__main__:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/tiki"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
