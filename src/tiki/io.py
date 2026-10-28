@@ -11,6 +11,33 @@ import tifffile
 from . import axes as axes_mod
 
 OPEN_FILTER = 'Images (*.tif *.tiff *.npy *.png *.jpg);;All files (*)'
+IMAGE_SUFFIXES = {'.tif', '.tiff', '.npy', '.png', '.jpg', '.jpeg'}
+ROI_SUFFIXES = {'.roi', '.zip'}
+MACRO_SUFFIXES = {'.py'}
+
+
+def sort_dropped(paths) -> dict[str, list[Path]]:
+    """Sort dropped paths into images, ROI files, macros and anything unsupported.
+
+    A folder contributes its image files (not recursive), sorted by name, as
+    ImageJ does when a folder is dropped on its toolbar.
+    """
+    out: dict[str, list[Path]] = {'images': [], 'rois': [], 'macros': [], 'skipped': []}
+    for raw in paths:
+        p = Path(raw)
+        if p.is_dir():
+            out['images'] += sorted(f for f in p.iterdir() if f.is_file() and f.suffix.lower() in IMAGE_SUFFIXES)
+            continue
+        suffix = p.suffix.lower()
+        if suffix in IMAGE_SUFFIXES:
+            out['images'].append(p)
+        elif suffix in ROI_SUFFIXES:
+            out['rois'].append(p)
+        elif suffix in MACRO_SUFFIXES:
+            out['macros'].append(p)
+        else:
+            out['skipped'].append(p)
+    return out
 
 
 def _axes_without_metadata(path: Path, shape: tuple, rgb: bool = False) -> axes_mod.AxesInfo:

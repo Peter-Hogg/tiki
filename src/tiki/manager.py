@@ -21,6 +21,7 @@ class WindowManager(QObject):
     windows_changed = Signal()
     cursor_moved = Signal(object, object)  # viewer, world position
     ndisplay_changed = Signal(object)  # viewer switched between 2D and 3D
+    files_dropped = Signal(list)  # local paths dropped on an image window
 
     def __init__(self, reserved_shortcuts: list[str] | None = None):
         super().__init__()
@@ -140,6 +141,9 @@ class WindowManager(QObject):
         self.viewers.append(viewer)
         qwin = viewer.window._qt_window
         qwin.installEventFilter(self)
+        # napari would add dropped files as layers of this window (skipping
+        # TIKI's axis reading); route drops to TIKI instead, as ImageJ does.
+        viewer.window._qt_viewer.installEventFilter(self)
         self._strip_shortcuts(viewer)
         # napari rebuilds menus lazily; strip again once the window settles.
         QTimer.singleShot(0, lambda: self._strip_shortcuts(viewer))
@@ -187,6 +191,15 @@ class WindowManager(QObject):
 
     def eventFilter(self, obj, event):
         etype = event.type()
+        if etype in (QEvent.DragEnter, QEvent.DragMove) and event.mimeData().hasUrls():
+            event.acceptProposedAction()
+            return True
+        if etype == QEvent.Drop and event.mimeData().hasUrls():
+            paths = [u.toLocalFile() for u in event.mimeData().urls() if u.isLocalFile()]
+            event.acceptProposedAction()
+            if paths:
+                self.files_dropped.emit(paths)
+            return True
         if etype == QEvent.WindowActivate:
             viewer = self.viewer_for_window(obj)
             if viewer is not None:

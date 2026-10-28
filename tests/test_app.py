@@ -743,3 +743,63 @@ def test_correlation_image_and_negative_offset_traces(tiki, accept_dialogs):
     assert win.offset.value() < -250  # pre-set to the data minimum
     win.dff.setChecked(True)
     assert np.nanmax(win.traces) > 0.5  # transients point up, not down
+
+
+# ------------------------------------------------------------ drag & drop
+
+def _drop(widget, paths):
+    from qtpy.QtCore import QMimeData, QPointF, Qt, QUrl
+    from qtpy.QtGui import QDragEnterEvent, QDropEvent
+    from qtpy.QtWidgets import QApplication
+
+    mime = QMimeData()
+    mime.setUrls([QUrl.fromLocalFile(str(p)) for p in paths])
+    pos = QPointF(10, 10)
+    enter = QDragEnterEvent(pos.toPoint(), Qt.CopyAction, mime, Qt.LeftButton, Qt.NoModifier)
+    QApplication.sendEvent(widget, enter)
+    drop = QDropEvent(pos, Qt.CopyAction, mime, Qt.LeftButton, Qt.NoModifier)
+    QApplication.sendEvent(widget, drop)
+    return enter, drop
+
+
+def test_drop_files_folder_rois_macro_on_toolbar(tiki, tmp_path, monkeypatch):
+    from tiki import macros, recent
+    from tiki import rois as R
+
+    monkeypatch.setattr(recent, 'RECENT_FILE', tmp_path / 'recent.json')
+    folder = tmp_path / 'stack'
+    folder.mkdir()
+    for k in range(2):
+        np.save(folder / f'img{k}.npy', np.zeros((4, 4)))
+    (folder / 'notes.txt').write_text('ignored in folders')
+    single = tmp_path / 'single.npy'
+    np.save(single, np.ones((5, 5)))
+    roi_zip = tmp_path / 'RoiSet.zip'
+    R.save_imagej(roi_zip, [R.Roi('a', 'rectangle', np.array([[0.5, 0.5], [0.5, 2.5], [2.5, 2.5], [2.5, 0.5]]))])
+    macro = tmp_path / 'hello.py'
+    macro.write_text("print('hi')")
+    reported = []
+    monkeypatch.setattr(tiki, 'report', lambda *a, **k: reported.append(a))
+    enter, drop = _drop(tiki, [single, folder, roi_zip, macro, tmp_path / 'data.csv'])
+    assert enter.isAccepted()
+    titles = [v.title for v in tiki.windows.viewers]
+    assert titles == ['single.npy', 'img0.npy', 'img1.npy']
+    assert [r.name for r in tiki.roi_manager.rois] == ['a']
+    assert any(isinstance(w, macros.MacroEditor) and w.path == macro for w in tiki.profiles)
+    assert reported and 'data.csv' in reported[0][1]
+
+
+def test_drop_on_image_window_opens_new_window_not_layer(tiki, tmp_path, monkeypatch):
+    import tifffile
+
+    from tiki import recent
+
+    monkeypatch.setattr(recent, 'RECENT_FILE', tmp_path / 'recent.json')
+    v = tiki.open_data(np.zeros((8, 8)), 'first')
+    movie = tmp_path / 'movie.tif'
+    tifffile.imwrite(movie, np.zeros((10, 8, 8), np.uint16), imagej=True, metadata={'axes': 'TYX', 'finterval': 0.1})
+    n_layers = len(v.layers)
+    _drop(v.window._qt_viewer, [movie])
+    assert len(v.layers) == n_layers  # napari did not add it as a layer
+    new = tiki.windows.viewers[-1]
+    assert new.title == 'movie.tif' and new.dims.axis_labels[0] == 't'  # TIKI read its axes

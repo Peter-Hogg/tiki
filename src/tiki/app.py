@@ -97,6 +97,7 @@ class Tiki(QMainWindow):
         self.windows.active_changed.connect(self._on_active_changed)
         self.windows.cursor_moved.connect(self._on_cursor)
         self.windows.ndisplay_changed.connect(self._on_ndisplay)
+        self.windows.files_dropped.connect(self.open_dropped)
         self._build_toolbar()
         self.status('TIKI Is Kinda ImageJ — File ▸ Open or drop an image here')
 
@@ -1154,12 +1155,39 @@ class Tiki(QMainWindow):
     # ------------------------------------------------------------ Qt events
 
     def dragEnterEvent(self, event):
-        if event.mimeData().hasUrls():
-            event.acceptProposedAction()
+        paths = [u.toLocalFile() for u in event.mimeData().urls() if u.isLocalFile()]
+        if not paths:
+            return
+        event.acceptProposedAction()
+        kinds = io.sort_dropped(paths)
+        parts = [f'{len(v)} {k[:-1] if len(v) == 1 else k}' for k, v in kinds.items() if v and k != 'skipped']
+        self.status('Drop to open ' + (', '.join(parts) if parts else 'nothing TIKI can read'), hold=False)
+
+    def dragLeaveEvent(self, event):
+        self.status('', hold=False)
 
     def dropEvent(self, event):
         paths = [u.toLocalFile() for u in event.mimeData().urls() if u.isLocalFile()]
-        self._run('Open', lambda: self.open_paths(paths))
+        event.acceptProposedAction()
+        self.open_dropped(paths)
+
+    def open_dropped(self, paths) -> None:
+        """Open whatever was dropped, ImageJ-style: images (and folders of images)
+        in new windows, .roi/.zip into the ROI Manager, .py macros in the editor."""
+        self.raise_()
+        kinds = io.sort_dropped(paths)
+        if kinds['images']:
+            self._run('Open', lambda: self.open_paths([str(p) for p in kinds['images']]))
+        for p in kinds['rois']:
+            self._run('Open ROIs', lambda p=p: self.show_roi_manager().open(str(p)))
+        for p in kinds['macros']:
+            self._run('Open Macro', lambda p=p: self.new_macro(str(p)))
+        if kinds['skipped']:
+            names = ', '.join(p.name for p in kinds['skipped'][:5])
+            self.report('Open', f'TIKI cannot open: {names}\n\nSupported: images (.tif, .tiff, .npy, .png, '
+                        '.jpg), folders of images, ImageJ ROIs (.roi, .zip) and macros (.py).')
+        if not any(kinds.values()):
+            self.status('Nothing to open')
 
     def closeEvent(self, event):
         self.windows.close_all()
