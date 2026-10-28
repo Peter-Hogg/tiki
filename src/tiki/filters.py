@@ -22,7 +22,7 @@ from qtpy.QtWidgets import (
 )
 
 from . import axes as axes_mod
-from . import ops, style
+from . import nd, ops, style
 from . import roi as roi_mod
 
 PREVIEW_NAME = 'filter preview'
@@ -47,10 +47,12 @@ class FilterSpec:
     params: list[Param]
     flags: list[tuple[str, str, bool]]  # (key, label, default)
     func: object  # func(plane, **values) -> plane
+    func3d: object = None  # func(volume, z_ratio, **values) -> volume, if it can work through Z
 
     def name_suffix(self, values: dict) -> str:
         parts = [f'{p.key}={values[p.key]:g}' for p in self.params]
         parts += [k for k, _, _ in self.flags if values.get(k)]
+        parts += ['3D'] if values.get('3D') else []
         return f'{self.short} ' + ' '.join(parts)
 
 
@@ -59,11 +61,13 @@ FILTERS = {
         'Gaussian Blur', 'gauss',
         [Param('sigma', 'Sigma (radius):', 2.0, 0.1, 100, 0.5, 2, ' px')], [],
         lambda plane, sigma: ops.gaussian_blur(plane, sigma),
+        lambda vol, z_ratio, sigma: ops.gaussian_3d(vol, sigma, z_ratio),
     ),
     'median': FilterSpec(
         'Median', 'median',
         [Param('radius', 'Radius:', 2.0, 0.5, 50, 0.5, 1, ' px')], [],
         lambda plane, radius: ops.median_filter(plane, radius),
+        lambda vol, z_ratio, radius: ops.median_3d(vol, radius, z_ratio),
     ),
     'background': FilterSpec(
         'Subtract Background', 'bgsub',
@@ -74,14 +78,29 @@ FILTERS = {
 }
 
 
+def z_ratio(image) -> float:
+    """x/y pixel size divided by z step (1 if either is unknown)."""
+    info = axes_mod.get(image)
+    z, y = info.index('Z'), info.index('Y')
+    if z is None or y is None:
+        return 1.0
+    sz, sy = info.axes[z].step, info.axes[y].step
+    return float(sy / sz) if sz and sy else 1.0
+
+
 class FilterDialog(QDialog):
     def __init__(self, tiki, key: str, viewer, image):
+        from .layer_select import LayerCombo
+
         super().__init__(tiki)
         style.apply(self)
         self.tiki, self.spec, self.viewer, self.image = tiki, FILTERS[key], viewer, image
         self.preview: Image | None = None
-        self.setWindowTitle(f'{self.spec.title} — {image.name}')
+        self.setWindowTitle(self.spec.title)
         form = QFormLayout(self)
+        self.image_box = LayerCombo(viewer, Image, current=image)
+        self.image_box.layer_changed.connect(self._set_image)
+        form.addRow('Image:', self.image_box)
         self.inputs: dict[str, object] = {}
         for p in self.spec.params:
             spin = QDoubleSpinBox()
@@ -99,11 +118,12 @@ class FilterDialog(QDialog):
             box.toggled.connect(lambda _: self.schedule())
             form.addRow(box)
             self.inputs[k] = box
+        self.three_d = QCheckBox('3D (filter through Z, scaled by voxel size)', checked=True)
+        self.three_d.toggled.connect(lambda _: self.schedule())
+        form.addRow(self.three_d)
         self.whole_stack = QCheckBox('Process whole stack', checked=True)
-        if image.ndim > 2:
-            n = int(np.prod(image.data.shape[: image.ndim - 2]))
-            self.whole_stack.setText(f'Process whole stack ({n} planes)')
-            form.addRow(self.whole_stack)
+        form.addRow(self.whole_stack)
+        self._update_options()
         self.show_preview = QCheckBox('Preview', checked=True)
         self.show_preview.toggled.connect(lambda on: self.update_preview() if on else self._remove_preview())
         form.addRow(self.show_preview)
@@ -119,6 +139,31 @@ class FilterDialog(QDialog):
         viewer.dims.events.current_step.connect(self.schedule)
         self.update_preview()
 
+    def _update_options(self) -> None:
+        info = axes_mod.get(self.image)
+        # availability is stored, not read back from widget visibility (a closed
+        # dialog reports every widget as hidden)
+        self.has_z = info.index('Z') is not None and self.spec.func3d is not None
+        self.three_d.setVisible(self.has_z)
+        n = int(np.prod(self.image.data.shape[: self.image.ndim - 2])) if self.image.ndim > 2 else 0
+        self.has_stack = n > 0
+        self.whole_stack.setVisible(self.has_stack)
+        self.whole_stack.setText(f'Process whole stack ({n} planes)')
+
+    def _set_image(self, image) -> None:
+        if image is None or image is self.image:
+            return
+        self._remove_preview()
+        self.image = image
+        self._update_options()
+        self.schedule()
+
+    def use_3d(self) -> bool:
+        return self.has_z and self.three_d.isChecked()
+
+    def use_whole_stack(self) -> bool:
+        return self.has_stack and self.whole_stack.isChecked()
+
     def values(self) -> dict:
         out = {}
         for k, w in self.inputs.items():
@@ -132,8 +177,17 @@ class FilterDialog(QDialog):
     def update_preview(self) -> None:
         if not self.show_preview.isChecked():
             return
-        plane = roi_mod.current_plane(self.viewer, self.image)
-        result = self.spec.func(plane, **self.values())
+        if self.use_3d():  # filter the current volume, show the current slice of it
+            info = axes_mod.get(self.image)
+            shape = self.image.data.shape[: self.image.ndim]
+            index = roi_mod.current_index(self.viewer, self.image)
+            (block,) = nd.blocks(info, shape, index, nd.VOLUME, True) if len(info.axes) > 3 else \
+                [(slice(None), slice(None), slice(None))]
+            vol = self.spec.func3d(np.asarray(self.image.data[block]), z_ratio(self.image), **self.values())
+            result = vol[index[info.index('Z')]]
+        else:
+            plane = roi_mod.current_plane(self.viewer, self.image)
+            result = self.spec.func(plane, **self.values())
         lo, hi = ops.saturated_limits(result)
         if self.preview is None or self.preview not in self.viewer.layers:
             self.preview = Image(result, name=PREVIEW_NAME, colormap=self.image.colormap,
@@ -159,25 +213,39 @@ class FilterDialog(QDialog):
         super().done(result)
 
 
-def run_filter(tiki, key: str, viewer, image, values: dict, whole_stack: bool = True) -> Image | None:
+def run_filter(tiki, key: str, viewer, image, values: dict, whole_stack: bool = True,
+               three_d: bool = False) -> Image | None:
     """Filter ``image`` and add the result as a new layer; returns it (None if cancelled)."""
     spec = FILTERS[key]
-    func = lambda plane: spec.func(plane, **values)  # noqa: E731
-    if image.ndim > 2 and whole_stack:
-        data = image.data
-        if image.rgb:
-            from .app import TikiError
+    info = axes_mod.get(image)
+    three_d = three_d and spec.func3d is not None and info.index('Z') is not None
+    if image.rgb and image.ndim > 2:
+        from .app import TikiError
 
-            raise TikiError('filters on RGB stacks are not supported yet')
-        with tiki.progress(spec.title, int(np.prod(data.shape[:-2]))) as tick:
-            result = ops.map_planes(func, data, progress=tick)
+        raise TikiError('filters on RGB stacks are not supported yet')
+    shape = tuple(image.data.shape[: image.ndim])
+    index = roi_mod.current_index(viewer, image)
+    if image.ndim > 2 and (whole_stack or three_d):
+        if three_d:
+            ratio = z_ratio(image)
+            func = lambda vol: spec.func3d(vol, ratio, **values)  # noqa: E731
+            blocks = nd.blocks(info, shape, index, nd.WHOLE if whole_stack else nd.VOLUME, True)
+        else:
+            func = lambda plane: spec.func(plane, **values)  # noqa: E731
+            blocks = nd.blocks(info, shape, index, nd.WHOLE, False)
+        with tiki.progress(spec.title, len(blocks)) as tick:
+            result = ops.map_blocks(func, image.data, blocks, progress=tick)
         if tick.cancelled:
             tiki.status(f'{spec.title} cancelled')
             return None
-        geometry = axes_mod.geometry(image)
+        if not whole_stack:  # only the current volume was filtered: keep just that volume
+            result = result[blocks[0]]
+        geometry = axes_mod.geometry(image) if result.ndim == image.ndim else axes_mod.geometry(image, ndim=3)
     else:
-        result = func(roi_mod.current_plane(viewer, image))
+        result = spec.func(roi_mod.current_plane(viewer, image), **values)
         geometry = axes_mod.geometry(image, ndim=2)
+    if three_d:
+        values = values | {'3D': True}
     lo, hi = ops.saturated_limits(result if result.ndim == 2 else result[(0,) * (result.ndim - 2)])
     info = axes_mod.get(image) if result.ndim == image.ndim else axes_mod.guess(result.shape)
     layer = Image(result, name=f'{image.name} {spec.name_suffix(values)}', colormap=image.colormap,

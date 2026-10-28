@@ -277,7 +277,8 @@ def test_traces_from_labels_and_dff(tiki):
     v = tiki.open_data(movie, 'cells.tif')
     tiki.threshold()
     tiki.threshold_window._set_range(140, 1000)
-    tiki.threshold_window.whole_stack.setChecked(False)
+    w = tiki.threshold_window
+    w.scope.setCurrentIndex(w.scope.findData('plane'))
     tiki.threshold_window.apply()
     tiki.traces_from_labels()
     win = tiki.traces[-1]
@@ -473,3 +474,87 @@ def test_calibrated_image_is_framed_by_camera(tiki, hyperstack):
     (lo, hi) = image.extent.world
     centre = (np.asarray(lo[-2:]) + np.asarray(hi[-2:])) / 2
     np.testing.assert_allclose(v.camera.center[-2:], centre, atol=0.5)  # in µm, not pixels
+
+
+# ------------------------------------------------------- 3D threshold etc.
+
+def _sphere_movie(nt=3):
+    from test_ops import _spheres
+
+    return np.stack([_spheres() for _ in range(nt)])  # T, Z, Y, X
+
+
+def _open_with_axes(tiki, data, roles, name, steps=None):
+    from tiki import axes
+
+    info = axes.AxesInfo([axes.Axis(r, n, (steps or {}).get(r), 'µm' if (steps or {}).get(r) else None)
+                          for r, n in zip(roles, data.shape)], 'test', True)
+    return tiki.open_data(data, name, axes=info)
+
+
+def test_threshold_zstack_3d_objects(tiki):
+    from test_ops import _spheres
+
+    v = _open_with_axes(tiki, _spheres(), 'ZYX', 'zstack.tif', {'Z': 2.0, 'Y': 0.5, 'X': 0.5})
+    tiki.threshold()
+    w = tiki.threshold_window
+    assert [w.scope.itemData(i) for i in range(w.scope.count())] == ['plane', 'whole']
+    assert w.scope.currentData() == 'whole' and w.connect_z.isVisible()
+    w._set_range(500, 1000)
+    layer = w.apply()
+    assert layer.data.shape == (20, 40, 40) and len(np.unique(layer.data)) == 3  # bg + 2 spheres
+    assert '3D labels' in layer.name
+    n = tiki.particles(v, v.layers['zstack.tif'], layer, scope='whole', three_d=True)
+    assert n == 2 and 'Volume' in tiki.results.columns and 'Z' in tiki.results.columns
+
+
+def test_threshold_movie_volume_and_whole_unique_ids(tiki):
+    v = _open_with_axes(tiki, _sphere_movie(), 'TZYX', 'tzyx.tif')
+    tiki.threshold()
+    w = tiki.threshold_window
+    assert w.scope.currentData() == 'volume'
+    w._set_range(500, 1000)
+    vol = w.apply()
+    assert vol.data.shape == (20, 40, 40) and vol.data.max() == 2
+    tiki.threshold()
+    w.scope.setCurrentIndex(w.scope.findData('whole'))
+    w._set_range(500, 1000)
+    whole = w.apply()
+    assert whole.data.shape == (3, 20, 40, 40)
+    assert len(np.unique(whole.data)) == 1 + 3 * 2  # 2 objects per t, unique ids
+    w.connect_z.setChecked(False)
+    w._set_range(500, 1000)
+    flat = w.apply()
+    assert flat.data.max() > 6  # per-plane objects
+
+
+def test_threshold_image_dropdown_and_channel_gate(tiki, hyperstack):
+    path, data = hyperstack
+    tiki.open_paths([str(path)])
+    v = tiki.windows.active
+    tiki.threshold()
+    w = tiki.threshold_window
+    assert w.note_widget.isVisibleTo(w) and not w.action_buttons[1].isEnabled()
+    w._split_channels()
+    names = [w.image_box.itemText(i) for i in range(w.image_box.count())]
+    assert names == [f'C1-{path.name}', f'C2-{path.name}']
+    w.image_box.setCurrentIndex(1)
+    assert w.image.name == f'C2-{path.name}' and w.action_buttons[1].isEnabled()
+    w._set_range(900, 2000)
+    layer = w.apply()
+    assert layer.data.ndim in (3, 4)
+
+
+def test_filter_3d_option(tiki):
+    from test_ops import _spheres
+    from tiki.filters import FilterDialog, run_filter
+
+    v = _open_with_axes(tiki, _spheres().astype(np.float32), 'ZYX', 'z.tif', {'Z': 2.0, 'Y': 0.5, 'X': 0.5})
+    image = v.layers['z.tif']
+    dlg = FilterDialog(tiki, 'gaussian', v, image)
+    assert dlg.has_z and dlg.use_3d()
+    dlg.reject()
+    flat = run_filter(tiki, 'gaussian', v, image, {'sigma': 2}, whole_stack=True, three_d=False)
+    deep = run_filter(tiki, 'gaussian', v, image, {'sigma': 2}, whole_stack=True, three_d=True)
+    assert flat.data.shape == deep.data.shape == image.data.shape
+    assert not np.allclose(flat.data, deep.data) and '3D' in deep.name

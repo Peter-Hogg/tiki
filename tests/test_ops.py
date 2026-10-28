@@ -122,3 +122,54 @@ def test_filters_shapes_and_background():
     assert ops.median_filter(spot, 2).shape == spot.shape
     stack = ops.map_planes(lambda p: ops.median_filter(p, 1), np.stack([spot, spot]))
     assert stack.shape == (2, 64, 64)
+
+
+def _spheres(shape=(20, 40, 40), centres=((6, 10, 10), (13, 28, 28)), r=4):
+    zz, yy, xx = np.ogrid[: shape[0], : shape[1], : shape[2]]
+    vol = np.full(shape, 100, np.uint16)
+    for cz, cy, cx in centres:
+        vol[(zz - cz) ** 2 + (yy - cy) ** 2 + (xx - cx) ** 2 <= r * r] = 1000
+    return vol
+
+
+def test_segment_connects_through_z_only_in_3d():
+    vol = _spheres()
+    labels3d = ops.segment(vol, 500, 2000, split=True)
+    assert labels3d.max() == 2  # two spheres = two 3D objects
+    planes = [(k, slice(None), slice(None)) for k in range(vol.shape[0])]
+    per_plane = ops.threshold_blocks(vol, 500, 2000, planes, split=True)
+    assert per_plane.max() > 2  # every slice of every sphere is its own object
+
+
+def test_particle_table_3d_volume_uses_voxel_size():
+    vol = np.zeros((10, 20, 20), np.int32)
+    vol[2:6, 5:10, 5:15] = 1  # 4 x 5 x 10 voxels
+    rows = ops.particle_table(vol, np.ones_like(vol, float), scale=(2.0, 0.5, 0.5))
+    assert len(rows) == 1
+    assert rows[0]['Voxels'] == 200
+    assert rows[0]['Volume'] == pytest.approx(200 * 2.0 * 0.25)
+    assert rows[0]['Z'] == pytest.approx(3.5 * 2.0)
+
+
+def test_nd_blocks_scopes():
+    from tiki import axes, nd
+
+    info = axes.AxesInfo([axes.Axis('T', 3), axes.Axis('Z', 4), axes.Axis('Y', 8), axes.Axis('X', 8)])
+    shape, idx = (3, 4, 8, 8), (1, 2, 0, 0)
+    assert [k for k, _ in nd.scopes(info)] == ['plane', 'volume', 'whole']
+    assert nd.blocks(info, shape, idx, 'plane', True) == [(1, 2, slice(None), slice(None))]
+    assert nd.blocks(info, shape, idx, 'volume', True) == [(1, slice(None), slice(None), slice(None))]
+    assert len(nd.blocks(info, shape, idx, 'whole', True)) == 3    # one per t
+    assert len(nd.blocks(info, shape, idx, 'whole', False)) == 12  # one per plane
+    zyx = axes.AxesInfo([axes.Axis('Z', 4), axes.Axis('Y', 8), axes.Axis('X', 8)])
+    assert [k for k, _ in nd.scopes(zyx)] == ['plane', 'whole']
+    assert nd.for_layer((1, slice(None), slice(None), slice(None)), 3) == (slice(None),) * 3
+
+
+def test_gaussian_3d_respects_anisotropy():
+    vol = np.zeros((21, 21, 21), np.float32)
+    vol[10, 10, 10] = 1
+    iso = ops.gaussian_3d(vol, 2.0, 1.0)
+    aniso = ops.gaussian_3d(vol, 2.0, 0.25)  # slices 4x further apart than pixels
+    assert iso[12, 10, 10] == pytest.approx(iso[10, 12, 10], rel=1e-4)
+    assert aniso[11, 10, 10] < aniso[10, 11, 10]  # blurred less across slices

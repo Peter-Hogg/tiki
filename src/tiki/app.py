@@ -36,7 +36,7 @@ from qtpy.QtWidgets import (
 )
 
 from . import axes as axes_mod
-from . import io, ops, style
+from . import io, nd, ops, style
 from . import roi as roi_mod
 from .icons import tool_icon
 from .manager import WindowManager
@@ -72,7 +72,7 @@ class TikiError(Exception):
         self.fix = fix
 
 
-FIXES = {'properties': ('Open Properties…', 'properties')}
+FIXES = {'properties': ('Open Properties…', 'properties'), 'split': ('Split Channels', 'split_channels')}
 
 
 class Tiki(QMainWindow):
@@ -605,48 +605,65 @@ class Tiki(QMainWindow):
         viewer.reset_view()
 
     def z_project_dialog(self) -> None:
+        from .layer_select import LayerCombo
+
         viewer, image = self.require_image()
-        if image.ndim < 3:
-            raise TikiError('Z Project needs a stack')
         dlg = QDialog(self)
         dlg.setWindowTitle('ZProjection')
         form = QFormLayout(dlg)
-        info = axes_mod.get(image)
+        image_box = LayerCombo(viewer, Image, current=image)
+        form.addRow('Image:', image_box)
         axis_box = QComboBox()
-        for d in range(image.ndim - 2):
-            if info.axes[d].role == 'C':
-                continue  # never average channels together
-            axis_box.addItem(f'{roi_mod.axis_name(viewer, image, d)} ({image.data.shape[d]})', d)
-        if axis_box.count() == 0:
-            raise TikiError('no axis to project along (only channels besides Y and X)', fix='properties')
-        default = axes_mod.stack_axis(info, prefer='ZT')
-        if default is not None and axis_box.findData(default) >= 0:
-            axis_box.setCurrentIndex(axis_box.findData(default))
         start, stop = QSpinBox(), QSpinBox()
         method = QComboBox()
         method.addItems(list(ops.PROJECTIONS))
+        note = QLabel('')
+        note.setStyleSheet('color: #b00020;')
 
-        def update_range():
-            n = image.data.shape[axis_box.currentData()]
+        def update_range(_=None):
+            img = image_box.layer()
+            if img is None or axis_box.currentData() is None:
+                return
+            n = img.data.shape[axis_box.currentData()]
             for spin in (start, stop):
                 spin.setRange(1, n)
             start.setValue(1)
             stop.setValue(n)
 
-        axis_box.currentIndexChanged.connect(update_range)
-        update_range()
-        if axis_box.count() > 1:
-            form.addRow('Project along:', axis_box)
-        form.addRow('Start slice:', start)
-        form.addRow('Stop slice:', stop)
-        form.addRow('Projection type:', method)
+        def update_axes(_=None):
+            img = image_box.layer()
+            axis_box.blockSignals(True)
+            axis_box.clear()
+            if img is not None:
+                info = axes_mod.get(img)
+                for d in range(img.ndim - 2):
+                    if info.axes[d].role == 'C':
+                        continue  # never average channels together
+                    axis_box.addItem(f'{roi_mod.axis_name(viewer, img, d)} ({img.data.shape[d]})', d)
+                default = axes_mod.stack_axis(info, prefer='ZT')
+                if default is not None and axis_box.findData(default) >= 0:
+                    axis_box.setCurrentIndex(axis_box.findData(default))
+            axis_box.blockSignals(False)
+            ok = axis_box.count() > 0
+            note.setText('' if ok else 'This image has no stack axis to project along.')
+            buttons.button(QDialogButtonBox.Ok).setEnabled(ok)
+            update_range()
+
         buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         buttons.accepted.connect(dlg.accept)
         buttons.rejected.connect(dlg.reject)
+        image_box.layer_changed.connect(update_axes)
+        axis_box.currentIndexChanged.connect(update_range)
+        update_axes()
+        form.addRow('Project along:', axis_box)
+        form.addRow('Start slice:', start)
+        form.addRow('Stop slice:', stop)
+        form.addRow('Projection type:', method)
+        form.addRow(note)
         form.addRow(buttons)
         if dlg.exec_() != QDialog.Accepted:
             return
-        self.z_project(image, ops.PROJECTIONS[method.currentText()], axis_box.currentData(),
+        self.z_project(image_box.layer(), ops.PROJECTIONS[method.currentText()], axis_box.currentData(),
                        start.value() - 1, stop.value())
 
     def z_project(self, image: Image, method: str, axis: int = 0, start: int = 0, stop: int | None = None):
@@ -819,60 +836,121 @@ class Tiki(QMainWindow):
     # ------------------------------------------------- Analyze Particles
 
     def analyze_particles(self) -> None:
+        from .layer_select import LayerCombo
+
         viewer, image = self.require_image()
-        layer = self.labels_layer(viewer)
+        self.labels_layer(viewer)  # fails gently if there are no labels at all
         dlg = QDialog(self)
         dlg.setWindowTitle('Analyze Particles')
         form = QFormLayout(dlg)
-        form.addRow(QLabel(f'Labels: <b>{layer.name}</b><br>Intensity: <b>{image.name}</b>'))
+        labels_box = LayerCombo(viewer, Labels)
+        image_box = LayerCombo(viewer, Image, current=image)
+        form.addRow('Labels:', labels_box)
+        form.addRow('Measure intensity in:', image_box)
+        scope = QComboBox()
+        three_d = QCheckBox('Measure objects in 3D (volume, z centroid)', checked=True)
+        state = {'has_z': False}  # not widget visibility: a closed dialog reports all widgets hidden
         min_size = QSpinBox()
         min_size.setRange(0, 10**7)
-        min_size.setSuffix(' px')
+
+        def refresh_scopes(_=None):
+            img = image_box.layer()
+            info = axes_mod.get(img) if img is not None else None
+            current = scope.currentData()
+            scope.clear()
+            for key, label in nd.scopes(info) if info else []:
+                scope.addItem(label, key)
+            if current and scope.findData(current) >= 0:
+                scope.setCurrentIndex(scope.findData(current))
+            state['has_z'] = info is not None and info.index('Z') is not None
+            three_d.setVisible(state['has_z'])
+            update_units()
+
+        def update_units(_=None):
+            min_size.setSuffix(' voxels' if state['has_z'] and three_d.isChecked()
+                               and scope.currentData() != nd.PLANE else ' px')
+
+        image_box.layer_changed.connect(refresh_scopes)
+        scope.currentIndexChanged.connect(update_units)
+        three_d.toggled.connect(update_units)
+        refresh_scopes()
+        form.addRow('Measure:', scope)
+        form.addRow(three_d)
         form.addRow('Min size:', min_size)
         exclude = QCheckBox('Exclude on edges')
         clear = QCheckBox('Clear results', checked=True)
-        stack = QCheckBox('Whole stack')
         form.addRow(exclude)
         form.addRow(clear)
-        if layer.data.ndim > 2:
-            form.addRow(stack)
         buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         buttons.accepted.connect(dlg.accept)
         buttons.rejected.connect(dlg.reject)
         form.addRow(buttons)
         if dlg.exec_() != QDialog.Accepted:
             return
-        self.particles(viewer, image, layer, min_size.value(), exclude.isChecked(), clear.isChecked(),
-                       stack.isChecked() and layer.data.ndim > 2)
+        if labels_box.layer() is None or image_box.layer() is None:
+            raise TikiError('choose a Labels layer and an image')
+        self.particles(viewer, image_box.layer(), labels_box.layer(), min_size.value(), exclude.isChecked(),
+                       clear.isChecked(), scope.currentData() or nd.PLANE,
+                       state['has_z'] and three_d.isChecked())
 
-    def particles(self, viewer, image, layer, min_size=0, exclude_edges=False, clear=True, whole_stack=False):
+    def particles(self, viewer, image, layer, min_size=0, exclude_edges=False, clear=True,
+                  scope: str = 'plane', three_d: bool = True, whole_stack: bool | None = None):
+        """Measure every object of Labels ``layer`` in ``image`` (plane, volume or whole stack)."""
         from skimage.segmentation import clear_border
 
+        if whole_stack is not None:  # older keyword
+            scope = nd.WHOLE if whole_stack else nd.PLANE
+        info = axes_mod.get(image)
+        if info.index('C') is not None:
+            raise TikiError(f'{image.name} has a channel axis: split channels and measure one channel',
+                            fix='split')
+        labels = layer.data
+        ln, ndim = labels.ndim, image.ndim
+        if ln > ndim:
+            raise TikiError(f'"{layer.name}" has more axes than "{image.name}"')
+        z = info.index('Z')
+        labels_have_z = z is not None and ln >= ndim - z
+        by_volume = three_d and labels_have_z and scope != nd.PLANE
+        if scope == nd.VOLUME and not labels_have_z:
+            raise TikiError(f'"{layer.name}" is a single plane; measure "This plane" or threshold the volume')
+        shape = tuple(image.data.shape[:ndim])
+        blocks = nd.blocks(info, shape, roi_mod.current_index(viewer, image), scope, by_volume)
         if clear:
             self.results.clear()
-        sy, sx = image.scale[-2:]
-        if whole_stack:
-            lead = layer.data.shape[:-2]
-            planes = [(idx, np.asarray(layer.data[idx]), np.asarray(image.data[idx])) for idx in np.ndindex(*lead)]
-        else:
-            idx = roi_mod.current_index(viewer, image)[:-2]
-            planes = [(idx, self.labels_plane(viewer, layer), roi_mod.current_plane(viewer, image))]
         total = 0
-        for idx, lab, img in planes:
-            if lab.max() == 1:  # a 0/1 mask: split into objects first
-                lab = ops.label_objects(lab > 0)
-            if exclude_edges:
-                lab = clear_border(lab)
-            if min_size > 1:
-                sizes = np.bincount(lab.ravel())
-                lab = np.where(sizes[lab] >= min_size, lab, 0)
-            for row in ops.particle_table(lab, img, (sy, sx)):
-                if idx:
-                    row = {'Slice': ','.join(str(i + 1) for i in idx)} | row
-                self.results.add_row(row)
-                total += 1
+        with self.progress('Analyze Particles', len(blocks)) as tick:
+            for n, block in enumerate(blocks):
+                lab = np.asarray(labels[nd.for_layer(block, ln)])
+                img = np.asarray(image.data[block])
+                if image.rgb:
+                    img = img[..., :3].mean(-1)
+                if lab.shape != img.shape:  # e.g. 2D labels against a volume: measure plane by plane
+                    lab = np.broadcast_to(lab, img.shape)
+                if lab.max() == 1:  # a 0/1 mask: split into objects first
+                    lab = ops.label_objects(lab > 0)
+                if exclude_edges:
+                    lab = clear_border(lab)
+                if min_size > 1:
+                    sizes = np.bincount(lab.ravel())
+                    lab = np.where(sizes[lab] >= min_size, lab, 0)
+                block_scale = [image.scale[d] for d, b in enumerate(block) if not isinstance(b, int)]
+                if lab.ndim == 3 and not by_volume:  # labels with Z, measured slice by slice
+                    rows = []
+                    for k in range(lab.shape[0]):
+                        for row in ops.particle_table(lab[k], img[k], block_scale[-2:]):
+                            rows.append({'z': k + 1} | row)
+                else:
+                    rows = ops.particle_table(lab, img, block_scale)
+                where = nd.block_label(info, block)
+                for row in rows:
+                    if where:
+                        row = {'Slice': where} | row
+                    self.results.add_row(row)
+                    total += 1
+                if tick(n + 1, len(blocks)) is False:
+                    break
         self.show_results()
-        self.status(f'Analyze Particles: {total} objects from "{layer.name}"')
+        self.status(f'Analyze Particles: {total} {"3D " if by_volume else ""}objects from "{layer.name}"')
         return total
 
     # --------------------------------------------------- Process filters
@@ -884,7 +962,8 @@ class Tiki(QMainWindow):
         dlg = FilterDialog(self, key, viewer, image)
         if dlg.exec_() != QDialog.Accepted:
             return
-        run_filter(self, key, viewer, image, dlg.values(), dlg.whole_stack.isChecked())
+        run_filter(self, key, viewer, dlg.image, dlg.values(),
+                   dlg.use_whole_stack(), dlg.use_3d())
 
     # ---------------------------------------------------- Send to notebook
 

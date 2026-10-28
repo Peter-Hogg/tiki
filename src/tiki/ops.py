@@ -171,61 +171,101 @@ def threshold_mask(plane: np.ndarray, lower: float, upper: float) -> np.ndarray:
 
 
 def label_objects(mask: np.ndarray, min_size: int = 0, start: int = 0) -> np.ndarray:
-    """Connected components of a 2D mask (8-connected, like Analyze Particles).
+    """Connected components of a 2D or 3D mask, fully connected (8 neighbours
+    in 2D like Analyze Particles, 26 in 3D like the 3D Objects Counter).
 
-    Objects smaller than ``min_size`` pixels are dropped; ids start at ``start + 1``.
+    Objects smaller than ``min_size`` pixels/voxels are dropped; ids start at ``start + 1``.
     """
     from skimage.measure import label
 
-    labels = label(mask, connectivity=2).astype(np.int32)
+    labels = label(mask, connectivity=mask.ndim).astype(np.int32)
     if min_size > 1 and labels.max():
         sizes = np.bincount(labels.ravel())
         small = sizes < min_size
         small[0] = False
         labels[small[labels]] = 0
-        labels = label(labels > 0, connectivity=2).astype(np.int32)
+        labels = label(labels > 0, connectivity=mask.ndim).astype(np.int32)
     if start:
         labels[labels > 0] += start
     return labels
 
 
+def segment(block: np.ndarray, lower: float, upper: float, split: bool = True, min_size: int = 0) -> np.ndarray:
+    """Threshold one 2D plane or 3D volume: int32 object labels, or a uint8 0/1 mask."""
+    mask = threshold_mask(block, lower, upper)
+    if split:
+        return label_objects(mask, min_size)
+    if min_size > 1:
+        mask = label_objects(mask, min_size) > 0
+    return mask.astype(np.uint8)
+
+
+def threshold_blocks(data, lower: float, upper: float, blocks: list[tuple], split: bool = True,
+                     min_size: int = 0, progress=None) -> np.ndarray:
+    """Threshold ``data`` block by block (planes or Z-volumes, see ``tiki.nd``).
+
+    Returns an array the shape of ``data``; with ``split`` every object id is
+    unique across all blocks. Blocks are read one at a time (memmap friendly).
+    """
+    out = np.zeros(data.shape, dtype=np.int32 if split else np.uint8)
+    next_id = 0
+    for n, b in enumerate(blocks):
+        result = segment(np.asarray(data[b]), lower, upper, split, min_size)
+        if split and result.max():
+            result[result > 0] += next_id
+            next_id = int(result.max())
+        out[b] = result
+        if progress is not None and progress(n + 1, len(blocks)) is False:
+            break
+    return out
+
+
 def threshold_stack(
     data: np.ndarray, lower: float, upper: float, split: bool = False, min_size: int = 0
 ) -> np.ndarray:
-    """Threshold every 2D plane of ``data`` into a uint8 mask or int32 labels.
-
-    With ``split`` each object gets its own id, unique across the whole stack.
-    Works plane by plane, so memory-mapped movies are never loaded at once.
-    """
+    """Threshold every 2D plane of ``data`` into a uint8 mask or int32 labels."""
     lead = data.shape[:-2]
-    out = np.zeros(data.shape, dtype=np.int32 if split else np.uint8)
-    next_id = 0
-    for idx in np.ndindex(*lead) if lead else [()]:
-        mask = threshold_mask(data[idx], lower, upper)
-        if split:
-            out[idx] = label_objects(mask, min_size, start=next_id)
-            next_id = max(next_id, int(out[idx].max()))
-        else:
-            if min_size > 1:
-                mask = label_objects(mask, min_size) > 0
-            out[idx] = mask
-    return out
+    planes = [idx + (slice(None), slice(None)) for idx in (np.ndindex(*lead) if lead else [()])]
+    return threshold_blocks(data, lower, upper, planes, split, min_size)
 
 
 # ---------------------------------------------------------------- particles
 
 def particle_table(labels: np.ndarray, intensity: np.ndarray, scale=(1.0, 1.0)) -> list[dict]:
-    """Analyze Particles: one row per labelled object in a 2D label image.
+    """Analyze Particles: one row per labelled object in a 2D or 3D label image.
 
-    Columns follow ImageJ (Area, Mean, StdDev, Min, Max, X, Y, Perim.,
-    Circ., AR, Solidity, IntDen). Lengths and areas use ``scale`` (sy, sx);
-    shape descriptors assume square pixels.
+    2D columns follow ImageJ (Area, Mean, StdDev, Min, Max, X, Y, Perim.,
+    Circ., AR, Solidity, IntDen). 3D gives Volume, X, Y, Z and AR instead of
+    the outline measures, using the voxel size so anisotropic z is handled.
+    ``scale`` is the physical step of each axis of ``labels``.
     """
     from skimage.measure import regionprops
 
-    sy, sx = float(scale[0]), float(scale[1])
+    labels = np.asarray(labels).astype(np.int32, copy=False)
+    intensity = np.asarray(intensity)
+    scale = tuple(float(s) for s in scale)[-labels.ndim:]
     rows = []
-    for region in regionprops(np.asarray(labels).astype(np.int32, copy=False), np.asarray(intensity)):
+    if labels.ndim == 3:
+        for region in regionprops(labels, intensity, spacing=scale):
+            vals = region.image_intensity[region.image].astype(np.float64)
+            cz, cy, cx = region.centroid  # physical units (spacing applied)
+            major, minor = region.axis_major_length, region.axis_minor_length
+            volume = float(region.area)
+            rows.append({
+                'Label': int(region.label),
+                'Volume': volume,
+                'Voxels': int(region.image.sum()),
+                'Mean': float(vals.mean()),
+                'StdDev': float(vals.std(ddof=1)) if vals.size > 1 else 0.0,
+                'Min': float(vals.min()),
+                'Max': float(vals.max()),
+                'X': cx, 'Y': cy, 'Z': cz,
+                'AR': major / minor if minor > 0 else float('nan'),
+                'IntDen': volume * float(vals.mean()),
+            })
+        return rows
+    sy, sx = scale
+    for region in regionprops(labels, intensity):
         vals = region.image_intensity[region.image].astype(np.float64)
         area_px = float(region.area)
         perim_px = float(region.perimeter)
@@ -369,6 +409,42 @@ def subtract_background(plane: np.ndarray, radius: float, light_background: bool
         info = np.iinfo(plane.dtype)
         return np.clip(np.round(result), max(info.min, 0), info.max).astype(plane.dtype)
     return result.astype(np.float32)
+
+
+def gaussian_3d(volume: np.ndarray, sigma: float, z_ratio: float) -> np.ndarray:
+    """Gaussian through Z: ``sigma`` in x/y pixels, z sigma scaled by voxel shape.
+
+    ``z_ratio`` = x/y pixel size / z step, so a blur of 1 µm is 1 µm in every
+    direction even when slices are further apart than pixels.
+    """
+    from scipy.ndimage import gaussian_filter
+
+    return gaussian_filter(np.asarray(volume, dtype=np.float32), (sigma * z_ratio, sigma, sigma))
+
+
+def median_3d(volume: np.ndarray, radius: float, z_ratio: float) -> np.ndarray:
+    """Median over an ellipsoid of ``radius`` x/y pixels (z radius scaled by voxel shape)."""
+    from scipy.ndimage import median_filter as _median
+
+    r = max(int(round(radius)), 0)
+    rz = int(round(radius * z_ratio))
+    if r == 0:
+        return np.asarray(volume).copy()
+    zz, yy, xx = np.ogrid[-rz:rz + 1, -r:r + 1, -r:r + 1]
+    footprint = (xx / r) ** 2 + (yy / r) ** 2 + ((zz / rz) ** 2 if rz else zz.astype(float) * 0) <= 1
+    return _median(np.asarray(volume), footprint=footprint)
+
+
+def map_blocks(func, data, blocks: list[tuple], out_dtype=None, progress=None) -> np.ndarray:
+    """Apply ``func`` to each block (2D plane or 3D volume) of ``data``."""
+    first = func(np.asarray(data[blocks[0]]))
+    out = np.empty(data.shape, dtype=out_dtype or first.dtype)
+    out[blocks[0]] = first
+    for n, b in enumerate(blocks[1:], start=2):
+        out[b] = func(np.asarray(data[b]))
+        if progress is not None and progress(n, len(blocks)) is False:
+            break
+    return out
 
 
 def map_planes(func, data, out_dtype=None, progress=None) -> np.ndarray:

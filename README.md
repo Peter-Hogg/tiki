@@ -119,7 +119,15 @@ pixel value.
   2D. If the z-step is unknown, voxels are drawn as cubes (as ImageJ's 3D
   viewer does) and the status bar says so
 
-### Threshold → Labels
+### Threshold → Labels (2D and 3D)
+
+- **Image** dropdown: threshold any image layer of the window (e.g. one split
+  channel); multichannel images are asked to split channels first
+- **Apply to**: this plane, this volume (all z at the current t) or the whole
+  stack; the histogram and Auto use the same part of the data
+- **Connect objects through Z (3D)**: objects touching in neighbouring slices
+  become one 3D object (26-connected); otherwise plane by plane
+- In 3D view the preview is the whole current volume
 
 - ImageJ-style Threshold dialog: histogram, lower/upper sliders, Default,
   IsoData, Li, Mean, Minimum, Otsu, Percentile, Triangle and Yen methods,
@@ -134,9 +142,10 @@ pixel value.
 
 ### Particles, ROI Manager and traces
 
-- **Analyze Particles** measures every object in a Labels layer (Area, Mean,
-  StdDev, Min, Max, X, Y, Perim., Circ., AR, Solidity, IntDen), on one slice or
-  the whole stack, with min size and exclude-on-edges options
+- **Analyze Particles** measures every object in a chosen Labels layer against
+  a chosen image: 2D objects give Area, Mean, StdDev, Min, Max, X, Y, Perim.,
+  Circ., AR, Solidity, IntDen; 3D objects give Volume, Voxels, X, Y, Z, AR and
+  intensity stats using the voxel size (anisotropic z handled)
 - **ROI Manager**: Add (<kbd>Ctrl</kbd>+<kbd>T</kbd>), Update, Delete, Rename,
   Measure, Multi Plot, Show All with names; it is global, so ROIs drawn on one
   window (e.g. an average projection) can be used on another (the movie)
@@ -150,7 +159,9 @@ pixel value.
 ### Filters
 
 - Gaussian Blur, Median and rolling-ball Subtract Background with a live
-  preview of the current slice
+  preview of the current slice and an Image dropdown
+- Gaussian and Median can work **in 3D** (through Z), with the kernel scaled
+  by the voxel size so an anisotropic z-step is handled
 - Non-destructive: the result is added as a new layer above the original
 
 ### Send to Notebook
@@ -223,6 +234,8 @@ src/tiki/
 ├── axes.py      axis roles, metadata readers, folder memory
 ├── properties.py Image ▸ Properties dialog
 ├── channels.py  Split/Merge Channels, Channels tool
+├── nd.py        planes / volumes / whole-stack blocks for nD commands
+├── layer_select.py layer dropdown used by the dialogs
 ├── widgets.py   Results and profile windows
 ├── threshold.py Threshold dialog producing napari Labels
 ├── rois.py      ROI model, ImageJ .roi/.zip and Labels conversion

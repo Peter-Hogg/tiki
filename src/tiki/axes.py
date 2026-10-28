@@ -394,4 +394,6 @@ def apply(viewer, image, info: AxesInfo) -> None:
     for layer in viewer.layers:
         match_units(layer, image)
     y = info.axes[info.index('Y')] if info.index('Y') is not None else None
-    viewer.scale_bar.visible = bool(y is not None and y.step and y.unit)
+    overlays = getattr(getattr(viewer, 'canvas', None), 'overlays', None)
+    scale_bar = getattr(overlays, 'scale_bar', None) or viewer.scale_bar  # napari 0.9 moved it
+    scale_bar.visible = bool(y is not None and y.step and y.unit)
