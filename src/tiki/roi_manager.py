@@ -296,4 +296,6 @@ class RoiManager(QWidget):
 
 
 def _plane_kw(image) -> dict:
-    return dict(scale=image.scale[-2:], translate=image.translate[-2:])
+    from . import axes as axes_mod
+
+    return axes_mod.geometry(image, ndim=2)

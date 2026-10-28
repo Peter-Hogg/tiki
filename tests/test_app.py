@@ -326,3 +326,102 @@ def test_send_to_notebook_roundtrip(tiki, tmp_path):
     (lab,) = ns['labels'].values()
     assert lab.shape == movie.shape
     assert (tmp_path / 'sess' / 'RoiSet.zip').exists() and (tmp_path / 'sess' / 'results.csv').exists()
+
+
+# ------------------------------------------------------------- nD axes
+
+@pytest.fixture
+def hyperstack(tmp_path):
+    import tifffile
+
+    rng = np.random.default_rng(0)
+    data = rng.integers(100, 200, (6, 4, 2, 24, 20)).astype(np.uint16)
+    data[:, :, 1, 5:10, 5:10] += 1000  # bright object in channel 2 only
+    path = tmp_path / 'hyper.tif'
+    tifffile.imwrite(path, data, imagej=True, resolution=(4, 4),
+                     metadata={'axes': 'TZCYX', 'spacing': 2.0, 'finterval': 0.5, 'unit': 'um'})
+    return path, data
+
+
+def test_open_hyperstack_labels_scale(tiki, hyperstack):
+    path, data = hyperstack
+    tiki.open_paths([str(path)])
+    v = tiki.windows.active
+    assert tuple(v.dims.axis_labels) == ('t', 'z', 'c', 'y', 'x')
+    assert tuple(v.layers[path.name].scale) == pytest.approx((0.5, 2.0, 1.0, 0.25, 0.25))
+    assert 'TZCYX' not in tiki.status_label.text() and 'T6' in tiki.status_label.text()
+
+
+def test_split_and_merge_channels_are_views(tiki, hyperstack):
+    path, data = hyperstack
+    tiki.open_paths([str(path)])
+    v = tiki.windows.active
+    original = v.layers[path.name]
+    v.dims.set_current_step(0, 3)  # t = 3
+    v.dims.set_current_step(1, 2)  # z = 2
+    tiki.split_channels()
+    assert v.dims.current_step[:2] == (3, 2)  # still on the same frame and slice
+    chans = [ly for ly in v.layers if ly.name.startswith('C')]
+    assert [ly.name for ly in chans] == [f'C1-{path.name}', f'C2-{path.name}']
+    assert all(ly.blending == 'additive' for ly in chans)
+    assert chans[1].data.shape == (6, 4, 24, 20)
+    assert np.shares_memory(chans[1].data, original.data)
+    assert tuple(v.dims.axis_labels) == ('t', 'z', 'y', 'x')
+    tiki.merge_channels()
+    assert v.layers[path.name] is original and tuple(v.dims.axis_labels) == ('t', 'z', 'c', 'y', 'x')
+
+
+def test_z_project_keeps_t_and_c_and_traces_run_along_t(tiki, hyperstack):
+    path, data = hyperstack
+    tiki.open_paths([str(path)])
+    v = tiki.windows.active
+    image = v.layers[path.name]
+    proj = tiki.z_project(image, 'max', axis=1)
+    assert proj.layers[0].data.shape == (6, 2, 24, 20)
+    assert tuple(proj.dims.axis_labels) == ('t', 'c', 'y', 'x')
+    np.testing.assert_array_equal(proj.layers[0].data, data.max(axis=1))
+    tiki.windows.activate(v)
+    assert tiki._stack_axis(v, image) == 0  # T, not Z or C
+
+
+def test_split_without_channels_offers_properties(tiki, monkeypatch):
+    from qtpy.QtWidgets import QMessageBox
+
+    seen = {}
+
+    def fake_exec(box):
+        seen['text'] = box.text()
+        seen['buttons'] = [b.text() for b in box.buttons()]
+        return 0
+
+    monkeypatch.setattr(QMessageBox, 'exec_', fake_exec)
+    monkeypatch.setattr(QMessageBox, 'exec', fake_exec, raising=False)
+    tiki.open_data(np.zeros((5, 8, 8)), 'movie.npy')
+    tiki._actions['Color>Split Channels'].trigger()
+    assert 'no channel' in seen['text']
+    assert 'Open Properties…' in seen['buttons']
+
+
+def test_properties_relabel_and_remember(tiki, tmp_path, monkeypatch):
+    from tiki import axes
+    from tiki.properties import PropertiesDialog
+
+    monkeypatch.setattr(axes, 'MEMORY_FILE', tmp_path / 'mem.json')
+    path = tmp_path / 'cache.npy'
+    np.save(path, np.zeros((30, 8, 8), np.float32))
+    tiki.open_paths([str(path)])
+    v = tiki.windows.active
+    image = v.layers['cache.npy']
+    dlg = PropertiesDialog(tiki, v, image)
+    role, step, unit = dlg.rows[0]
+    role.setCurrentIndex(axes.ROLES.index('X'))  # invalid: two X axes
+    assert not dlg.buttons.button(dlg.buttons.Ok).isEnabled()
+    role.setCurrentIndex(axes.ROLES.index('T'))
+    step.setValue(0.001)
+    assert dlg.buttons.button(dlg.buttons.Ok).isEnabled()
+    dlg.remember.setChecked(True)
+    dlg.apply()
+    assert v.dims.axis_labels[0] == 't' and image.scale[0] == pytest.approx(0.001)
+    np.save(tmp_path / 'other.npy', np.zeros((99, 8, 8), np.float32))
+    tiki.open_paths([str(tmp_path / 'other.npy')])
+    assert tiki.windows.active.dims.axis_labels[0] == 't'

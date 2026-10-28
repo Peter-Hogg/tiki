@@ -35,6 +35,7 @@ from qtpy.QtWidgets import (
     QWidget,
 )
 
+from . import axes as axes_mod
 from . import io, ops, style
 from . import roi as roi_mod
 from .icons import tool_icon
@@ -60,7 +61,18 @@ STATUS_HOLD_MS = 4000
 
 
 class TikiError(Exception):
-    """An expected problem the user can fix (no image open, wrong ROI type...)."""
+    """An expected problem the user can fix (no image open, wrong ROI type...).
+
+    ``fix`` names a command that resolves it (e.g. ``'properties'``); the
+    error dialog then offers a button for it.
+    """
+
+    def __init__(self, message: str, fix: str | None = None):
+        super().__init__(message)
+        self.fix = fix
+
+
+FIXES = {'properties': ('Open Properties…', 'properties')}
 
 
 class Tiki(QMainWindow):
@@ -155,11 +167,18 @@ class Tiki(QMainWindow):
         self._add(adjust, 'Reset Display Range', self.reset_contrast)
         m.addSeparator()
         self._add(m, 'Show Info…', self.show_info, 'Ctrl+I')
+        self._add(m, 'Properties…', self.properties, 'Ctrl+Shift+P')
+        color = m.addMenu('Color')
+        self._add(color, 'Split Channels', self.split_channels)
+        self._add(color, 'Merge Channels', self.merge_channels)
+        self._add(color, 'Channels Tool…', self.channels_tool, 'Ctrl+Shift+Z')
         self._add(m, 'Crop', self.crop, 'Ctrl+Shift+X')
         self._add(m, 'Duplicate…', self.duplicate, 'Ctrl+Shift+D')
         stacks = m.addMenu('Stacks')
         self._add(stacks, 'Z Project…', self.z_project_dialog)
         self._add(stacks, 'Plot Z-axis Profile', self.plot_z_profile, 'Ctrl+Shift+Y')
+        stacks.addSeparator()
+        self._add(stacks, 'Split Channels ', self.split_channels)  # same command as Image ▸ Color
 
         m = mb.addMenu('&Process')
         filt = m.addMenu('Filters')
@@ -220,14 +239,25 @@ class Tiki(QMainWindow):
         try:
             slot()
         except TikiError as exc:
-            self.report(name, str(exc))
+            self.report(name, str(exc), fix=exc.fix)
         except Exception as exc:
             traceback.print_exc()
             self.report(name, f'{type(exc).__name__}: {exc}\n\n(full traceback in the terminal)', error=True)
 
-    def report(self, title: str, message: str, error: bool = False) -> None:
-        """Show a problem the way ImageJ does: a small dialog plus the status bar."""
+    def report(self, title: str, message: str, error: bool = False, fix: str | None = None) -> None:
+        """Show a problem the way ImageJ does: a small dialog plus the status bar.
+
+        With ``fix`` the dialog gets a button that runs the fixing command.
+        """
         self.status(f'{title}: {message.splitlines()[0]}')
+        if fix in FIXES:
+            label, method = FIXES[fix]
+            box = QMessageBox(QMessageBox.Warning, title, message, QMessageBox.Close, self)
+            button = box.addButton(label, QMessageBox.ActionRole)
+            box.exec_()
+            if box.clickedButton() is button:
+                self._run(label, getattr(self, method))
+            return
         box = QMessageBox.critical if error else QMessageBox.warning
         box(self, title, message)
 
@@ -296,11 +326,11 @@ class Tiki(QMainWindow):
             return labels[-1]
         image = roi_mod.target_image(viewer)
         shape = image.data.shape[: image.ndim]
-        scale, translate = image.scale, image.translate
+        geometry = axes_mod.geometry(image)
         if np.prod(shape) * 2 > 1 * 2**30:  # >1 GB for a whole movie: paint one plane
-            shape, scale, translate = shape[-2:], scale[-2:], translate[-2:]
+            shape, geometry = shape[-2:], axes_mod.geometry(image, ndim=2)
             self.status('Movie too large for full-size labels; painting a single 2D plane')
-        layer = Labels(np.zeros(shape, np.uint16), name='labels', scale=scale, translate=translate, opacity=0.6)
+        layer = Labels(np.zeros(shape, np.uint16), name='labels', opacity=0.6, **geometry)
         viewer.add_layer(layer)
         roi = roi_mod.roi_layer(viewer, create=False)
         if roi is not None:
@@ -339,6 +369,7 @@ class Tiki(QMainWindow):
             self.threshold_window.set_target(viewer)
         if self.roi_manager is not None and self.roi_manager.isVisible():
             self.roi_manager.refresh_overlay(viewer)
+        self._refresh_channels_tool(viewer)
 
     # ------------------------------------------------------------ helpers
 
@@ -367,11 +398,19 @@ class Tiki(QMainWindow):
                 traceback.print_exc()
                 self.report('Open', f'Could not open {Path(path).name}:\n{exc}')
                 continue
-            kwargs = {'metadata': {'path': meta['path']}}
-            if 'scale' in meta:
-                kwargs['scale'] = meta['scale']
-            self.open_data(data, meta['name'], **kwargs)
-            self.status(f'Opened {meta["name"]} {data.shape} {data.dtype} in {time.perf_counter() - t0:.2f} s')
+            metadata = {'path': meta['path']}
+            if meta.get('imagej_luts') is not None:
+                metadata['imagej_luts'] = meta['imagej_luts']
+            info = meta['axes']
+            self.open_data(data, meta['name'], axes=info, metadata=metadata)
+            msg = f'Opened {meta["name"]}: {info.describe()} {data.dtype} [{info.source}]'
+            if info.notes:
+                msg += ' — ' + '; '.join(info.notes)
+            if not info.confident:
+                msg += ' — check Image ▸ Properties (Ctrl+Shift+P)'
+            self.status(msg)
+            if not info.confident or info.notes:
+                self._message_until = time.monotonic() + 10
             if 'warning' in meta:
                 self.report('Open', f'{meta["name"]}: {meta["warning"]}')
 
@@ -438,6 +477,47 @@ class Tiki(QMainWindow):
     def toggle_layer_list(self) -> None:
         self._set_dock('dockLayerList')
 
+    def properties(self) -> None:
+        from .properties import PropertiesDialog
+
+        viewer, image = self.require_image()
+        dlg = PropertiesDialog(self, viewer, image)
+        if dlg.exec_() == QDialog.Accepted:
+            info = dlg.apply()
+            self.status(f'{image.name}: {info.describe()}')
+
+    def split_channels(self) -> None:
+        from . import channels
+
+        viewer, image = self.require_image()
+        layers = channels.split(viewer, image)
+        self.reapply_tool(viewer)
+        self._refresh_channels_tool(viewer)
+        self.status(f'Split {image.name} into {len(layers)} channel layers (Image ▸ Color ▸ Merge Channels undoes)')
+
+    def merge_channels(self) -> None:
+        from . import channels
+
+        viewer, _ = self.require_image()
+        layer = channels.merge(viewer)
+        self.reapply_tool(viewer)
+        self._refresh_channels_tool(viewer)
+        self.status(f'Merged channels back into {layer.name}')
+
+    def channels_tool(self) -> None:
+        from .channels import ChannelsTool
+
+        if getattr(self, 'channels_window', None) is None:
+            self.channels_window = ChannelsTool(self)
+        self.channels_window.refresh()
+        self.channels_window.show()
+        self.channels_window.raise_()
+
+    def _refresh_channels_tool(self, viewer=None) -> None:
+        win = getattr(self, 'channels_window', None)
+        if win is not None and win.isVisible():
+            win.refresh(viewer)
+
     def threshold(self) -> None:
         from .threshold import ThresholdWindow
 
@@ -492,7 +572,7 @@ class Tiki(QMainWindow):
         box = self._roi_box(viewer, image)
         data = image.data if box is None else ops.crop_to_box(image.data, box)
         stem = Path(image.name).stem
-        self.open_data(np.array(data), f'{stem}-1.tif', scale=image.scale)
+        self.open_data(np.array(data), f'{stem}-1.tif', axes=axes_mod.fit(axes_mod.get(image), data.shape))
 
     def crop(self) -> None:
         viewer, image = self.require_image()
@@ -510,9 +590,17 @@ class Tiki(QMainWindow):
         dlg = QDialog(self)
         dlg.setWindowTitle('ZProjection')
         form = QFormLayout(dlg)
+        info = axes_mod.get(image)
         axis_box = QComboBox()
         for d in range(image.ndim - 2):
+            if info.axes[d].role == 'C':
+                continue  # never average channels together
             axis_box.addItem(f'{roi_mod.axis_name(viewer, image, d)} ({image.data.shape[d]})', d)
+        if axis_box.count() == 0:
+            raise TikiError('no axis to project along (only channels besides Y and X)', fix='properties')
+        default = axes_mod.stack_axis(info, prefer='ZT')
+        if default is not None and axis_box.findData(default) >= 0:
+            axis_box.setCurrentIndex(axis_box.findData(default))
         start, stop = QSpinBox(), QSpinBox()
         method = QComboBox()
         method.addItems(list(ops.PROJECTIONS))
@@ -526,8 +614,8 @@ class Tiki(QMainWindow):
 
         axis_box.currentIndexChanged.connect(update_range)
         update_range()
-        if image.ndim > 3:
-            form.addRow('Axis:', axis_box)
+        if axis_box.count() > 1:
+            form.addRow('Project along:', axis_box)
         form.addRow('Start slice:', start)
         form.addRow('Stop slice:', stop)
         form.addRow('Projection type:', method)
@@ -547,19 +635,14 @@ class Tiki(QMainWindow):
         data = image.data[tuple(sl)]
         result = ops.z_project(data, method, axis)
         prefix = {'max': 'MAX', 'mean': 'AVG', 'sum': 'SUM', 'std': 'STD', 'median': 'MED', 'min': 'MIN'}[method]
-        scale = [s for d, s in enumerate(image.scale) if d != axis]
-        viewer = self.open_data(result, f'{prefix}_{image.name}', scale=scale)
+        info = axes_mod.fit(axes_mod.get(image), data.shape).without(axis)
+        viewer = self.open_data(result, f'{prefix}_{image.name}', axes=info)
         self.status(f'Z Project ({method}) in {time.perf_counter() - t0:.2f} s')
         return viewer
 
     def plot_z_profile(self) -> None:
         viewer, image = self.require_image()
-        if image.ndim < 3:
-            raise TikiError('Plot Z-axis Profile needs a stack')
-        axis = 0
-        last = viewer.dims.last_used - (viewer.dims.ndim - image.ndim)
-        if 0 <= last < image.ndim - 2:
-            axis = last
+        axis = self._stack_axis(viewer, image)
         window = ProfileWindow(viewer, image, axis)
         window.destroyed.connect(lambda _=None, w=window: self.profiles.remove(w) if w in self.profiles else None)
         window.setAttribute(Qt.WA_DeleteOnClose)
@@ -663,10 +746,13 @@ class Tiki(QMainWindow):
         self.show_roi_manager().add_current()
 
     def _stack_axis(self, viewer, image) -> int:
+        """Axis for profiles/traces: T if there is one, else Z, else an unknown stack axis."""
         if image.ndim < 3:
-            raise TikiError('traces need a stack or movie')
-        last = viewer.dims.last_used - (viewer.dims.ndim - image.ndim)
-        return last if 0 <= last < image.ndim - 2 else 0
+            raise TikiError('this needs a stack or movie, not a single image')
+        axis = axes_mod.stack_axis(axes_mod.get(image))
+        if axis is None:
+            raise TikiError('this image has no T or Z axis to run along (only channels?)', fix='properties')
+        return axis
 
     def show_traces(self, viewer, image, names, masks=None, labels=None):
         """Compute traces (masks list or a 2D labels image) and open a TracesWindow."""
@@ -832,7 +918,7 @@ class Tiki(QMainWindow):
     def closeEvent(self, event):
         self.windows.close_all()
         self.results.close()
-        for w in (self.threshold_window, self.roi_manager):
+        for w in (self.threshold_window, self.roi_manager, getattr(self, 'channels_window', None)):
             if w is not None:
                 w.close()
         for w in list(self.profiles):

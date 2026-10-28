@@ -95,6 +95,25 @@ pixel value.
 - Live ROI intensity profile through a stack, with current-frame indicator
 - Copy profiles or save them as CSV
 
+### Multidimensional data (T, Z, C)
+
+- Axis meanings, pixel size, z-step and frame interval are read from ImageJ
+  hyperstack, OME and ScanImage metadata; sliders are labelled `t`, `z`, `c`
+  and measurements, the scale bar and 3D scaling use physical units
+- Data is never rearranged, only labelled. Files without metadata (`.npy`,
+  generic TIFF sequences) open with unknown stack axes (`dim0`) and a status-bar
+  hint rather than a wrong guess
+- **Image ▸ Properties** relabels axes and sets steps/units, validates the
+  combination before applying, and can remember the choice for every file
+  with that many axes in the folder (stored in `~/.config/tiki/axes_memory.json`)
+- Commands that need a missing axis say so and offer an **Open Properties…**
+  button
+- **Split Channels** turns a C axis into additively blended, separately
+  coloured layers in the same window (views, no copy; ImageJ LUT colours are
+  used when present); **Merge Channels** restores the original
+- Z Project never averages channels and keeps T and C; profiles and traces run
+  along T (else Z)
+
 ### Threshold → Labels
 
 - ImageJ-style Threshold dialog: histogram, lower/upper sliders, Default,
@@ -155,6 +174,8 @@ pixel value.
 | Image → Adjust | Brightness/Contrast | <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>C</kbd> |
 | Image → Adjust | Threshold… (preview and result are napari Labels) | <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>T</kbd> |
 | Image → Adjust | Enhance Contrast | <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>E</kbd> |
+| Image | Properties… (axis meanings, steps, units) | <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>P</kbd> |
+| Image → Color | Split Channels / Merge Channels / Channels Tool… | — / — / <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>Z</kbd> |
 | Image | Show Info | <kbd>Ctrl</kbd>+<kbd>I</kbd> |
 | Image | Crop | <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>X</kbd> |
 | Image | Duplicate | <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>D</kbd> |
@@ -194,6 +215,9 @@ src/tiki/
 ├── ops.py       NumPy image operations
 ├── roi.py       selection layers, masks and current-slice helpers
 ├── io.py        TIFF and NumPy loading
+├── axes.py      axis roles, metadata readers, folder memory
+├── properties.py Image ▸ Properties dialog
+├── channels.py  Split/Merge Channels, Channels tool
 ├── widgets.py   Results and profile windows
 ├── threshold.py Threshold dialog producing napari Labels
 ├── rois.py      ROI model, ImageJ .roi/.zip and Labels conversion

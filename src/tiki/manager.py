@@ -12,6 +12,7 @@ from qtpy.QtCore import QEvent, QObject, QTimer, Signal
 from qtpy.QtGui import QKeySequence, QShortcut
 from qtpy.QtWidgets import QAction, QMenu
 
+from . import axes as axes_mod
 from . import roi as roi_mod
 
 
@@ -42,19 +43,26 @@ class WindowManager(QObject):
                 return cand
             i += 1
 
-    def new_window(self, data: np.ndarray | None = None, name: str = 'Untitled', **image_kwargs) -> napari.Viewer:
-        """Open ``data`` in a new, slimmed-down napari window and make it current."""
+    def new_window(self, data: np.ndarray | None = None, name: str = 'Untitled', axes=None,
+                   **image_kwargs) -> napari.Viewer:
+        """Open ``data`` in a new, slimmed-down napari window and make it current.
+
+        ``axes`` (an AxesInfo) labels the sliders and sets the physical scale;
+        without it the axes are guessed (last two = Y, X).
+        """
         title = self.unique_title(name)
         viewer = napari.Viewer(title=title, show=True)
         self._slim(viewer)
         if data is not None:
             image_kwargs.setdefault('name', title)
+            image_kwargs.pop('scale', None) if axes is not None else None
             layer = viewer.add_image(data, **image_kwargs)
-            n_stack = layer.ndim - 2
-            stack_names = {1: ['z'], 2: ['t', 'z'], 3: ['t', 'z', 'c']}.get(
-                n_stack, [f'dim{d}' for d in range(n_stack)]
-            )
-            viewer.dims.axis_labels = stack_names + ['y', 'x']
+            shape = tuple(layer.data.shape[: layer.ndim])
+            info = axes if axes is not None and not axes.problems(shape) else axes_mod.guess(shape)
+            if axes is None and 'scale' in image_kwargs:  # caller gave a scale (e.g. derived data)
+                for a, s in zip(info.axes, layer.scale):
+                    a.step = float(s) if s != 1 else None
+            axes_mod.apply(viewer, layer, info)
             # ImageJ opens stacks at the first slice; napari at the middle.
             viewer.dims.current_step = (0,) * viewer.dims.ndim
         self.register(viewer)
@@ -98,11 +106,18 @@ class WindowManager(QObject):
         self._strip_shortcuts(viewer)
         # napari rebuilds menus lazily; strip again once the window settles.
         QTimer.singleShot(0, lambda: self._strip_shortcuts(viewer))
+        viewer.layers.events.inserted.connect(lambda event, v=viewer: self._on_layer_added(v, event.value))
         viewer.cursor.events.position.connect(
             lambda event, v=viewer: self.cursor_moved.emit(v, v.cursor.position)
         )
         self.set_active(viewer)
         self.windows_changed.emit()
+
+    def _on_layer_added(self, viewer, layer) -> None:
+        """New overlays (ROIs, labels, previews) take the image's physical units."""
+        image = roi_mod.target_image(viewer)
+        if image is not None and layer is not image and 'axes' not in getattr(layer, 'metadata', {}):
+            axes_mod.match_units(layer, image)
 
     # -- active window ----------------------------------------------------
 

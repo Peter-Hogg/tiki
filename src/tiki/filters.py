@@ -21,6 +21,7 @@ from qtpy.QtWidgets import (
     QLabel,
 )
 
+from . import axes as axes_mod
 from . import ops, style
 from . import roi as roi_mod
 
@@ -136,8 +137,7 @@ class FilterDialog(QDialog):
         lo, hi = ops.saturated_limits(result)
         if self.preview is None or self.preview not in self.viewer.layers:
             self.preview = Image(result, name=PREVIEW_NAME, colormap=self.image.colormap,
-                                 contrast_limits=(lo, hi), scale=self.image.scale[-2:],
-                                 translate=self.image.translate[-2:])
+                                 contrast_limits=(lo, hi), **axes_mod.geometry(self.image, ndim=2))
             self.viewer.add_layer(self.preview)
             self.tiki.reapply_tool(self.viewer)
         else:
@@ -174,13 +174,15 @@ def run_filter(tiki, key: str, viewer, image, values: dict, whole_stack: bool = 
         if tick.cancelled:
             tiki.status(f'{spec.title} cancelled')
             return None
-        scale, translate = image.scale, image.translate
+        geometry = axes_mod.geometry(image)
     else:
         result = func(roi_mod.current_plane(viewer, image))
-        scale, translate = image.scale[-2:], image.translate[-2:]
+        geometry = axes_mod.geometry(image, ndim=2)
     lo, hi = ops.saturated_limits(result if result.ndim == 2 else result[(0,) * (result.ndim - 2)])
+    info = axes_mod.get(image) if result.ndim == image.ndim else axes_mod.guess(result.shape)
     layer = Image(result, name=f'{image.name} {spec.name_suffix(values)}', colormap=image.colormap,
-                  contrast_limits=(lo, hi), scale=scale, translate=translate)
+                  contrast_limits=(lo, hi), **geometry,
+                  metadata={'axes': axes_mod.fit(info, result.shape).to_dict()})
     viewer.add_layer(layer)
     tiki.reapply_tool(viewer)
     tiki.status(f'{spec.title}: new layer "{layer.name}" (original kept underneath)')

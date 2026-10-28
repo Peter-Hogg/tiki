@@ -2,45 +2,35 @@
 
 from __future__ import annotations
 
-from pathlib import Path
-
 import logging
+from pathlib import Path
 
 import numpy as np
 import tifffile
 
+from . import axes as axes_mod
+
 OPEN_FILTER = 'Images (*.tif *.tiff *.npy *.png *.jpg);;All files (*)'
 
 
-def _tiff_scale(tf: tifffile.TiffFile, ndim: int) -> tuple | None:
-    """Pixel size from ImageJ/TIFF resolution tags, or None if uncalibrated."""
-    try:
-        page = tf.pages[0]
-        xres = page.tags.get('XResolution')
-        yres = page.tags.get('YResolution')
-        if xres is None or yres is None:
-            return None
-        sx = xres.value[1] / xres.value[0]
-        sy = yres.value[1] / yres.value[0]
-        if sx == 1 and sy == 1:
-            return None
-        scale = [1.0] * ndim
-        scale[-1], scale[-2] = sx, sy
-        spacing = (tf.imagej_metadata or {}).get('spacing')
-        if spacing and ndim >= 3:
-            scale[-3] = float(spacing)
-        return tuple(scale)
-    except Exception:
-        return None
+def _axes_without_metadata(path: Path, shape: tuple, rgb: bool = False) -> axes_mod.AxesInfo:
+    """Folder memory first, then a cautious guess."""
+    return axes_mod.recall(path, shape) or axes_mod.guess(shape, rgb=rgb)
 
 
 def read_image(path: str | Path) -> tuple[np.ndarray, dict]:
-    """Return ``(data, meta)``; meta has ``name`` and optionally ``scale``."""
+    """Return ``(data, meta)``; meta has ``name``, ``path`` and ``axes`` (AxesInfo).
+
+    Never fails because of metadata: unreadable or inconsistent axis
+    information falls back to a guess with a note explaining why.
+    """
     path = Path(path)
     meta: dict = {'name': path.name, 'path': str(path)}
     suffix = path.suffix.lower()
     if suffix == '.npy':
-        return np.load(path, mmap_mode='r'), meta
+        data = np.load(path, mmap_mode='r')
+        meta['axes'] = _axes_without_metadata(path, data.shape)
+        return data, meta
     if suffix in ('.tif', '.tiff'):
         # tifffile logs (rather than raises) when the header promises more
         # frames than the file holds; report that ourselves instead.
@@ -54,7 +44,16 @@ def read_image(path: str | Path) -> tuple[np.ndarray, dict]:
                     data = tf.asarray(out='memmap')
                 except Exception:
                     data = tf.asarray()
-                scale = _tiff_scale(tf, data.ndim)
+                try:
+                    info = axes_mod.from_tiff(tf, data.shape)
+                except Exception as exc:  # odd metadata must never block opening
+                    info = axes_mod.guess(data.shape)
+                    info.notes.append(f'could not read axis metadata ({type(exc).__name__}: {exc})')
+                if not info.confident:
+                    info = axes_mod.recall(path, data.shape) or info
+                luts = (tf.imagej_metadata or {}).get('LUTs')
+                if luts is not None:
+                    meta['imagej_luts'] = [np.asarray(lut) for lut in luts]
         finally:
             tif_log.setLevel(level)
         if data.shape != tuple(expected):
@@ -62,12 +61,14 @@ def read_image(path: str | Path) -> tuple[np.ndarray, dict]:
                 f'header says {expected} but the file holds {data.shape}; '
                 'opened what is there (acquisition stopped early, or split across files?)'
             )
-        if scale is not None:
-            meta['scale'] = scale
+        meta['axes'] = info
         return data, meta
     from skimage.io import imread
 
-    return imread(path), meta
+    data = imread(path)
+    rgb = data.ndim == 3 and data.shape[-1] in (3, 4)
+    meta['axes'] = _axes_without_metadata(path, data.shape, rgb=rgb)
+    return data, meta
 
 
 def save_tiff(path: str | Path, data: np.ndarray, scale: tuple | None = None) -> None:

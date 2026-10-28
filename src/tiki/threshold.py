@@ -27,6 +27,7 @@ from qtpy.QtWidgets import (
     QWidget,
 )
 
+from . import axes as axes_mod
 from . import ops, style
 from . import roi as roi_mod
 
@@ -285,8 +286,7 @@ class ThresholdWindow(QWidget):
                 name=PREVIEW_NAME,
                 opacity=0.6,
                 colormap=self._colormap(),
-                scale=self.image.scale[-2:],
-                translate=self.image.translate[-2:],
+                **axes_mod.geometry(self.image, ndim=2),
             )
             self.viewer.add_layer(self.preview)
             # keep ROI drawing working: give selection back to what had it
@@ -317,18 +317,18 @@ class ThresholdWindow(QWidget):
             if image.rgb:
                 data = np.asarray(data)[..., :3].mean(-1)
             out = ops.threshold_stack(data, self.lo_val, self.hi_val, split, min_size)
-            scale, translate = image.scale, image.translate
+            geometry = axes_mod.geometry(image)
             suffix = ''
         else:
             mask = ops.threshold_mask(self._plane(), self.lo_val, self.hi_val)
             out = ops.label_objects(mask, min_size) if split else (
                 (ops.label_objects(mask, min_size) > 0) if min_size > 1 else mask).astype(np.uint8)
-            scale, translate = image.scale[-2:], image.translate[-2:]
+            geometry = axes_mod.geometry(image, ndim=2)
             idx = roi_mod.current_index(viewer, image)[:-2]
             suffix = ' slice ' + ','.join(str(i + 1) for i in idx)
         self._remove_preview()
         kind = 'labels' if split else 'mask'
-        layer = Labels(out, name=f'{image.name} {kind}{suffix}', scale=scale, translate=translate, opacity=0.6)
+        layer = Labels(out, name=f'{image.name} {kind}{suffix}', opacity=0.6, **geometry)
         if not split:
             layer.colormap = self._colormap()
         viewer.add_layer(layer)

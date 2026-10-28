@@ -35,7 +35,9 @@ def plane_kwargs(image: Image | None) -> dict:
     """scale/translate/ndim for a 2D overlay layer that lines up with ``image``."""
     if image is None:
         return {'ndim': 2}
-    return dict(scale=image.scale[-2:], translate=image.translate[-2:], ndim=2)
+    from . import axes as axes_mod
+
+    return axes_mod.geometry(image, ndim=2) | {'ndim': 2}
 
 
 def roi_layer(viewer, create: bool = True) -> Shapes | None:
@@ -140,13 +142,10 @@ def current_plane(viewer, image: Image) -> np.ndarray:
 
 
 def axis_name(viewer, image: Image, d: int) -> str:
-    """ImageJ-style name for data axis ``d``; napari's defaults are just -3, -2..."""
-    label = str(viewer.dims.axis_labels[-image.ndim:][d])
-    if not label.lstrip('-').isdigit():
-        return label
-    n_stack = image.ndim - 2
-    names = {1: ['z'], 2: ['t', 'z'], 3: ['t', 'z', 'c']}.get(n_stack)
-    return names[d] if names and d < n_stack else f'dim{d}'
+    """Name of data axis ``d`` from the layer's axes (t, z, c, dim0...)."""
+    from . import axes as axes_mod
+
+    return axes_mod.get(image).labels[d]
 
 
 def pixel_area(image: Image) -> float:
