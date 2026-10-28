@@ -9,6 +9,10 @@ from tiki.io import synthetic_movie
 @pytest.fixture
 def tiki(qtbot):
     t = Tiki()
+    # napari's layer-control panels use OpenGL, which the offscreen test
+    # platform lacks; record the request instead of showing them.
+    t.windows.shown_controls = []
+    t.windows.show_layer_controls = lambda v, visible=True: t.windows.shown_controls.append(v)
     qtbot.addWidget(t)
     t.show()
     yield t
@@ -152,3 +156,42 @@ def test_truncated_tiff_opens_with_warning(tmp_path):
         tw.write(np.zeros((5, 8, 8), np.uint16), metadata={'shape': [9, 8, 8]})
     data, meta = io.read_image(path)
     assert data.shape[-2:] == (8, 8)
+
+
+def test_threshold_preview_follows_window_and_apply_makes_labels(tiki, qtbot):
+    movie = np.zeros((4, 32, 32), np.uint16)
+    movie[:, 4:12, 4:12] = 1000
+    movie[:, 20:30, 20:30] = 1000
+    v1 = tiki.open_data(movie, 'movie.tif')
+    tiki.threshold()
+    win = tiki.threshold_window
+    assert win.image is v1.layers['movie.tif']
+    assert win.lo_val > 0 and win.hi_val == 1000  # dark background: objects above
+    qtbot.waitUntil(lambda: win.preview is not None, timeout=1000)
+    assert win.preview.data.sum() == 64 + 100
+    assert v1.layers.selection.active.name == roi.ROI_NAME  # ROI tool still armed
+
+    layer = win.apply()
+    assert layer.data.shape == movie.shape and layer.data.max() == 8  # 2 objects x 4 slices
+    assert 'threshold preview' not in [ly.name for ly in v1.layers]
+    # result is handed over for painting
+    assert v1.layers.selection.active is layer
+    assert v1 in tiki.windows.shown_controls
+    tiki.set_tool('brush')
+    assert v1.layers.selection.active is layer and layer.mode == 'paint'
+
+    v2 = tiki.open_data(np.ones((16, 16)), 'flat.tif')
+    assert win.viewer is v2
+    win.update_preview()
+    assert 'threshold preview' not in [ly.name for ly in v1.layers]
+
+
+def test_brush_creates_labels_layer_when_none(tiki):
+    from napari.layers import Labels
+
+    v = tiki.open_data(np.zeros((3, 16, 16), np.uint16), 'img')
+    tiki.set_tool('eraser')
+    layer = v.layers.selection.active
+    assert isinstance(layer, Labels) and layer.data.shape == (3, 16, 16) and layer.mode == 'erase'
+    tiki.set_tool('rectangle')
+    assert v.layers.selection.active.name == roi.ROI_NAME

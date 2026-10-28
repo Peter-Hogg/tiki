@@ -66,6 +66,10 @@ class WindowManager(QObject):
         qt_viewer.dockLayerList.setVisible(False)
         qt_viewer.dockLayerControls.setVisible(False)
 
+    def show_layer_controls(self, viewer: napari.Viewer, visible: bool = True) -> None:
+        """Show napari's controls for the selected layer (brush size, contrast...)."""
+        viewer.window._qt_viewer.dockLayerControls.setVisible(visible)
+
     def _strip_shortcuts(self, viewer: napari.Viewer) -> None:
         """Remove napari menu shortcuts that TIKI uses app-wide (e.g. Ctrl+M)."""
         if not self.reserved_shortcuts or viewer not in self.viewers:

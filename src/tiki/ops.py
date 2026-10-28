@@ -132,3 +132,81 @@ def crop_to_box(data: np.ndarray, box: tuple[int, int, int, int]) -> np.ndarray:
     y0, y1 = max(0, y0), min(h, y1)
     x0, x1 = max(0, x0), min(w, x1)
     return data[..., y0:y1, x0:x1]
+
+
+# ImageJ's Auto Threshold method names -> scikit-image implementations.
+# "Default" in ImageJ is its IsoData variant, which skimage's isodata matches closely.
+THRESHOLD_METHODS = ['Default', 'IsoData', 'Li', 'Mean', 'Minimum', 'Otsu', 'Percentile', 'Triangle', 'Yen']
+
+
+def auto_threshold(values: np.ndarray, method: str = 'Default') -> float:
+    """Threshold value for ``values`` by an ImageJ-named method."""
+    from skimage import filters
+
+    values = np.asarray(values).ravel()
+    if values.size > 2_000_000:
+        values = values[:: values.size // 2_000_000]
+    if values.min() == values.max():
+        return float(values.min())
+    funcs = {
+        'Default': filters.threshold_isodata,
+        'IsoData': filters.threshold_isodata,
+        'Li': filters.threshold_li,
+        'Mean': filters.threshold_mean,
+        'Minimum': filters.threshold_minimum,
+        'Otsu': filters.threshold_otsu,
+        'Percentile': lambda v: np.percentile(v, 50),
+        'Triangle': filters.threshold_triangle,
+        'Yen': filters.threshold_yen,
+    }
+    if method not in funcs:
+        raise ValueError(f'unknown threshold method {method!r}')
+    return float(funcs[method](values))
+
+
+def threshold_mask(plane: np.ndarray, lower: float, upper: float) -> np.ndarray:
+    """Pixels with ``lower <= value <= upper``."""
+    plane = np.asarray(plane)
+    return (plane >= lower) & (plane <= upper)
+
+
+def label_objects(mask: np.ndarray, min_size: int = 0, start: int = 0) -> np.ndarray:
+    """Connected components of a 2D mask (8-connected, like Analyze Particles).
+
+    Objects smaller than ``min_size`` pixels are dropped; ids start at ``start + 1``.
+    """
+    from skimage.measure import label
+
+    labels = label(mask, connectivity=2).astype(np.int32)
+    if min_size > 1 and labels.max():
+        sizes = np.bincount(labels.ravel())
+        small = sizes < min_size
+        small[0] = False
+        labels[small[labels]] = 0
+        labels = label(labels > 0, connectivity=2).astype(np.int32)
+    if start:
+        labels[labels > 0] += start
+    return labels
+
+
+def threshold_stack(
+    data: np.ndarray, lower: float, upper: float, split: bool = False, min_size: int = 0
+) -> np.ndarray:
+    """Threshold every 2D plane of ``data`` into a uint8 mask or int32 labels.
+
+    With ``split`` each object gets its own id, unique across the whole stack.
+    Works plane by plane, so memory-mapped movies are never loaded at once.
+    """
+    lead = data.shape[:-2]
+    out = np.zeros(data.shape, dtype=np.int32 if split else np.uint8)
+    next_id = 0
+    for idx in np.ndindex(*lead) if lead else [()]:
+        mask = threshold_mask(data[idx], lower, upper)
+        if split:
+            out[idx] = label_objects(mask, min_size, start=next_id)
+            next_id = max(next_id, int(out[idx].max()))
+        else:
+            if min_size > 1:
+                mask = label_objects(mask, min_size) > 0
+            out[idx] = mask
+    return out

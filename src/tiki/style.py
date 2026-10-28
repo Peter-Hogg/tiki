@@ -16,6 +16,23 @@ WINDOW = '#f3f3f3'
 BASE = '#ffffff'
 BORDER = '#b9b9b9'
 
+
+def _check_mark_svg() -> str:
+    """Write a white tick SVG once so checked boxes show a mark, not just colour."""
+    import tempfile
+    from pathlib import Path
+
+    path = Path(tempfile.gettempdir()) / 'tiki_check.svg'
+    if not path.exists():
+        path.write_text(
+            '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 13 13">'
+            '<path d="M2.5 6.8 5.3 9.5 10.5 3.5" fill="none" stroke="white" stroke-width="2"/></svg>'
+        )
+    return path.as_posix()
+
+
+_CHECK = _check_mark_svg()
+
 STYLESHEET = f"""
 QWidget {{
     background: {WINDOW};
@@ -86,13 +103,28 @@ QPushButton:hover {{
 QPushButton:pressed {{
     background: #dde7f5;
 }}
-QLineEdit, QSpinBox, QComboBox {{
+QLineEdit, QComboBox {{
     background: {BASE};
     border: 1px solid {BORDER};
     border-radius: 3px;
     padding: 2px 4px;
     selection-background-color: {ACCENT};
     selection-color: white;
+}}
+QCheckBox::indicator {{
+    width: 13px;
+    height: 13px;
+    border: 1px solid #8c8c8c;
+    border-radius: 2px;
+    background: {BASE};
+}}
+QCheckBox::indicator:hover {{
+    border-color: {ACCENT};
+}}
+QCheckBox::indicator:checked {{
+    background: {ACCENT};
+    border-color: {ACCENT};
+    image: url({_CHECK});
 }}
 QComboBox QAbstractItemView {{
     background: {BASE};

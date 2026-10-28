@@ -72,6 +72,24 @@ def hand(p):
         p.drawPolyline(_poly([a, b, c]))
 
 
+def brush(p):
+    p.setBrush(QColor(200, 150, 90))
+    p.drawPolygon(_poly([(13, 4), (20, 11), (12, 15), (9, 12)]))  # handle
+    p.setBrush(QColor(230, 60, 60))
+    path = QPainterPath(QPointF(9, 12))
+    path.lineTo(12, 15)
+    path.cubicTo(10, 20, 6, 21, 3, 21)
+    path.cubicTo(4, 18, 4, 14, 9, 12)
+    p.drawPath(path)
+
+
+def eraser(p):
+    p.setBrush(QColor(240, 170, 190))
+    p.drawPolygon(_poly([(4, 15), (13, 6), (20, 13), (11, 22)]))
+    p.setBrush(QColor(255, 255, 255))
+    p.drawPolygon(_poly([(4, 15), (8, 11), (15, 18), (11, 22)]))
+
+
 ICONS = {
     'rectangle': rectangle,
     'oval': oval,
@@ -81,6 +99,8 @@ ICONS = {
     'point': point,
     'select': select,
     'hand': hand,
+    'brush': brush,
+    'eraser': eraser,
 }
 
 

@@ -53,3 +53,25 @@ def test_rectangle_and_ellipse_masks():
     assert abs(e.sum() - np.pi * 100) / (np.pi * 100) < 0.05
     line = roi.shape_mask(np.array([[0, 0], [5, 5]], float), 'line', (8, 8))
     assert line.sum() == 6
+
+
+def test_auto_threshold_methods_separate_two_populations():
+    rng = np.random.default_rng(1)
+    values = np.concatenate([rng.normal(100, 5, 5000), rng.normal(300, 5, 1000)])
+    for method in ops.THRESHOLD_METHODS:
+        t = ops.auto_threshold(values, method)
+        assert values.min() <= t <= values.max(), (method, t)
+        if method in ('Default', 'IsoData', 'Otsu', 'Li', 'Minimum'):
+            assert 112 < t < 290, (method, t)
+
+
+def test_threshold_stack_labels_unique_and_min_size():
+    data = np.zeros((2, 10, 10), np.uint16)
+    data[0, 1:4, 1:4] = 500   # 9 px object
+    data[0, 7, 7] = 500       # 1 px speck
+    data[1, 5:9, 5:9] = 500   # 16 px object
+    labels = ops.threshold_stack(data, 200, 1000, split=True, min_size=2)
+    assert labels.dtype == np.int32
+    assert set(np.unique(labels[0])) == {0, 1} and set(np.unique(labels[1])) == {0, 2}
+    mask = ops.threshold_stack(data, 200, 1000, split=False)
+    assert mask.dtype == np.uint8 and mask.sum() == 9 + 1 + 16

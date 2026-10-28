@@ -8,7 +8,7 @@ import traceback
 from pathlib import Path
 
 import numpy as np
-from napari.layers import Image, Points, Shapes
+from napari.layers import Image, Labels, Points, Shapes
 from qtpy.QtCore import Qt, QTimer
 from qtpy.QtGui import QKeySequence
 from qtpy.QtWidgets import (
@@ -50,6 +50,8 @@ TOOLS = [
     ('point', 'Point', 'add', 'points'),
     ('select', 'Move / edit ROI', 'select', 'shapes'),
     ('hand', 'Scrolling tool (pan & zoom)', 'pan_zoom', None),
+    ('brush', 'Paint labels (brush size in the layer controls)', 'paint', 'labels'),
+    ('eraser', 'Erase labels', 'erase', 'labels'),
 ]
 DRAW_MODES = {'add_rectangle', 'add_ellipse', 'add_polygon', 'add_polygon_lasso', 'add_line'}
 
@@ -71,6 +73,7 @@ class Tiki(QMainWindow):
         self.profiles: list[ProfileWindow] = []
         self._message_until = 0.0
         self._actions: dict[str, QAction] = {}
+        self.threshold_window = None
 
         self._build_menus()
         self.windows = WindowManager(
@@ -142,6 +145,7 @@ class Tiki(QMainWindow):
         m = mb.addMenu('&Image')
         adjust = m.addMenu('Adjust')
         self._add(adjust, 'Brightness/Contrast…', self.toggle_layer_controls, 'Ctrl+Shift+C')
+        self._add(adjust, 'Threshold…', self.threshold, 'Ctrl+Shift+T')
         self._add(adjust, 'Enhance Contrast', self.enhance_contrast, 'Ctrl+Shift+E')
         self._add(adjust, 'Reset Display Range', self.reset_contrast)
         m.addSeparator()
@@ -251,6 +255,9 @@ class Tiki(QMainWindow):
             layer = self._roi(viewer)
         elif kind == 'points':
             layer = roi_mod.points_layer(viewer)
+        elif kind == 'labels':
+            layer = self._labels_for_painting(viewer)
+            self.windows.show_layer_controls(viewer)
         else:
             for name in (roi_mod.ROI_NAME, roi_mod.POINTS_NAME):
                 if name in viewer.layers:
@@ -258,6 +265,29 @@ class Tiki(QMainWindow):
             return
         viewer.layers.selection.active = layer
         layer.mode = mode
+
+    def _labels_for_painting(self, viewer) -> Labels:
+        """The selected Labels layer, else the topmost one, else a new empty one."""
+        from .threshold import PREVIEW_NAME
+
+        active = viewer.layers.selection.active
+        if isinstance(active, Labels) and active.name != PREVIEW_NAME:
+            return active
+        labels = [ly for ly in viewer.layers if isinstance(ly, Labels) and ly.name != PREVIEW_NAME]
+        if labels:
+            return labels[-1]
+        image = roi_mod.target_image(viewer)
+        shape = image.data.shape[: image.ndim]
+        scale, translate = image.scale, image.translate
+        if np.prod(shape) * 2 > 1 * 2**30:  # >1 GB for a whole movie: paint one plane
+            shape, scale, translate = shape[-2:], scale[-2:], translate[-2:]
+            self.status('Movie too large for full-size labels; painting a single 2D plane')
+        layer = Labels(np.zeros(shape, np.uint16), name='labels', scale=scale, translate=translate, opacity=0.6)
+        viewer.add_layer(layer)
+        roi = roi_mod.roi_layer(viewer, create=False)
+        if roi is not None:
+            viewer.layers.move(viewer.layers.index(roi), len(viewer.layers))
+        return layer
 
     def _roi(self, viewer) -> Shapes:
         existed = roi_mod.roi_layer(viewer, create=False) is not None
@@ -287,6 +317,8 @@ class Tiki(QMainWindow):
     def _on_active_changed(self, viewer) -> None:
         if viewer is not None:
             self.apply_tool(viewer)
+        if self.threshold_window is not None and self.threshold_window.isVisible():
+            self.threshold_window.set_target(viewer)
 
     # ------------------------------------------------------------ helpers
 
@@ -387,6 +419,18 @@ class Tiki(QMainWindow):
 
     def toggle_layer_list(self) -> None:
         self._set_dock('dockLayerList')
+
+    def threshold(self) -> None:
+        from .threshold import ThresholdWindow
+
+        viewer, image = self.require_image()
+        if self.threshold_window is None:
+            self.threshold_window = ThresholdWindow(self)
+        win = self.threshold_window
+        win.show()
+        win.raise_()
+        win.set_target(viewer)
+        win.update_preview()
 
     def enhance_contrast(self) -> None:
         viewer, image = self.require_image()
@@ -583,6 +627,8 @@ class Tiki(QMainWindow):
     def closeEvent(self, event):
         self.windows.close_all()
         self.results.close()
+        if self.threshold_window is not None:
+            self.threshold_window.close()
         for w in list(self.profiles):
             w.close()
         event.accept()

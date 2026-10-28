@@ -95,6 +95,19 @@ pixel value.
 - Live ROI intensity profile through a stack, with current-frame indicator
 - Copy profiles or save them as CSV
 
+### Threshold → Labels
+
+- ImageJ-style Threshold dialog: histogram, lower/upper sliders, Default,
+  IsoData, Li, Mean, Minimum, Otsu, Percentile, Triangle and Yen methods,
+  dark-background and stack-histogram options
+- Live preview drawn as a translucent napari Labels layer on the current slice
+- **Apply** adds a Labels layer to the same window, either a 0/1 mask or one id
+  per connected object, with an optional minimum object size
+- The result is selected with napari's label controls open, ready for touch-up
+  with the brush, eraser and fill tools
+- Brush and eraser tools on the TIKI toolbar paint into the selected Labels
+  layer, or create an empty one for annotating from scratch
+
 ### File handling
 
 - TIFF/OME-TIFF via `tifffile`
@@ -112,6 +125,7 @@ pixel value.
 | File | Save As TIFF… | <kbd>Ctrl</kbd>+<kbd>S</kbd> |
 | Edit → Selection | Select All / Select None | <kbd>Ctrl</kbd>+<kbd>A</kbd> / <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>A</kbd> |
 | Image → Adjust | Brightness/Contrast | <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>C</kbd> |
+| Image → Adjust | Threshold… (preview and result are napari Labels) | <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>T</kbd> |
 | Image → Adjust | Enhance Contrast | <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>E</kbd> |
 | Image | Show Info | <kbd>Ctrl</kbd>+<kbd>I</kbd> |
 | Image | Crop | <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>X</kbd> |
@@ -147,6 +161,8 @@ src/tiki/
 ├── roi.py       selection layers, masks and current-slice helpers
 ├── io.py        TIFF and NumPy loading
 ├── widgets.py   Results and profile windows
+├── threshold.py Threshold dialog producing napari Labels
+├── style.py     fixed light theme for TIKI windows
 └── icons.py     toolbar icon drawing
 ```
 
