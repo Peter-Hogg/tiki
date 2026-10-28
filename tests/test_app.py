@@ -125,3 +125,30 @@ def test_drawing_replaces_previous_roi_unless_shift(tiki, qtbot):
     _drag(layer, (50, 5), (60, 10), modifiers=['Shift'])
     qtbot.wait(20)
     assert layer.nshapes == 2
+
+
+def test_command_errors_are_reported_not_raised(tiki, monkeypatch):
+    from qtpy.QtWidgets import QMessageBox
+
+    shown = []
+    monkeypatch.setattr(QMessageBox, 'warning', lambda *a: shown.append(('warning', a[1], a[2])))
+    monkeypatch.setattr(QMessageBox, 'critical', lambda *a: shown.append(('critical', a[1], a[2])))
+    tiki.open_data(np.zeros((16, 16)), 'img')
+    tiki._actions['Image>Crop'].trigger()  # no ROI drawn
+    tiki._actions['Analyze>Plot Profile'].trigger()
+    tiki._run('Boom', lambda: 1 / 0)
+    assert [s[0] for s in shown] == ['warning', 'warning', 'critical']
+    assert 'area selection' in shown[0][2]
+    assert 'ZeroDivisionError' in shown[2][2]
+
+
+def test_truncated_tiff_opens_with_warning(tmp_path):
+    import tifffile
+
+    from tiki import io
+
+    path = tmp_path / 'short.tif'
+    with tifffile.TiffWriter(path) as tw:
+        tw.write(np.zeros((5, 8, 8), np.uint16), metadata={'shape': [9, 8, 8]})
+    data, meta = io.read_image(path)
+    assert data.shape[-2:] == (8, 8)

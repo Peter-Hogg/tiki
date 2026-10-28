@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import sys
 import time
+import traceback
 from pathlib import Path
 
 import numpy as np
@@ -52,6 +54,10 @@ TOOLS = [
 DRAW_MODES = {'add_rectangle', 'add_ellipse', 'add_polygon', 'add_polygon_lasso', 'add_line'}
 
 STATUS_HOLD_MS = 4000
+
+
+class TikiError(Exception):
+    """An expected problem the user can fix (no image open, wrong ROI type...)."""
 
 
 class Tiki(QMainWindow):
@@ -182,12 +188,25 @@ class Tiki(QMainWindow):
             self._message_until = time.monotonic() + STATUS_HOLD_MS / 1000
 
     def _run(self, name: str, slot) -> None:
-        """Run a menu command, reporting errors in the status bar like ImageJ."""
+        """Run a menu command; problems become a message box, never a crash.
+
+        PyQt6 aborts the whole process on an exception escaping a slot, so
+        nothing is re-raised here.
+        """
+        name = name.rstrip('…')
         try:
             slot()
-        except Exception as exc:  # keep the toolbar alive whatever a command does
-            self.status(f'{name}: {exc}')
-            raise
+        except TikiError as exc:
+            self.report(name, str(exc))
+        except Exception as exc:
+            traceback.print_exc()
+            self.report(name, f'{type(exc).__name__}: {exc}\n\n(full traceback in the terminal)', error=True)
+
+    def report(self, title: str, message: str, error: bool = False) -> None:
+        """Show a problem the way ImageJ does: a small dialog plus the status bar."""
+        self.status(f'{title}: {message.splitlines()[0]}')
+        box = QMessageBox.critical if error else QMessageBox.warning
+        box(self, title, message)
 
     def _on_cursor(self, viewer, position) -> None:
         if time.monotonic() < self._message_until:
@@ -273,7 +292,7 @@ class Tiki(QMainWindow):
     def require_image(self):
         viewer, image = self.windows.active_image()
         if image is None:
-            raise RuntimeError('no image open')
+            raise TikiError('no image open')
         return viewer, image
 
     def open_data(self, data, name, **kwargs):
@@ -289,12 +308,19 @@ class Tiki(QMainWindow):
     def open_paths(self, paths) -> None:
         for path in paths:
             t0 = time.perf_counter()
-            data, meta = io.read_image(path)
+            try:
+                data, meta = io.read_image(path)
+            except Exception as exc:
+                traceback.print_exc()
+                self.report('Open', f'Could not open {Path(path).name}:\n{exc}')
+                continue
             kwargs = {'metadata': {'path': meta['path']}}
             if 'scale' in meta:
                 kwargs['scale'] = meta['scale']
             self.open_data(data, meta['name'], **kwargs)
             self.status(f'Opened {meta["name"]} {data.shape} {data.dtype} in {time.perf_counter() - t0:.2f} s')
+            if 'warning' in meta:
+                self.report('Open', f'{meta["name"]}: {meta["warning"]}')
 
     def open_dialog(self) -> None:
         paths, _ = QFileDialog.getOpenFileNames(self, 'Open', str(Path.home()), io.OPEN_FILTER)
@@ -349,7 +375,7 @@ class Tiki(QMainWindow):
     def _set_dock(self, dock_name: str) -> None:
         viewer = self.windows.active
         if viewer is None:
-            raise RuntimeError('no image open')
+            raise TikiError('no image open')
         dock = getattr(viewer.window._qt_viewer, dock_name)
         dock.setVisible(not dock.isVisible())
 
@@ -409,7 +435,7 @@ class Tiki(QMainWindow):
         viewer, image = self.require_image()
         box = self._roi_box(viewer, image)
         if box is None:
-            raise RuntimeError('Crop needs an area selection')
+            raise TikiError('Crop needs an area selection')
         image.data = np.array(ops.crop_to_box(image.data, box))
         self.select_none()
         viewer.reset_view()
@@ -417,7 +443,7 @@ class Tiki(QMainWindow):
     def z_project_dialog(self) -> None:
         viewer, image = self.require_image()
         if image.ndim < 3:
-            raise RuntimeError('Z Project needs a stack')
+            raise TikiError('Z Project needs a stack')
         dlg = QDialog(self)
         dlg.setWindowTitle('ZProjection')
         form = QFormLayout(dlg)
@@ -466,7 +492,7 @@ class Tiki(QMainWindow):
     def plot_z_profile(self) -> None:
         viewer, image = self.require_image()
         if image.ndim < 3:
-            raise RuntimeError('Plot Z-axis Profile needs a stack')
+            raise TikiError('Plot Z-axis Profile needs a stack')
         axis = 0
         last = viewer.dims.last_used - (viewer.dims.ndim - image.ndim)
         if 0 <= last < image.ndim - 2:
@@ -519,7 +545,7 @@ class Tiki(QMainWindow):
         viewer, image = self.require_image()
         current = self.current_roi(viewer)
         if current is None or current[1] != 'line':
-            raise RuntimeError('Plot Profile needs a straight line selection')
+            raise TikiError('Plot Profile needs a straight line selection')
         src, dst = np.asarray(current[0])[:, -2:]
         plane = roi_mod.current_plane(viewer, image)
         values = profile_line(plane, src, dst, order=1, mode='constant', reduce_func=None)
@@ -560,6 +586,22 @@ class Tiki(QMainWindow):
             w.close()
         event.accept()
         QApplication.instance().quit()
+
+
+def install_excepthook(tiki: Tiki) -> None:
+    """Catch errors outside menu commands (mouse callbacks, timers, live plots).
+
+    Without this PyQt6 calls abort() on any exception raised inside Qt.
+    """
+
+    def hook(exc_type, exc, tb):
+        traceback.print_exception(exc_type, exc, tb)
+        try:
+            tiki.status(f'Error: {exc_type.__name__}: {exc} (see terminal)')
+        except Exception:
+            pass
+
+    sys.excepthook = hook
 
 
 class CommandFinder(QDialog):

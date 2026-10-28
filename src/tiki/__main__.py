@@ -8,11 +8,12 @@ import sys
 def main(argv: list[str] | None = None) -> int:
     from napari.qt import get_qapp
 
-    from .app import Tiki
+    from .app import Tiki, install_excepthook
 
     argv = sys.argv[1:] if argv is None else argv
     app = get_qapp()
     tiki = Tiki()
+    install_excepthook(tiki)
     tiki.show()
     if argv:
         tiki.open_paths(argv)

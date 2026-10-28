@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import logging
+
 import numpy as np
 import tifffile
 
@@ -40,12 +42,26 @@ def read_image(path: str | Path) -> tuple[np.ndarray, dict]:
     if suffix == '.npy':
         return np.load(path, mmap_mode='r'), meta
     if suffix in ('.tif', '.tiff'):
-        with tifffile.TiffFile(path) as tf:
-            try:
-                data = tf.asarray(out='memmap')
-            except Exception:
-                data = tf.asarray()
-            scale = _tiff_scale(tf, data.ndim)
+        # tifffile logs (rather than raises) when the header promises more
+        # frames than the file holds; report that ourselves instead.
+        tif_log = logging.getLogger('tifffile')
+        level = tif_log.level
+        tif_log.setLevel(logging.ERROR + 10)
+        try:
+            with tifffile.TiffFile(path) as tf:
+                expected = tf.series[0].shape
+                try:
+                    data = tf.asarray(out='memmap')
+                except Exception:
+                    data = tf.asarray()
+                scale = _tiff_scale(tf, data.ndim)
+        finally:
+            tif_log.setLevel(level)
+        if data.shape != tuple(expected):
+            meta['warning'] = (
+                f'header says {expected} but the file holds {data.shape}; '
+                'opened what is there (acquisition stopped early, or split across files?)'
+            )
         if scale is not None:
             meta['scale'] = scale
         return data, meta
