@@ -81,7 +81,7 @@ class Tiki(QMainWindow):
         style.apply(self)
         self.setWindowTitle('TIKI')
         self.setAcceptDrops(True)
-        self.tool = 'rectangle'
+        self.tool = 'hand'  # nothing gets drawn until a drawing tool is picked
         self.results = ResultsTable()
         self.profiles: list[ProfileWindow] = []
         self._message_until = 0.0
@@ -96,6 +96,7 @@ class Tiki(QMainWindow):
         )
         self.windows.active_changed.connect(self._on_active_changed)
         self.windows.cursor_moved.connect(self._on_cursor)
+        self.windows.ndisplay_changed.connect(self._on_ndisplay)
         self._build_toolbar()
         self.status('TIKI Is Kinda ImageJ — File ▸ Open or drop an image here')
 
@@ -295,10 +296,20 @@ class Tiki(QMainWindow):
         self.status(tip)
 
     def apply_tool(self, viewer) -> None:
-        """Put ``viewer`` in the mode for the current tool (ImageJ tools are global)."""
+        """Put ``viewer`` in the mode for the current tool (ImageJ tools are global).
+
+        In 3D view the mouse rotates the volume, so drawing tools stand down
+        (otherwise a drag meant to rotate draws shapes in 3D space).
+        """
         if roi_mod.target_image(viewer) is None:
             return
         _, _, mode, kind = next(t for t in TOOLS if t[0] == self.tool)
+        if viewer.dims.ndisplay == 3:
+            for layer in viewer.layers:
+                if isinstance(layer, (Shapes, Points, Labels)) and layer.mode != 'pan_zoom':
+                    layer.mode = 'pan_zoom'
+            viewer.layers.selection.active = roi_mod.target_image(viewer)
+            return
         if kind == 'shapes':
             layer = self._roi(viewer)
         elif kind == 'points':
@@ -361,6 +372,16 @@ class Tiki(QMainWindow):
             return
         layer.selected_data = set(range(layer.nshapes - 1))
         layer.remove_selected()
+
+    def _on_ndisplay(self, viewer) -> None:
+        self.apply_tool(viewer)
+        if viewer.dims.ndisplay == 3:
+            image = roi_mod.target_image(viewer)
+            note = ''
+            if image is not None and axes_mod.get(image).z_assumed:
+                note = ' z-step unknown, so voxels are drawn as cubes: set it in Image ▸ Properties.'
+            self.status('3D view: drag to rotate, shift-drag to pan; drawing tools work in 2D.' + note)
+            self._message_until = time.monotonic() + 8
 
     def _on_active_changed(self, viewer) -> None:
         if viewer is not None:

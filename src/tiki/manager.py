@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import napari
 import numpy as np
-from qtpy.QtCore import QEvent, QObject, QTimer, Signal
+from qtpy.QtCore import QEvent, QObject, Qt, QTimer, Signal
 from qtpy.QtGui import QKeySequence, QShortcut
 from qtpy.QtWidgets import QAction, QMenu
 
@@ -20,6 +20,7 @@ class WindowManager(QObject):
     active_changed = Signal(object)  # napari.Viewer | None
     windows_changed = Signal()
     cursor_moved = Signal(object, object)  # viewer, world position
+    ndisplay_changed = Signal(object)  # viewer switched between 2D and 3D
 
     def __init__(self, reserved_shortcuts: list[str] | None = None):
         super().__init__()
@@ -69,10 +70,43 @@ class WindowManager(QObject):
         return viewer
 
     def _slim(self, viewer: napari.Viewer) -> None:
-        """Hide the layer docks so a window is mostly just the image."""
+        """Hide the layer docks so a window is mostly just the image, but keep
+        napari's view buttons (2D/3D, grid, reset view...) in a small toolbar."""
         qt_viewer = viewer.window._qt_viewer
         qt_viewer.dockLayerList.setVisible(False)
         qt_viewer.dockLayerControls.setVisible(False)
+        try:
+            self._add_view_toolbar(viewer)
+        except Exception:  # napari internals moved: the window still works without it
+            import traceback
+
+            traceback.print_exc()
+
+    def _add_view_toolbar(self, viewer: napari.Viewer) -> None:
+        from napari._qt.widgets.qt_viewer_buttons import QtViewerButtons
+        from qtpy.QtWidgets import QToolBar, QToolButton
+
+        qwin = viewer.window._qt_window
+        bar = QToolBar('View', qwin)
+        bar.setObjectName('tiki_view_toolbar')
+        bar.setMovable(False)
+        buttons = QtViewerButtons(viewer.window._qt_viewer.viewer)
+        buttons.consoleButton.setVisible(False)
+        bar.addWidget(buttons)
+        bar.addSeparator()
+        qt_viewer = viewer.window._qt_viewer
+        for text, dock, tip in (
+            ('Layers', qt_viewer.dockLayerList, 'Show the layer list'),
+            ('Controls', qt_viewer.dockLayerControls, 'Show controls for the selected layer (contrast, colormap, brush...)'),
+        ):
+            b = QToolButton()
+            b.setText(text)
+            b.setToolTip(tip)
+            b.setCheckable(True)
+            b.toggled.connect(dock.setVisible)
+            dock.visibilityChanged.connect(b.setChecked)
+            bar.addWidget(b)
+        qwin.addToolBar(Qt.TopToolBarArea, bar)
 
     def show_layer_controls(self, viewer: napari.Viewer, visible: bool = True) -> None:
         """Show napari's controls for the selected layer (brush size, contrast...)."""
@@ -106,6 +140,7 @@ class WindowManager(QObject):
         self._strip_shortcuts(viewer)
         # napari rebuilds menus lazily; strip again once the window settles.
         QTimer.singleShot(0, lambda: self._strip_shortcuts(viewer))
+        viewer.dims.events.ndisplay.connect(lambda event, v=viewer: self.ndisplay_changed.emit(v))
         viewer.layers.events.inserted.connect(lambda event, v=viewer: self._on_layer_added(v, event.value))
         viewer.cursor.events.position.connect(
             lambda event, v=viewer: self.cursor_moved.emit(v, v.cursor.position)

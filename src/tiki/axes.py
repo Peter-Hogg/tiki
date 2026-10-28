@@ -67,8 +67,25 @@ class AxesInfo:
         return out
 
     @property
+    def z_assumed(self) -> bool:
+        """Z has no step but X/Y are calibrated: Z is drawn as cubic voxels."""
+        z, y = self.index('Z'), self.index('Y')
+        return z is not None and y is not None and not self.axes[z].step and bool(self.axes[y].step)
+
+    @property
     def scale(self) -> list[float]:
-        return [1.0 if a.role in ('C', '?') else a.scale for a in self.axes]
+        out = [1.0 if a.role in ('C', '?') else a.scale for a in self.axes]
+        if self.z_assumed:  # like ImageJ's 3D viewer: assume isotropic voxels
+            out[self.index('Z')] = self.axes[self.index('Y')].step
+        return out
+
+    def display_unit(self, i: int) -> str | None:
+        a = self.axes[i]
+        if a.step:
+            return a.unit
+        if a.role == 'Z' and self.z_assumed:
+            return self.axes[self.index('Y')].unit
+        return None
 
     def describe(self) -> str:
         parts = []
@@ -371,7 +388,7 @@ def apply(viewer, image, info: AxesInfo) -> None:
         labels[len(labels) - image.ndim + k] = label
     viewer.dims.axis_labels = labels
     try:  # napari >= 0.6 takes physical units per layer axis
-        image.units = tuple(PINT_UNITS.get(a.unit, 'pixel') if a.step else 'pixel' for a in info.axes)
+        image.units = tuple(PINT_UNITS.get(info.display_unit(i), 'pixel') for i in range(len(info.axes)))
     except Exception:
         pass  # unknown unit string: keep the scale, skip the unit
     for layer in viewer.layers:

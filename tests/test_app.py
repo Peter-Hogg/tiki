@@ -13,6 +13,7 @@ def tiki(qtbot):
     # platform lacks; record the request instead of showing them.
     t.windows.shown_controls = []
     t.windows.show_layer_controls = lambda v, visible=True: t.windows.shown_controls.append(v)
+    t.set_tool('rectangle')  # most tests draw ROIs; the app default is the pan tool
     qtbot.addWidget(t)
     t.show()
     yield t
@@ -425,3 +426,40 @@ def test_properties_relabel_and_remember(tiki, tmp_path, monkeypatch):
     np.save(tmp_path / 'other.npy', np.zeros((99, 8, 8), np.float32))
     tiki.open_paths([str(tmp_path / 'other.npy')])
     assert tiki.windows.active.dims.axis_labels[0] == 't'
+
+
+def test_3d_view_disarms_drawing_and_assumes_cubic_voxels(tiki, hyperstack):
+    import tifffile
+
+    path, data = hyperstack
+    nozstep = path.with_name('noz.tif')
+    tifffile.imwrite(nozstep, data, imagej=True, resolution=(4, 4), metadata={'axes': 'TZCYX', 'unit': 'um'})
+    tiki.open_paths([str(nozstep)])
+    v = tiki.windows.active
+    image = v.layers['noz.tif']
+    assert tuple(image.scale)[1] == pytest.approx(0.25)  # z drawn like x/y
+    assert str(image.units[1]) == 'micrometer'
+    roi_layer = v.layers[roi.ROI_NAME]
+    assert roi_layer.mode == 'add_rectangle'
+    v.dims.ndisplay = 3
+    assert roi_layer.mode == 'pan_zoom' and v.layers.selection.active is image
+    assert 'drawing tools work in 2D' in tiki.status_label.text()
+    v.dims.ndisplay = 2
+    assert roi_layer.mode == 'add_rectangle'
+
+
+def test_view_toolbar_present(tiki):
+    from qtpy.QtWidgets import QToolBar
+
+    v = tiki.open_data(np.zeros((4, 8, 8)), 'img')
+    bars = [b for b in v.window._qt_window.findChildren(QToolBar) if b.objectName() == 'tiki_view_toolbar']
+    assert len(bars) == 1
+
+
+def test_default_tool_is_pan_and_draws_nothing(qtbot):
+    t = Tiki()
+    qtbot.addWidget(t)
+    assert t.tool == 'hand'
+    v = t.open_data(np.zeros((4, 8, 8)), 'img')
+    assert roi.ROI_NAME not in v.layers  # no drawing layer until a drawing tool is chosen
+    t.windows.close_all()

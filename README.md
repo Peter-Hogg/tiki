@@ -113,6 +113,11 @@ pixel value.
   used when present); **Merge Channels** restores the original
 - Z Project never averages channels and keeps T and C; profiles and traces run
   along T (else Z)
+- Each image window has napari's view buttons (2D/3D, roll and transpose axes,
+  grid, reset view) plus Layers/Controls toggles
+- In 3D the mouse always rotates: drawing tools stand down until you return to
+  2D. If the z-step is unknown, voxels are drawn as cubes (as ImageJ's 3D
+  viewer does) and the status bar says so
 
 ### Threshold → Labels
 
