@@ -27,7 +27,7 @@ Run the application and tests:
 
 ```bash
 tiki
-QT_QPA_PLATFORM=offscreen python -m pytest -q  # headless, as in CI
+QT_QPA_PLATFORM=offscreen python -m pytest -q  # headless on a desktop with a GPU
 sphinx-build -W --keep-going -b html docs docs/_build/html
 ```
 
@@ -41,8 +41,10 @@ sphinx-build -W --keep-going -b html docs docs/_build/html
 5. Confirm the test and documentation builds pass before opening the PR.
 
 Without `QT_QPA_PLATFORM=offscreen` the tests open real windows on your
-display. Offscreen mode has no OpenGL, so tests stub out napari's layer-control
-panels (see the `tiki` fixture in `tests/test_app.py`).
+display. Offscreen mode borrows OpenGL from your GPU driver; machines without
+one (like CI runners) need `xvfb-run` plus Qt's xcb libraries instead, as in
+`.github/workflows/tests.yml`. Tests stub out napari's layer-control panels
+(see the `tiki` fixture in `tests/test_app.py`).
 
 By contributing, you agree that your contribution is licensed under the
 project's BSD 3-Clause License.
