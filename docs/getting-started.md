@@ -2,7 +2,7 @@
 
 ## Requirements
 
-- Python 3.10 or newer
+- Python 3.11 or newer
 - A desktop with working OpenGL graphics
 - Linux, macOS or Windows
 
