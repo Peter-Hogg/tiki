@@ -7,6 +7,12 @@
   Familiar tools and workflows, backed by Python image processing.
 </p>
 
+<p align="center">
+  <a href="https://github.com/Peter-Hogg/tiki/actions/workflows/tests.yml"><img alt="Tests" src="https://github.com/Peter-Hogg/tiki/actions/workflows/tests.yml/badge.svg"></a>
+  <a href="https://peter-hogg.github.io/tiki/"><img alt="Documentation" src="https://img.shields.io/badge/docs-GitHub%20Pages-2ea44f"></a>
+  <a href="LICENSE"><img alt="License: BSD-3-Clause" src="https://img.shields.io/badge/license-BSD--3--Clause-blue"></a>
+</p>
+
 > [!NOTE]
 > TIKI is an early prototype. The core workflow works, but interfaces and
 > shortcuts may change while it is tested on real microscopy data.
@@ -212,13 +218,16 @@ on Linux; in TIKI it consistently means **Measure**.
 
 ## Development
 
+The full user and contributor documentation is available at
+**[peter-hogg.github.io/tiki](https://peter-hogg.github.io/tiki/)**.
+
 Install the test dependencies and run the suite headlessly:
 
 ```bash
 cd ~/Code/tiki
 source .venv/bin/activate
 python -m pip install -e '.[test]'
-QT_QPA_PLATFORM=offscreen python -m pytest -q
+python -m pytest -q
 ```
 
 The code is intentionally split so image processing can be tested without the
@@ -262,5 +271,4 @@ shipping any Java code.
 
 ## License
 
-A license has not been selected yet. Add a `LICENSE` file before distributing
-or accepting external contributions.
+TIKI is distributed under the [BSD 3-Clause License](LICENSE).

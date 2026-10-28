@@ -1,0 +1,24 @@
+name: Feature request
+description: Suggest an ImageJ-style workflow or improvement
+title: "[Feature]: "
+labels: [enhancement]
+body:
+  - type: textarea
+    id: workflow
+    attributes:
+      label: Scientific workflow
+      description: What are you trying to accomplish, and how do you do it today?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed behavior
+      description: Describe the command, interaction or shortcut you would expect.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Existing alternatives
+      description: Mention relevant ImageJ/Fiji commands or napari plugins.

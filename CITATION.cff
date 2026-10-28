@@ -1,0 +1,19 @@
+cff-version: 1.2.0
+message: "If TIKI helps your work, please cite the software using this metadata."
+title: "TIKI: an ImageJ-style toolbar for napari"
+type: software
+authors:
+  - family-names: Hogg
+    given-names: Peter
+    email: peterhogg@fas.harvard.edu
+repository-code: "https://github.com/Peter-Hogg/tiki"
+url: "https://peter-hogg.github.io/tiki/"
+license: BSD-3-Clause
+version: 0.0.1
+date-released: 2026-10-27
+keywords:
+  - bioimage analysis
+  - microscopy
+  - napari
+  - ImageJ
+  - Python

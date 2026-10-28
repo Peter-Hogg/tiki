@@ -982,9 +982,14 @@ class Tiki(QMainWindow):
         traces = [(w.windowTitle(), w.names, w.traces) for w in self.traces if w.viewer is viewer]
         out, snippet = export_session(folder, viewer, image, manager, traces,
                                       self.results.rows, self.results.columns)
-        QApplication.clipboard().setText(snippet)
-        self.status(f'Exported to {out}; loader code copied to clipboard')
-        if not getattr(self, '_quiet_export', False):
+        quiet = getattr(self, '_quiet_export', False)
+        # Clipboard access can block indefinitely on headless Linux. Quiet
+        # mode is used by tests and programmatic callers, which already get
+        # the snippet as the return value.
+        if not quiet:
+            QApplication.clipboard().setText(snippet)
+        self.status(f'Exported to {out}' + ('' if quiet else '; loader code copied to clipboard'))
+        if not quiet:
             QMessageBox.information(
                 self, 'Send to Notebook',
                 f'Wrote {out}\n\nPaste into a notebook (already on your clipboard):\n\n'

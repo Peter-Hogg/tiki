@@ -9,6 +9,18 @@ description = "TIKI Is Kinda ImageJ: an ImageJ-style toolbar that drives napari 
 readme = "README.md"
 requires-python = ">=3.10"
 authors = [{ name = "Peter Hogg", email = "peterhogg@fas.harvard.edu" }]
+license = "BSD-3-Clause"
+license-files = ["LICENSE"]
+keywords = ["napari", "imagej", "fiji", "microscopy", "bioimage-analysis"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: BSD License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Topic :: Scientific/Engineering :: Image Processing",
+]
 dependencies = [
     "napari[pyqt6]>=0.5",
     "numpy",
@@ -21,6 +33,19 @@ dependencies = [
 
 [project.optional-dependencies]
 test = ["pytest", "pytest-qt"]
+docs = [
+    "sphinx>=7",
+    "furo",
+    "myst-parser",
+    "sphinx-copybutton",
+    "sphinx-design",
+]
+
+[project.urls]
+Homepage = "https://github.com/Peter-Hogg/tiki"
+Documentation = "https://peter-hogg.github.io/tiki/"
+Issues = "https://github.com/Peter-Hogg/tiki/issues"
+Source = "https://github.com/Peter-Hogg/tiki"
 
 [project.scripts]
 tiki = "tiki.__main__:main"

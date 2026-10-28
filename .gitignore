@@ -2,4 +2,9 @@
 __pycache__/
 *.egg-info/
 .pytest_cache/
+docs/_build/
+dist/
+build/
+.coverage
+htmlcov/
 sample_data/

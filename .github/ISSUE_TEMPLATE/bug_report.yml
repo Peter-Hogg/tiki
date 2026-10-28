@@ -1,0 +1,41 @@
+name: Bug report
+description: Report a reproducible problem in TIKI
+title: "[Bug]: "
+labels: [bug]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: What happened?
+      description: Describe what you expected and what happened instead.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. Open...
+        2. Select...
+        3. Run...
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: Operating system, Python version, TIKI version or commit, and installation method.
+    validations:
+      required: true
+  - type: textarea
+    id: traceback
+    attributes:
+      label: Terminal output
+      render: shell
+  - type: checkboxes
+    id: privacy
+    attributes:
+      label: Data safety
+      options:
+        - label: I removed private data, credentials and identifying file paths.
+          required: true
