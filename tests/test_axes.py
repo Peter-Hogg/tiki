@@ -75,3 +75,18 @@ def test_problems_and_derivation():
     assert any('more than one T' in p for p in probs) and any('Y and X' in p for p in probs)
     assert axes.stack_axis(info) == 0
     assert axes.stack_axis(axes.AxesInfo([axes.Axis('C', 2), axes.Axis('Y', 4), axes.Axis('X', 4)])) is None
+
+
+def test_imagej_slices_with_fps_are_time(tmp_path):
+    path = tmp_path / 'movie_as_slices.tif'
+    tifffile.imwrite(path, np.zeros((30, 8, 8), np.uint16), imagej=True, metadata={'axes': 'ZYX', 'fps': 60.0})
+    info = io.read_image(path)[1]['axes']
+    assert info.roles == 'TYX'
+    assert info.axes[0].step == pytest.approx(1 / 60) and info.axes[0].unit == 's'
+    assert any('fps' in n for n in info.notes)
+
+
+def test_imagej_zstack_with_spacing_stays_z(tmp_path):
+    path = tmp_path / 'zstack.tif'
+    tifffile.imwrite(path, np.zeros((30, 8, 8), np.uint16), imagej=True, metadata={'axes': 'ZYX', 'spacing': 0.5, 'unit': 'um'})
+    assert io.read_image(path)[1]['axes'].roles == 'ZYX'

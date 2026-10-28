@@ -249,3 +249,33 @@ def test_bleach_exponential_refuses_without_decay():
     movie = np.ones((60, 4, 4), np.float32) * means[:, None, None].astype(np.float32)
     with pytest.raises(ValueError, match='no bleaching decay'):
         ops.bleach_correct(movie, axis=0, method='exponential')
+
+
+def test_dff_never_flips_sign_on_negative_data():
+    trace = np.full((1, 100), -250.0)
+    trace[0, 40:45] += 40  # a positive transient on a negative baseline
+    raw = ops.dff(trace)
+    assert np.isnan(raw).all()  # F0 <= 0: refuse rather than flip
+    fixed = ops.dff(trace, offset=ops.suggested_offset(trace) - 50)  # dark level 50 below the baseline
+    assert fixed[0, 42] == pytest.approx(40 / 50)
+    assert ops.suggested_offset(np.array([1.0, 5.0])) == 0.0
+
+
+def test_correlation_image_finds_cell_not_brightness():
+    rng = np.random.default_rng(0)
+    movie = rng.normal(0, 1, (300, 24, 30)).astype(np.float32)
+    sig = rng.normal(0, 1, 300).astype(np.float32)
+    movie[:, 8:14, 8:14] += 3 * sig[:, None, None]
+    movie[:, :, 20:] += 100  # bright but uncorrelated
+    old = ops.CHUNK_BYTES
+    ops.CHUNK_BYTES = 300 * 30 * 4 * 5  # 5-row chunks with halos
+    try:
+        cn = ops.correlation_image(movie, 0, (0, 0, 0))
+    finally:
+        ops.CHUNK_BYTES = old
+    assert cn[9:13, 9:13].mean() > 0.8
+    assert abs(cn[:, 22:].mean()) < 0.05
+    z = (movie - movie.mean(0)) / movie.std(0)
+    ref = np.mean([np.mean(z[:, 10, 10] * z[:, 10 + dy, 10 + dx])
+                   for dy in (-1, 0, 1) for dx in (-1, 0, 1) if (dy, dx) != (0, 0)])
+    assert cn[10, 10] == pytest.approx(ref, abs=1e-4)

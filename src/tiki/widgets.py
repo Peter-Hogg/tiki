@@ -259,14 +259,26 @@ class TracesWindow(QWidget):
 
         self.figure = Figure(figsize=(7, 4), layout='constrained')
         self.canvas = FigureCanvasQTAgg(self.figure)
+        from qtpy.QtWidgets import QDoubleSpinBox, QLabel
+
         self.dff = QCheckBox('ΔF/F (F0 = median)')
         self.dff.toggled.connect(lambda _: self.draw())
+        self.offset = QDoubleSpinBox(decimals=2, minimum=-1e9, maximum=1e9)
+        self.offset.setPrefix('offset ')
+        self.offset.setToolTip('Subtracted before ΔF/F (camera dark level). Pre-set to the data minimum '
+                               'when traces go below zero, since ΔF/F needs a positive F0.')
+        self.offset.setValue(ops.suggested_offset(self.raw) if np.isfinite(self.raw).any() else 0.0)
+        self.offset.valueChanged.connect(lambda _: self.dff.isChecked() and self.draw())
+        self.offset_note = QLabel('below zero: offset set to minimum' if self.offset.value() < 0 else '')
+        self.offset_note.setStyleSheet('color: #8a5a00;')
         self.mode = QComboBox()
         self.mode.addItems(['Stacked', 'Overlay', 'Heatmap'])
         self.mode.setCurrentText('Heatmap' if len(self.names) > self.HEATMAP_ABOVE else 'Stacked')
         self.mode.currentTextChanged.connect(lambda _: self.draw())
         bar = QHBoxLayout()
         bar.addWidget(self.dff)
+        bar.addWidget(self.offset)
+        bar.addWidget(self.offset_note)
         bar.addWidget(self.mode)
         bar.addStretch()
         for text, slot in (('Copy', self.copy), ('Save .npy…', self.save_npy), ('Save CSV…', self.save_csv)):
@@ -284,7 +296,7 @@ class TracesWindow(QWidget):
 
     @property
     def traces(self) -> np.ndarray:
-        return ops.dff(self.raw) if self.dff.isChecked() else self.raw
+        return ops.dff(self.raw, self.offset.value()) if self.dff.isChecked() else self.raw
 
     def draw(self) -> None:
         self.figure.clear()

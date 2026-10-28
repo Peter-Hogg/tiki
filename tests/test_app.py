@@ -725,3 +725,21 @@ def test_open_recent(tiki, tmp_path, monkeypatch):
     texts = [a.text() for a in tiki.recent_menu.actions()]
     assert texts[:2] == ['two.npy', 'one.npy (missing)']
     assert not tiki.recent_menu.actions()[1].isEnabled()
+
+
+def test_correlation_image_and_negative_offset_traces(tiki, accept_dialogs):
+    from tiki import process
+
+    rng = np.random.default_rng(3)
+    movie = (rng.normal(-250, 2, (200, 20, 24))).astype(np.float32)  # negative baseline
+    sig = np.abs(rng.normal(0, 1, 200)).astype(np.float32)
+    movie[:, 5:10, 5:10] += 20 * sig[:, None, None]
+    v = _open_with_axes(tiki, movie, 'TYX', 'neg.tif', {'T': 0.033})
+    cn_win = process.correlation_image(tiki)
+    cn = cn_win.layers[0].data
+    assert cn.shape == (20, 24) and cn[6:9, 6:9].mean() > 0.5 > cn[15:, 15:].mean()
+    tiki.windows.activate(v)
+    win = tiki.show_traces(v, v.layers['neg.tif'], ['cell'], masks=[np.pad(np.ones((5, 5), bool), ((5, 10), (5, 14)))])
+    assert win.offset.value() < -250  # pre-set to the data minimum
+    win.dff.setChecked(True)
+    assert np.nanmax(win.traces) > 0.5  # transients point up, not down

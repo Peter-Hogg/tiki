@@ -181,6 +181,7 @@ class Tiki(QMainWindow):
         self._add(stacks, 'Z Project…', self.z_project_dialog)
         self._add(stacks, 'Plot Z-axis Profile', self.plot_z_profile, 'Ctrl+Shift+Y')
         self._add(stacks, 'Kymograph / Reslice…', lambda: self._process('kymograph_dialog'))
+        self._add(stacks, 'Correlation Image', lambda: self._process('correlation_image'))
         stacks.addSeparator()
         self._add(stacks, 'Split Channels ', self.split_channels)  # same command as Image ▸ Color
 

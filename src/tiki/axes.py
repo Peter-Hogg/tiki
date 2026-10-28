@@ -246,6 +246,17 @@ def from_tiff(tf, data_shape: tuple) -> AxesInfo:
         if ij.get('spacing') and info.index('Z') is not None:
             axes[info.index('Z')].step = float(ij['spacing'])
             axes[info.index('Z')].unit = _unit(ij.get('unit')) or 'µm'
+        rate = ij.get('fps') or (1 / float(ij['finterval']) if ij.get('finterval') else None)
+        if (info.index('T') is None and info.index('Z') is not None and rate
+                and not ij.get('spacing') and not ij.get('frames')):
+            # ImageJ often saves movies as plain "slices"; a frame rate without a
+            # z-spacing says the stack axis is really time.
+            axes[info.index('Z')].role = 'T'
+            notes.append(f'ImageJ stored the frames as slices; fps = {float(rate):g} says this is time '
+                         '(change in Image ▸ Properties if not)')
+        if ij.get('fps') and not ij.get('finterval') and info.index('T') is not None:
+            axes[info.index('T')].step = 1 / float(ij['fps'])
+            axes[info.index('T')].unit = 's'
         if ij.get('finterval') and info.index('T') is not None:
             axes[info.index('T')].step = float(ij['finterval'])
             axes[info.index('T')].unit = _unit(ij.get('tunit')) or 's'

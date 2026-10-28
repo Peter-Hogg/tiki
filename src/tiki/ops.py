@@ -349,11 +349,68 @@ def label_traces(data, axis: int, index: tuple, labels: np.ndarray, chunk: int =
     return ids, out
 
 
-def dff(traces: np.ndarray) -> np.ndarray:
-    """ΔF/F with F0 = each trace's median."""
-    f0 = np.nanmedian(traces, axis=-1, keepdims=True)
+def dff(traces: np.ndarray, offset: float = 0.0) -> np.ndarray:
+    """ΔF/F with F0 = each trace's median, after subtracting ``offset``.
+
+    Traces whose F0 is not positive become NaN: dividing by a negative F0
+    would silently flip transients upside down.
+    """
+    f = np.asarray(traces, dtype=np.float64) - offset
+    f0 = np.nanmedian(f, axis=-1, keepdims=True)
     with np.errstate(divide='ignore', invalid='ignore'):
-        return (traces - f0) / f0
+        return np.where(f0 > 0, (f - f0) / f0, np.nan)
+
+
+def suggested_offset(values) -> float:
+    """0 for positive data; the minimum when data dips below zero (a dark offset)."""
+    low = float(np.nanmin(values))
+    return low if low < 0 else 0.0
+
+
+def correlation_image(data, axis: int, index: tuple, progress=None) -> np.ndarray:
+    """Local correlation image (as in CaImAn): each pixel's mean temporal
+    correlation with its 8 neighbours along ``axis``.
+
+    Active cells stand out regardless of brightness, so uneven illumination
+    and neuropil haze matter much less than in a mean or SD projection.
+    Computed in row chunks with a one-row halo, so movies need not fit in RAM.
+    """
+    lead = data.ndim - 2
+    axis = axis % data.ndim
+    h, w = data.shape[-2:]
+    n_t = data.shape[axis]
+    out = np.zeros((h, w), np.float64)
+    rows = max(1, min(h, CHUNK_BYTES // max(1, n_t * w * 4)))
+    offsets = [(dy, dx) for dy in (-1, 0, 1) for dx in (-1, 0, 1) if (dy, dx) != (0, 0)]
+    for r0 in range(0, h, rows):
+        r1 = min(h, r0 + rows)
+        a0, a1 = max(0, r0 - 1), min(h, r1 + 1)
+        sl = tuple(slice(None) if d == axis else int(index[d]) for d in range(lead))
+        # only ``axis`` is a slice among the leading axes, so time comes first
+        block = np.asarray(data[sl + (slice(a0, a1), slice(None))], dtype=np.float32)
+        block = block - block.mean(axis=0, dtype=np.float64).astype(np.float32)
+        sd = block.std(axis=0)
+        block /= np.where(sd > 0, sd, np.inf)
+        core = slice(r0 - a0, r0 - a0 + (r1 - r0))
+        acc = np.zeros((r1 - r0, w))
+        count = np.zeros((r1 - r0, w))
+        ys = np.arange(r0, r1)
+        for dy, dx in offsets:
+            yy = ys + dy
+            valid_y = (yy >= 0) & (yy < h)
+            if not valid_y.any():
+                continue
+            src_rows = np.arange(core.start, core.stop)[valid_y]
+            nb_rows = src_rows + dy
+            x0, x1 = max(0, -dx), min(w, w - dx)
+            a = block[:, src_rows, x0:x1]
+            b = block[:, nb_rows, x0 + dx:x1 + dx]
+            acc[valid_y, x0:x1] += np.einsum('tij,tij->ij', a, b) / n_t
+            count[valid_y, x0:x1] += 1
+        out[r0:r1] = acc / np.maximum(count, 1)
+        if progress is not None and progress(r1, h) is False:
+            break
+    return out.astype(np.float32)
 
 
 # ------------------------------------------------------------------ filters

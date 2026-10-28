@@ -64,3 +64,20 @@ line; a line width greater than one averages across the line.
 
 Draw a line across a feature of known length and choose **Analyze → Set
 Scale…**. The pixel length is filled in; enter the known distance and unit.
+
+## Find active cells in a calcium movie
+
+1. Open the movie and check that its stack axis is T (Image → Properties).
+2. Choose **Image → Stacks → Correlation Image**. Each pixel shows how strongly
+   it co-fluctuates with its neighbours, so firing cells are bright even where
+   the illumination is dim, and bright but inactive regions stay dark.
+3. Threshold the correlation image (Otsu works well), Apply, then use the ROI
+   Manager's **From Labels** and switch back to the movie for **Multi Plot**.
+
+This is a quick first pass. It does not demix overlapping cells or subtract
+neuropil the way CNMF (CaImAn) or Suite2p do.
+
+If the data has a negative offset (common for resonant-scanner recordings),
+ΔF/F needs that offset removed first: TIKI pre-sets it to the data minimum and
+says so. ΔF/F amplitudes depend on this choice, so enter the true dark level if
+you know it.

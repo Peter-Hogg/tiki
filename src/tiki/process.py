@@ -128,6 +128,22 @@ def dff_dialog(tiki) -> Image | None:
     offset = QDoubleSpinBox(decimals=2, minimum=-1e9, maximum=1e9, value=0)
     offset.setToolTip('Subtracted from F before ΔF/F, e.g. the camera dark level')
     form.addRow('Offset:', offset)
+    offset_note = QLabel('')
+    offset_note.setWordWrap(True)
+    form.addRow(offset_note)
+
+    def suggest_offset(layer=None):
+        layer = layer or image_box.layer()
+        if layer is None:
+            return
+        low = ops.suggested_offset(_sample(layer.data))
+        offset.setValue(low)
+        offset_note.setText(
+            f'Values go below zero (minimum ≈ {low:g}), so the offset is set to the minimum: ΔF/F '
+            'needs a positive F0. Change it if you know the true dark level.' if low < 0 else '')
+
+    image_box.layer_changed.connect(suggest_offset)
+    suggest_offset()
     add_f0 = QCheckBox('Also add the F0 image')
     form.addRow(add_f0)
 
@@ -168,6 +184,41 @@ def dff_dialog(tiki) -> Image | None:
     tiki.status(f'ΔF/F ({m}{", offset " + format(offset.value(), "g") if offset.value() else ""}) '
                 f'→ "{layer.name}"; colour range ±{span:.3g}')
     return layer
+
+
+def _sample(data, n: int = 32) -> np.ndarray:
+    """A few evenly spaced planes of a (possibly huge) array, for quick statistics."""
+    lead = data.shape[:-2]
+    total = int(np.prod(lead)) if lead else 1
+    picks = np.unique(np.linspace(0, total - 1, min(n, total)).astype(int))
+    return np.stack([np.asarray(data[np.unravel_index(i, lead)] if lead else data) for i in picks])
+
+
+# ---------------------------------------------------------- correlation image
+
+def correlation_image(tiki):
+    viewer, image = tiki.require_image()
+    info = axes_mod.get(image)
+    axis = axes_mod.stack_axis(info, 'T')
+    if axis is None or image.ndim < 3:
+        _error('a correlation image needs a movie (a T axis)', fix='properties')
+    if info.axes[axis].role != 'T':
+        tiki.status(f'No T axis: correlating along {info.labels[axis]} (set T in Image ▸ Properties if wrong)')
+    if image.rgb:
+        _error('correlation images need a greyscale movie')
+    index = roi_mod.current_index(viewer, image)
+    with tiki.progress('Correlation Image', image.data.shape[-2]) as tick:
+        cn = ops.correlation_image(image.data, axis, index, progress=tick)
+    if tick.cancelled:
+        return None
+    keep = [i for i in range(len(info.axes)) if i >= image.ndim - 2]
+    cn_info = axes_mod.AxesInfo([info.axes[i] for i in keep], info.source, True,
+                                ['local correlation with 8 neighbours along ' + info.labels[axis]])
+    new = tiki.open_data(cn, f'Cn_{image.name}', axes=cn_info)
+    new.layers[0].contrast_limits = (0, max(0.1, float(np.percentile(cn, 99.9))))
+    tiki.status(f'Correlation image of {image.name}: bright = pixels that co-fluctuate with their '
+                'neighbours (active cells). Threshold it to find cells.')
+    return new
 
 
 # ------------------------------------------------------- bleach correction

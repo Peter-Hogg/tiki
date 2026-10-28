@@ -180,6 +180,12 @@ pixel value.
   (reports τ in frames and seconds, and refuses when the frame means are not an
   exponential decay) or scales frames to the first frame's mean; a plot of
   frame means is shown either way
+- **Image ▸ Stacks ▸ Correlation Image** (CaImAn-style local correlation):
+  active cells stand out regardless of brightness; threshold it to find cells
+- ΔF/F never divides by a non-positive F0: when data dips below zero (a
+  digitiser/camera offset), the ΔF/F dialog and traces window pre-set the
+  offset to the minimum and say so
+- ImageJ movies saved as plain "slices" with a frame rate are read as T
 - **Image ▸ Stacks ▸ Kymograph / Reslice…** samples a line or path through T
   (or Z), averaged across a chosen width
 - **Process ▸ Image Calculator…** combines any two images from any windows
