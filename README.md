@@ -1,39 +1,172 @@
-# TIKI — TIKI Is Kinda ImageJ
+<p align="center">
+  <img src="assets/tiki-logo-concept.png" alt="TIKI logo: a microscope containing a tropical island sunset" width="720">
+</p>
 
-An ImageJ-style floating toolbar for [napari](https://napari.org). Every image
-opens in its own napari window; menu commands and tools act on the window you
-clicked last, just like ImageJ.
+<p align="center">
+  <strong>An ImageJ-style toolbar for napari.</strong><br>
+  Familiar tools and workflows, backed by Python image processing.
+</p>
+
+> [!NOTE]
+> TIKI is an early prototype. The core workflow works, but interfaces and
+> shortcuts may change while it is tested on real microscopy data.
+
+## What is TIKI?
+
+**TIKI Is Kinda ImageJ.** It is a small, persistent toolbar that opens and
+controls napari image windows. Commands operate on the last selected window
+and its active layer, giving ImageJ users a familiar “current image” workflow
+without embedding ImageJ or Java.
+
+TIKI is not intended to reproduce every Fiji plugin. Its goal is to make the
+everyday microscopy loop—open, inspect, draw, measure, project and plot—fast
+and approachable in Python.
+
+## Quick start
+
+TIKI currently runs from a source checkout and requires Python 3.10 or newer.
 
 ```bash
-tiki                 # empty toolbar
-tiki movie.tif       # open images on launch (.tif memory-mapped, .npy mmap)
+git clone https://github.com/Peter-Hogg/tiki.git
+cd tiki
+
+python -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
+python -m pip install -e .
+
+tiki
 ```
 
-## What works
+Open an image directly from the command line:
+
+```bash
+tiki movie.tif
+tiki recording.npy
+```
+
+For this development checkout, the launcher is also available directly:
+
+```bash
+~/Code/tiki/.venv/bin/tiki
+```
+
+To try TIKI without data, choose **File → Open Samples → Synthetic movie**.
+
+## The basic workflow
+
+1. Open a TIFF or NumPy array. Each image gets its own napari window.
+2. Select a tool from the TIKI toolbar and draw on the active image.
+3. Press <kbd>Ctrl</kbd>+<kbd>M</kbd> to measure the selection.
+4. Use **Image → Stacks → Z Project…** to create a projection in a new window.
+5. Press <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>Y</kbd> for a live intensity trace
+   through the stack.
+6. Click another image window; subsequent commands follow that window.
+
+The status bar continuously reports the active image, cursor coordinates and
+pixel value.
+
+## Features
+
+### ImageJ-like toolbar
+
+- Rectangle, oval, polygon, freehand, straight-line and point selections
+- Move/edit and pan tools
+- New selections replace the previous selection; hold <kbd>Shift</kbd> to keep
+  multiple selections
+- Application-wide shortcuts that continue to work when a napari image window
+  has focus
+
+### Stacks and images
+
+- Maximum, average, sum, standard-deviation, median and minimum projections
+- Selectable projection range
+- Chunked projection operations for memory-mapped movies
+- Crop, duplicate, enhance contrast and reset contrast
+- First-slice opening behavior, matching ImageJ rather than napari's default
+  middle-slice position
+
+### Measurement and plotting
+
+- Results table with area, mean, standard deviation, minimum, maximum and
+  integrated density
+- Copy results or save them as CSV
+- Straight-line intensity profiles
+- Live ROI intensity profile through a stack, with current-frame indicator
+- Copy profiles or save them as CSV
+
+### File handling
+
+- TIFF/OME-TIFF via `tifffile`
+- NumPy `.npy` arrays
+- Memory mapping where the format permits it
+- Graceful handling of incomplete ScanImage TIFFs whose header advertises more
+  frames than the file contains
+
+## Commands and shortcuts
 
 | Menu | Command | Shortcut |
 |---|---|---|
-| File | Open…, Open Samples, Close, Close All, Save As TIFF, Quit | Ctrl+O / W / Shift+W / S / Q |
-| Edit ▸ Selection | Select All, Select None | Ctrl+A, Ctrl+Shift+A |
-| Image ▸ Adjust | Brightness/Contrast (napari layer controls), Enhance Contrast (0.35 %), Reset | Ctrl+Shift+C, Ctrl+Shift+E |
-| Image | Show Info, Crop, Duplicate (crops to ROI) | Ctrl+I, Ctrl+Shift+X, Ctrl+Shift+D |
-| Image ▸ Stacks | Z Project (max/avg/sum/sd/median/min, slice range), Plot Z-axis Profile (live) | —, Ctrl+Shift+Y |
-| Analyze | Measure → Results table, Plot Profile (line) | Ctrl+M, Ctrl+K |
-| Window | List / raise image windows, show layer list | |
-| Help | Find Commands | Ctrl+L |
+| File | Open… | <kbd>Ctrl</kbd>+<kbd>O</kbd> |
+| File | Close / Close All | <kbd>Ctrl</kbd>+<kbd>W</kbd> / <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>W</kbd> |
+| File | Save As TIFF… | <kbd>Ctrl</kbd>+<kbd>S</kbd> |
+| Edit → Selection | Select All / Select None | <kbd>Ctrl</kbd>+<kbd>A</kbd> / <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>A</kbd> |
+| Image → Adjust | Brightness/Contrast | <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>C</kbd> |
+| Image → Adjust | Enhance Contrast | <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>E</kbd> |
+| Image | Show Info | <kbd>Ctrl</kbd>+<kbd>I</kbd> |
+| Image | Crop | <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>X</kbd> |
+| Image | Duplicate | <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>D</kbd> |
+| Image → Stacks | Plot Z-axis Profile | <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>Y</kbd> |
+| Analyze | Measure | <kbd>Ctrl</kbd>+<kbd>M</kbd> |
+| Analyze | Plot Profile | <kbd>Ctrl</kbd>+<kbd>K</kbd> |
+| Help | Find Commands | <kbd>Ctrl</kbd>+<kbd>L</kbd> |
 
-Tools: rectangle, oval, polygon, freehand, straight line, point, move/edit,
-pan. A new ROI replaces the previous one (hold Shift to keep both). The status
-bar shows `x, y, z, value` under the cursor in whichever window it is over.
+TIKI removes conflicting napari bindings from windows it manages. For
+example, napari normally uses <kbd>Ctrl</kbd>+<kbd>M</kbd> to toggle the menu bar
+on Linux; in TIKI it consistently means **Measure**.
 
-Shortcuts are application-wide, so they work while an image window has focus.
-napari's own bindings for the same keys (e.g. Ctrl+M = toggle menubar on
-Linux) are removed from TIKI windows.
+## Development
 
-## Layout
+Install the test dependencies and run the suite headlessly:
 
-- `ops.py` — pure numpy operations (chunked; safe on memory-mapped movies)
-- `roi.py` — ROI layer, masks, current slice
-- `manager.py` — window registry and active-window tracking
-- `widgets.py` — Results table, live profile plot
-- `app.py` — the toolbar, tools and menu commands
+```bash
+cd ~/Code/tiki
+source .venv/bin/activate
+python -m pip install -e '.[test]'
+QT_QPA_PLATFORM=offscreen python -m pytest -q
+```
+
+The code is intentionally split so image processing can be tested without the
+GUI:
+
+```text
+src/tiki/
+├── app.py       toolbar, menus, shortcuts and commands
+├── manager.py   napari window registry and active-window tracking
+├── ops.py       NumPy image operations
+├── roi.py       selection layers, masks and current-slice helpers
+├── io.py        TIFF and NumPy loading
+├── widgets.py   Results and profile windows
+└── icons.py     toolbar icon drawing
+```
+
+## Roadmap
+
+- ROI Manager with rename, show/hide, save/load and Multi Measure
+- ImageJ `.roi` and ROI-set `.zip` compatibility
+- A dedicated Brightness/Contrast dialog
+- Better OME and acquisition metadata handling
+- Calibration-aware measurements in physical units
+- More everyday ImageJ stack and image commands
+- Packaging and installation documentation for non-developers
+
+## Name
+
+**TIKI** is a recursive acronym: **T**IKI **I**s **K**inda **I**mageJ. The name
+also nods to Fiji and napari's island theme without depending on ImageJ or
+shipping any Java code.
+
+## License
+
+A license has not been selected yet. Add a `LICENSE` file before distributing
+or accepting external contributions.
