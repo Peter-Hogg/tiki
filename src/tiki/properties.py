@@ -124,7 +124,10 @@ class PropertiesDialog(QDialog):
 
     def apply(self) -> axes_mod.AxesInfo:
         info = self.result_info()
+        old_scale = tuple(self.image.scale)
         axes_mod.apply(self.viewer, self.image, info)
+        if tuple(self.image.scale) != old_scale:
+            self.viewer.reset_view()  # otherwise the camera is framed for the old size
         path = self.image.metadata.get('path')
         if path and self.remember.isChecked():
             axes_mod.remember(Path(path), self.shape, info)

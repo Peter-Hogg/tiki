@@ -56,7 +56,9 @@ class WindowManager(QObject):
         self._slim(viewer)
         if data is not None:
             image_kwargs.setdefault('name', title)
-            image_kwargs.pop('scale', None) if axes is not None else None
+            if axes is not None and not axes.problems(tuple(data.shape[: len(axes.axes)])):
+                # create the layer at its physical scale so the camera frames it correctly
+                image_kwargs['scale'] = axes.scale
             layer = viewer.add_image(data, **image_kwargs)
             shape = tuple(layer.data.shape[: layer.ndim])
             info = axes if axes is not None and not axes.problems(shape) else axes_mod.guess(shape)
@@ -64,6 +66,7 @@ class WindowManager(QObject):
                 for a, s in zip(info.axes, layer.scale):
                     a.step = float(s) if s != 1 else None
             axes_mod.apply(viewer, layer, info)
+            viewer.reset_view()
             # ImageJ opens stacks at the first slice; napari at the middle.
             viewer.dims.current_step = (0,) * viewer.dims.ndim
         self.register(viewer)

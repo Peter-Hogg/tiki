@@ -463,3 +463,13 @@ def test_default_tool_is_pan_and_draws_nothing(qtbot):
     v = t.open_data(np.zeros((4, 8, 8)), 'img')
     assert roi.ROI_NAME not in v.layers  # no drawing layer until a drawing tool is chosen
     t.windows.close_all()
+
+
+def test_calibrated_image_is_framed_by_camera(tiki, hyperstack):
+    path, data = hyperstack
+    tiki.open_paths([str(path)])
+    v = tiki.windows.active
+    image = v.layers[path.name]
+    (lo, hi) = image.extent.world
+    centre = (np.asarray(lo[-2:]) + np.asarray(hi[-2:])) / 2
+    np.testing.assert_allclose(v.camera.center[-2:], centre, atol=0.5)  # in µm, not pixels
