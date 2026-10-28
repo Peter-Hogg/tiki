@@ -26,6 +26,18 @@ macros can import it):
 pip install "napari-tiki @ git+https://github.com/Peter-Hogg/tiki"
 ```
 
+### Add TIKI to the applications menu (Linux)
+
+```bash
+tiki --install-desktop
+```
+
+TIKI then appears in the applications menu (Activities on Ubuntu/GNOME) with
+its icon: pin it to the dock, drop files onto the icon to open them, or
+right-click a TIFF and choose **Open With → TIKI**. Undo with
+`tiki --uninstall-desktop`. For a keyboard shortcut, add a custom shortcut in
+your desktop's keyboard settings with the command `tiki`.
+
 ### From source
 
 ```bash

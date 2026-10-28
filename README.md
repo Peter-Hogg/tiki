@@ -71,6 +71,18 @@ Already have a Python environment you want to use (e.g. one with CaImAn for
 macros)? `pip install "napari-tiki @ git+https://github.com/Peter-Hogg/tiki"`
 installs TIKI into it; this needs napari 0.9 or newer.
 
+### Add TIKI to the applications menu (Linux)
+
+```bash
+tiki --install-desktop
+```
+
+TIKI then appears in the applications menu (Activities on Ubuntu/GNOME) with
+its icon: pin it to the dock, drop files onto the icon to open them, or
+right-click a TIFF and choose **Open With → TIKI**. Undo with
+`tiki --uninstall-desktop`. For a keyboard shortcut, add a custom shortcut in
+your desktop's keyboard settings with the command `tiki`.
+
 Files can also be dragged onto the TIKI toolbar or any image window: images
 and folders of images open in new windows, `.roi`/`.zip` ROI sets open in the
 ROI Manager and `.py` macros open in the editor.

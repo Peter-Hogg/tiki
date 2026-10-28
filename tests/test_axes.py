@@ -90,3 +90,19 @@ def test_imagej_zstack_with_spacing_stays_z(tmp_path):
     path = tmp_path / 'zstack.tif'
     tifffile.imwrite(path, np.zeros((30, 8, 8), np.uint16), imagej=True, metadata={'axes': 'ZYX', 'spacing': 0.5, 'unit': 'um'})
     assert io.read_image(path)[1]['axes'].roles == 'ZYX'
+
+
+def test_desktop_launcher_install_and_uninstall(tmp_path, monkeypatch):
+    import sys
+
+    from tiki import desktop
+
+    monkeypatch.setenv('XDG_DATA_HOME', str(tmp_path))
+    monkeypatch.setattr(sys, 'platform', 'linux')
+    monkeypatch.setattr(desktop, '_refresh', lambda: None)
+    paths = desktop.install()
+    entry = desktop.desktop_path().read_text()
+    assert desktop.desktop_path() in paths and desktop.icon_path().exists()
+    assert f'Exec={sys.executable} -m tiki %F' in entry and 'MimeType=image/tiff;' in entry
+    assert desktop.ICON.exists()
+    assert set(desktop.uninstall()) == set(paths) and not desktop.desktop_path().exists()
