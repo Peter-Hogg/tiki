@@ -6,24 +6,37 @@
 - A desktop with working OpenGL graphics
 - Linux, macOS or Windows
 
-## Install from source
+## Install
 
-Until packaged releases are available, install TIKI from its GitHub checkout:
+With [uv](https://docs.astral.sh/uv/), one command installs TIKI with its own
+Python, napari and Qt, and puts `tiki` on your PATH:
+
+```bash
+uv tool install git+https://github.com/Peter-Hogg/tiki
+```
+
+Install uv first if needed (`curl -LsSf https://astral.sh/uv/install.sh | sh`
+on Linux/macOS; see the uv site for Windows). The first install downloads a
+few hundred MB and takes a few minutes. Later: `uv tool upgrade napari-tiki`.
+
+To use an existing environment instead (for example one with CaImAn, so
+macros can import it):
+
+```bash
+pip install "napari-tiki @ git+https://github.com/Peter-Hogg/tiki"
+```
+
+### From source
 
 ```bash
 git clone https://github.com/Peter-Hogg/tiki.git
 cd tiki
 python -m venv .venv
 source .venv/bin/activate
-python -m pip install --upgrade pip
-python -m pip install -e .
+python -m pip install -e '.[test]'
 ```
 
-On Windows PowerShell, activate with:
-
-```powershell
-.venv\Scripts\Activate.ps1
-```
+On Windows PowerShell, activate with `.venv\Scripts\Activate.ps1`.
 
 ## Launch
 
@@ -39,8 +52,11 @@ Or open one or more images immediately:
 tiki movie.tif second-image.ome.tif
 ```
 
-You can also drop TIFF or NumPy files onto the toolbar. To explore without
-data, select **File → Open Samples → Synthetic movie**.
+You can also drag files onto the toolbar or any image window, as in ImageJ:
+images and folders of images open in new windows, ImageJ ROI sets
+(`.roi`, `.zip`) open in the ROI Manager and `.py` macros in the editor. To
+explore without data, run `tiki --sample` or choose **File → Open Samples →
+Synthetic movie**. `tiki --version` reports the installed version.
 
 ## First five minutes
 

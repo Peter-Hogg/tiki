@@ -28,36 +28,63 @@ TIKI is not intended to reproduce every Fiji plugin. Its goal is to make the
 everyday microscopy loop—open, inspect, draw, measure, project and plot—fast
 and approachable in Python.
 
-## Quick start
+## Install
 
-TIKI currently runs from a source checkout and requires Python 3.10 or newer.
+One command, using [uv](https://docs.astral.sh/uv/) (it installs TIKI and its
+own Python, napari and Qt in an isolated environment, and puts `tiki` on your
+PATH):
+
+```bash
+uv tool install git+https://github.com/Peter-Hogg/tiki
+```
+
+No uv yet? Install it first (Linux/macOS; Windows instructions are on the uv
+site):
+
+```bash
+curl -LsSf https://astral.sh/uv/install.sh | sh
+```
+
+Then start TIKI, optionally with files, or with a synthetic movie to try it:
+
+```bash
+tiki
+tiki movie.tif recording.npy RoiSet.zip
+tiki --sample
+```
+
+The first install downloads napari and Qt (a few hundred MB), so it takes a
+few minutes. Update or remove later with:
+
+```bash
+uv tool upgrade napari-tiki
+uv tool uninstall napari-tiki
+```
+
+To try it without installing anything permanently:
+
+```bash
+uvx --from git+https://github.com/Peter-Hogg/tiki tiki --sample
+```
+
+Already have a Python environment you want to use (e.g. one with CaImAn for
+macros)? `pip install "napari-tiki @ git+https://github.com/Peter-Hogg/tiki"`
+installs TIKI into it; this needs napari 0.9 or newer.
+
+Files can also be dragged onto the TIKI toolbar or any image window: images
+and folders of images open in new windows, `.roi`/`.zip` ROI sets open in the
+ROI Manager and `.py` macros open in the editor.
+
+### From a source checkout (development)
 
 ```bash
 git clone https://github.com/Peter-Hogg/tiki.git
 cd tiki
-
 python -m venv .venv
 source .venv/bin/activate
-python -m pip install --upgrade pip
-python -m pip install -e .
-
+python -m pip install -e '.[test]'
 tiki
 ```
-
-Open an image directly from the command line:
-
-```bash
-tiki movie.tif
-tiki recording.npy
-```
-
-For this development checkout, the launcher is also available directly:
-
-```bash
-~/Code/tiki/.venv/bin/tiki
-```
-
-To try TIKI without data, choose **File → Open Samples → Synthetic movie**.
 
 ## The basic workflow
 
