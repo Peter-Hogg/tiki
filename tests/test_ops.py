@@ -173,3 +173,79 @@ def test_gaussian_3d_respects_anisotropy():
     aniso = ops.gaussian_3d(vol, 2.0, 0.25)  # slices 4x further apart than pixels
     assert iso[12, 10, 10] == pytest.approx(iso[10, 12, 10], rel=1e-4)
     assert aniso[11, 10, 10] < aniso[10, 11, 10]  # blurred less across slices
+
+
+def test_dff_movie_methods_and_chunking():
+    rng = np.random.default_rng(0)
+    t = np.arange(100)
+    base = 200.0
+    movie = np.full((100, 6, 7), base, np.float32) + rng.normal(0, 1, (100, 6, 7)).astype(np.float32)
+    movie[40:45, 2, 3] += 100  # a transient
+    old = ops.CHUNK_BYTES
+    ops.CHUNK_BYTES = 100 * 7 * 4 * 2  # 2 rows per chunk
+    try:
+        d = ops.dff_movie(movie, axis=0, method='median')
+    finally:
+        ops.CHUNK_BYTES = old
+    assert d.dtype == np.float32 and d.shape == movie.shape
+    assert d[42, 2, 3] == pytest.approx(0.5, abs=0.03)
+    assert abs(np.median(d[:, 0, 0])) < 1e-6
+    d_off, f0 = ops.dff_movie(movie, axis=0, method='first frames', n_first=10, offset=100, return_f0=True)
+    assert f0.shape == (1, 6, 7) and f0[0, 0, 0] == pytest.approx(100, abs=1)
+    assert d_off[42, 2, 3] == pytest.approx(1.0, abs=0.05)  # offset doubles ΔF/F
+    slide = ops.dff_movie(movie + (t * 0.5)[:, None, None].astype(np.float32), axis=0,
+                          method='sliding percentile', window=21, percentile=50)
+    assert abs(np.nanmedian(slide[:, 0, 0])) < 0.01  # drift removed by the sliding baseline
+    zero = np.zeros((5, 4, 4), np.float32)
+    assert np.isnan(ops.dff_movie(zero, axis=0)).all()
+
+
+def test_bleach_correct_ratio_and_exponential():
+    n = 60
+    t = np.arange(n)
+    decay = 100 + 300 * np.exp(-t / 15)
+    movie = np.ones((n, 8, 8), np.float32) * decay[:, None, None].astype(np.float32)
+    corr, info = ops.bleach_correct(movie, axis=0, method='ratio')
+    assert np.allclose(corr.mean(axis=(1, 2)), corr[0].mean(), rtol=1e-4)
+    corr2, info2 = ops.bleach_correct(movie, axis=0, method='exponential')
+    assert info2['tau_frames'] == pytest.approx(15, rel=0.02)
+    assert np.allclose(corr2.mean(axis=(1, 2)), corr2[0].mean(), rtol=1e-3)
+
+
+def test_kymograph_tracks_moving_spot():
+    n, h, w = 20, 16, 40
+    movie = np.zeros((n, h, w), np.float32)
+    for k in range(n):
+        movie[k, 7:10, 5 + k] = 100  # spot moves 1 px per frame along x
+    kymo = ops.kymograph(movie, axis=0, index=(0, 0, 0), verts=np.array([[8, 2], [8, 35]]), width=3, chunk=6)
+    assert kymo.shape == (20, 34)
+    peaks = kymo.argmax(axis=1)
+    assert np.all(np.diff(peaks) == 1)  # diagonal line = constant velocity
+    assert ops.line_samples(np.array([[0, 0], [0, 10], [10, 10]])).shape == (1, 21, 2)
+
+
+def test_image_calculator_broadcast_and_divide():
+    a = np.full((3, 4, 5), 10, np.uint16)
+    b = np.full((4, 5), 4, np.uint16)
+    b[0, 0] = 0
+    sub = ops.image_calculator(a, b, 'Subtract')
+    assert sub.dtype == np.float32 and sub[2, 1, 1] == 6  # no uint wrap-around
+    div = ops.image_calculator(a, b, 'Divide')
+    assert div[1, 1, 1] == 2.5 and np.isnan(div[0, 0, 0])
+    with pytest.raises(ValueError):
+        ops.image_calculator(a, np.zeros((3, 3)), 'Add')
+
+
+def test_histogram_stats():
+    s = ops.histogram_stats(np.array([1, 2, 2, 3, np.nan]), bins=3)
+    assert s['n'] == 4 and s['mean'] == 2 and s['min'] == 1 and s['max'] == 3
+    assert s['mode'] == pytest.approx(2.0)
+
+
+def test_bleach_exponential_refuses_without_decay():
+    rng = np.random.default_rng(2)
+    means = 190 + rng.normal(0, 0.2, 60)
+    means[18:35] -= 2  # a dip, not bleaching
+    movie = np.ones((60, 4, 4), np.float32) * means[:, None, None].astype(np.float32)
+    with pytest.raises(ValueError, match='no bleaching decay'):
+        ops.bleach_correct(movie, axis=0, method='exponential')

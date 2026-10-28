@@ -36,7 +36,7 @@ from qtpy.QtWidgets import (
 )
 
 from . import axes as axes_mod
-from . import io, nd, ops, style
+from . import io, nd, ops, recent, style
 from . import roi as roi_mod
 from .icons import tool_icon
 from .manager import WindowManager
@@ -142,6 +142,8 @@ class Tiki(QMainWindow):
         mb = self.menuBar()
         m = mb.addMenu('&File')
         self._add(m, 'Open…', self.open_dialog, 'Ctrl+O')
+        self.recent_menu = m.addMenu('Open Recent')
+        self.recent_menu.aboutToShow.connect(self._fill_recent_menu)
         samples = m.addMenu('Open Samples')
         self._add(samples, 'Synthetic movie', self.open_sample_movie)
         self._add(samples, 'Blobs', lambda: self._open_skimage('blobs'))
@@ -178,6 +180,7 @@ class Tiki(QMainWindow):
         stacks = m.addMenu('Stacks')
         self._add(stacks, 'Z Project…', self.z_project_dialog)
         self._add(stacks, 'Plot Z-axis Profile', self.plot_z_profile, 'Ctrl+Shift+Y')
+        self._add(stacks, 'Kymograph / Reslice…', lambda: self._process('kymograph_dialog'))
         stacks.addSeparator()
         self._add(stacks, 'Split Channels ', self.split_channels)  # same command as Image ▸ Color
 
@@ -186,10 +189,16 @@ class Tiki(QMainWindow):
         self._add(filt, 'Gaussian Blur…', lambda: self.filter_dialog('gaussian'))
         self._add(filt, 'Median…', lambda: self.filter_dialog('median'))
         self._add(m, 'Subtract Background…', lambda: self.filter_dialog('background'))
+        m.addSeparator()
+        self._add(m, 'ΔF/F…', lambda: self._process('dff_dialog'))
+        self._add(m, 'Bleach Correction…', lambda: self._process('bleach_dialog'))
+        self._add(m, 'Image Calculator…', lambda: self._process('calculator_dialog'))
 
         m = mb.addMenu('&Analyze')
         self._add(m, 'Measure', self.measure, 'Ctrl+M')
         self._add(m, 'Analyze Particles…', self.analyze_particles)
+        self._add(m, 'Histogram', self.histogram, 'Ctrl+H')
+        self._add(m, 'Set Scale…', lambda: self._process('set_scale_dialog'))
         self._add(m, 'Clear Results', self.results.clear)
         self._add(m, 'Show Results', self.show_results)
         m.addSeparator()
@@ -424,6 +433,7 @@ class Tiki(QMainWindow):
                 metadata['imagej_luts'] = meta['imagej_luts']
             info = meta['axes']
             self.open_data(data, meta['name'], axes=info, metadata=metadata)
+            recent.add(path)
             msg = f'Opened {meta["name"]}: {info.describe()} {data.dtype} [{info.source}]'
             if info.notes:
                 msg += ' — ' + '; '.join(info.notes)
@@ -996,6 +1006,57 @@ class Tiki(QMainWindow):
                 f"exec(open(r'{out / 'load_session.py'}').read())\n\nor open load_session.py.",
             )
         return snippet
+
+    # ------------------------------------------- Process extras & helpers
+
+    def _process(self, name: str):
+        from . import process
+
+        return getattr(process, name)(self)
+
+    def keep_window(self, win) -> None:
+        """Keep a floating plot alive until it is closed (and close it with TIKI)."""
+        win.setAttribute(Qt.WA_DeleteOnClose)
+        self.profiles.append(win)
+        win.destroyed.connect(lambda _=None, w=win: self.profiles.remove(w) if w in self.profiles else None)
+
+    def histogram(self) -> None:
+        from .widgets import HistogramWindow
+
+        viewer, image = self.require_image()
+        plane = roi_mod.current_plane(viewer, image)
+        current = self.current_roi(viewer)
+        where = 'whole plane'
+        if current is not None and current[1] not in ('line', 'path'):
+            plane = plane[roi_mod.shape_mask(*current, plane.shape)]
+            where = 'selection'
+        stats = ops.histogram_stats(plane)
+        if stats['n'] == 0:
+            raise TikiError('no finite pixel values to histogram')
+        idx = roi_mod.current_index(viewer, image)[:-2]
+        pos = f' ({nd.block_label(axes_mod.get(image), idx + (slice(None), slice(None)))})' if idx else ''
+        win = HistogramWindow(f'Histogram of {image.name}{pos}, {where}', stats)
+        self.keep_window(win)
+        win.show()
+
+    def _fill_recent_menu(self) -> None:
+        menu = self.recent_menu
+        menu.clear()
+        items = recent.load()
+        if not items:
+            menu.addAction('(none yet)').setEnabled(False)
+            return
+        for path in items:
+            action = menu.addAction(Path(path).name)
+            action.setToolTip(path)
+            action.setStatusTip(path)
+            exists = Path(path).exists()
+            action.setEnabled(exists)
+            if not exists:
+                action.setText(f'{Path(path).name} (missing)')
+            action.triggered.connect(lambda _=False, p=path: self._run('Open', lambda: self.open_paths([p])))
+        menu.addSeparator()
+        menu.addAction('Clear List').triggered.connect(recent.clear)
 
     # -------------------------------------------------------------- Help
 

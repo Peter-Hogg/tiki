@@ -458,3 +458,228 @@ def map_planes(func, data, out_dtype=None, progress=None) -> np.ndarray:
         if progress is not None and progress(n + 1, total) is False:
             break
     return out
+
+
+# ---------------------------------------------------------------- ΔF/F etc.
+
+F0_METHODS = ['median', 'mean', 'percentile', 'first frames', 'sliding percentile']
+
+
+def _rows_over_axis(data, axis: int):
+    """Row chunks (second-last axis) sized so one chunk of the full axis fits CHUNK_BYTES."""
+    step = _rows_per_chunk(data, axis)
+    for r0 in range(0, data.shape[-2], step):
+        yield slice(r0, min(r0 + step, data.shape[-2]))
+
+
+def baseline_f0(chunk: np.ndarray, axis: int, method: str = 'median', percentile: float = 10.0,
+                n_first: int = 10, window: int = 101) -> np.ndarray:
+    """F0 for ΔF/F along ``axis`` of an in-memory chunk (same shape as chunk for
+    the sliding method, else with ``axis`` reduced to length 1)."""
+    if method == 'median':
+        return np.median(chunk, axis=axis, keepdims=True)
+    if method == 'mean':
+        return np.mean(chunk, axis=axis, keepdims=True)
+    if method == 'percentile':
+        return np.percentile(chunk, percentile, axis=axis, keepdims=True)
+    if method == 'first frames':
+        n = max(1, min(int(n_first), chunk.shape[axis]))
+        return np.mean(np.take(chunk, range(n), axis=axis), axis=axis, keepdims=True)
+    if method == 'sliding percentile':
+        from scipy.ndimage import percentile_filter
+
+        size = [1] * chunk.ndim
+        size[axis] = max(1, min(int(window), chunk.shape[axis]))
+        return percentile_filter(chunk, percentile, size=size, mode='nearest')
+    raise ValueError(f'unknown F0 method {method!r}')
+
+
+def dff_movie(data, axis: int, method: str = 'median', offset: float = 0.0, progress=None,
+              return_f0: bool = False, **params):
+    """(F - F0) / F0 along ``axis`` (usually T), float32, chunked over rows.
+
+    ``offset`` (e.g. the camera dark level) is subtracted from F first. Pixels
+    whose F0 is not positive become NaN rather than exploding.
+    """
+    axis = axis % data.ndim
+    if axis >= data.ndim - 2:
+        raise ValueError('ΔF/F needs a stack axis, not Y or X')
+    out = np.empty(data.shape, dtype=np.float32)
+    f0_shape = list(data.shape)
+    if method != 'sliding percentile':
+        f0_shape[axis] = 1
+    f0_all = np.empty(f0_shape, dtype=np.float32) if return_f0 else None
+    rows = list(_rows_over_axis(data, axis))
+    for n, rs in enumerate(rows):
+        chunk = np.asarray(data[..., rs, :], dtype=np.float32) - np.float32(offset)
+        f0 = baseline_f0(chunk, axis, method, **params).astype(np.float32)
+        with np.errstate(divide='ignore', invalid='ignore'):
+            d = np.where(f0 > 0, (chunk - f0) / f0, np.nan)
+        out[..., rs, :] = d
+        if return_f0:
+            f0_all[..., rs, :] = f0
+        if progress is not None and progress(n + 1, len(rows)) is False:
+            break
+    return (out, f0_all) if return_f0 else out
+
+
+def bleach_correct(data, axis: int, method: str = 'ratio', background: float = 0.0, progress=None):
+    """Correct photobleaching along ``axis`` using each frame's mean intensity.
+
+    ``ratio``: scale every frame to the first frame's mean (ImageJ "Simple
+    ratio"). ``exponential``: fit a + b·exp(-t/τ) to the frame means and divide
+    by the fit (normalised to t=0). Returns ``(corrected float32, info dict)``.
+    """
+    axis = axis % data.ndim
+    n = data.shape[axis]
+    means = np.empty(n)
+    for t in range(n):
+        means[t] = float(np.mean(np.take(data, t, axis=axis), dtype=np.float64)) - background
+    info: dict = {'means': means}
+    if method == 'ratio':
+        factors = means[0] / np.where(means > 0, means, np.nan)
+    elif method == 'exponential':
+        from scipy.optimize import curve_fit
+
+        t = np.arange(n, dtype=float)
+
+        def model(t, a, b, tau):
+            return a + b * np.exp(-t / tau)
+
+        p0 = (means[-1], means[0] - means[-1], max(n / 3, 1.0))
+        try:
+            (a, b, tau), _ = curve_fit(model, t, means, p0=p0, maxfev=20000)
+        except Exception as exc:
+            raise ValueError(f'exponential fit failed ({exc}); try the ratio method') from exc
+        fit = model(t, a, b, tau)
+        drop = (fit[0] - fit[-1]) / fit[0] if fit[0] else 0.0
+        ss_tot = float(np.sum((means - means.mean()) ** 2))
+        r2 = 1 - float(np.sum((means - fit) ** 2)) / ss_tot if ss_tot > 0 else 0.0
+        if not (b > 0 and 0 < tau < 20 * n and drop > 0.005 and r2 >= 0.5):
+            raise ValueError(
+                'no bleaching decay found: an exponential decay does not describe the frame means '
+                f'(fit explains {100 * max(r2, 0):.0f}% of their variance, τ = {tau:.3g} frames, '
+                f'change {100 * -drop:+.2g}%). Nothing was corrected. Check the mean-intensity plot; '
+                'dips or rises may be real signal or motion.')
+        info['r2'] = r2
+        factors = fit[0] / fit
+        info |= {'a': a, 'b': b, 'tau_frames': tau, 'fit': fit}
+    else:
+        raise ValueError(f'unknown bleach method {method!r}')
+    factors = np.nan_to_num(factors, nan=1.0)
+    out = np.empty(data.shape, dtype=np.float32)
+    for t in range(n):
+        idx = [slice(None)] * data.ndim
+        idx[axis] = t
+        frame = np.asarray(data[tuple(idx)], dtype=np.float32) - np.float32(background)
+        out[tuple(idx)] = frame * np.float32(factors[t]) + np.float32(background)
+        if progress is not None and progress(t + 1, n) is False:
+            break
+    info['factors'] = factors
+    return out, info
+
+
+# --------------------------------------------------------------- kymograph
+
+def line_samples(verts: np.ndarray, width: int = 1) -> np.ndarray:
+    """Sample points (width, n, 2) every pixel along a polyline, with ``width``
+    parallel offsets one pixel apart (for averaging across the line)."""
+    verts = np.asarray(verts, dtype=float)[:, -2:]
+    pts, normals = [], []
+    for p, q in zip(verts[:-1], verts[1:]):
+        seg = q - p
+        length = float(np.hypot(*seg))
+        if length == 0:
+            continue
+        n = max(int(np.ceil(length)), 1)
+        t = np.linspace(0, 1, n, endpoint=False)[:, None]
+        pts.append(p + t * seg)
+        normal = np.array([-seg[1], seg[0]]) / length
+        normals.append(np.repeat(normal[None], n, axis=0))
+    pts.append(verts[-1][None])
+    normals.append(normals[-1][-1:] if normals else np.array([[0.0, 1.0]]))
+    pts, normals = np.concatenate(pts), np.concatenate(normals)
+    offsets = np.arange(width) - (width - 1) / 2
+    return pts[None] + offsets[:, None, None] * normals[None]
+
+
+def kymograph(data, axis: int, index: tuple, verts: np.ndarray, width: int = 1,
+              chunk: int = 256, progress=None) -> np.ndarray:
+    """Intensity along a line for every position of ``axis``: (n_axis, n_points).
+
+    Bilinear sampling, averaged across ``width`` pixels. Only the line's
+    bounding box is read from disk.
+    """
+    from scipy.ndimage import map_coordinates
+
+    samples = line_samples(verts, width)  # (w, n, 2) in y, x
+    h, w_img = data.shape[-2:]
+    lo = np.clip(np.floor(samples.reshape(-1, 2).min(0)).astype(int) - 1, 0, None)
+    hi = np.minimum(np.ceil(samples.reshape(-1, 2).max(0)).astype(int) + 2, (h, w_img))
+    ys, xs = slice(lo[0], hi[0]), slice(lo[1], hi[1])
+    local = samples - lo
+    coords = local.reshape(-1, 2).T  # (2, w*n)
+    n_t = data.shape[axis]
+    out = np.empty((n_t, samples.shape[1]), dtype=np.float32)
+    for t0 in range(0, n_t, chunk):
+        t1 = min(t0 + chunk, n_t)
+        sl = tuple(slice(t0, t1) if d == axis else int(index[d]) for d in range(data.ndim - 2))
+        block = np.asarray(data[sl + (ys, xs)], dtype=np.float32)
+        for k in range(t1 - t0):
+            vals = map_coordinates(block[k], coords, order=1, mode='nearest')
+            out[t0 + k] = vals.reshape(samples.shape[:2]).mean(0)
+        if progress is not None and progress(t1, n_t) is False:
+            break
+    return out
+
+
+# -------------------------------------------------------- image calculator
+
+CALC_OPS = {
+    'Add': np.add,
+    'Subtract': np.subtract,
+    'Multiply': np.multiply,
+    'Divide': np.divide,
+    'Min': np.minimum,
+    'Max': np.maximum,
+    'Average': lambda a, b: (a + b) / 2,
+    'Difference': lambda a, b: np.abs(a - b),
+}
+
+
+def image_calculator(a, b, op: str, progress=None) -> np.ndarray:
+    """``a <op> b`` as float32, plane by plane. ``b`` may have fewer leading axes
+    than ``a`` (e.g. one flat-field frame applied to a whole movie)."""
+    if op not in CALC_OPS:
+        raise ValueError(f'unknown operation {op!r}')
+    if a.shape[-b.ndim:] != b.shape:
+        raise ValueError(f'shapes {a.shape} and {b.shape} do not match')
+    func = CALC_OPS[op]
+    out = np.empty(a.shape, dtype=np.float32)
+    lead = a.shape[:-2]
+    planes = list(np.ndindex(*lead)) if lead else [()]
+    nb = b.ndim - 2
+    for n, idx in enumerate(planes):
+        pa = np.asarray(a[idx], dtype=np.float32)
+        pb = np.asarray(b[idx[len(idx) - nb:] if nb else ()], dtype=np.float32)
+        with np.errstate(divide='ignore', invalid='ignore'):
+            r = func(pa, pb)
+        if op == 'Divide':
+            r[~np.isfinite(r)] = np.nan
+        out[idx] = r
+        if progress is not None and progress(n + 1, len(planes)) is False:
+            break
+    return out
+
+
+def histogram_stats(values: np.ndarray, bins: int = 256) -> dict:
+    """Histogram plus ImageJ's summary statistics (n, mean, std, min, max, mode)."""
+    v = np.asarray(values, dtype=np.float64).ravel()
+    v = v[np.isfinite(v)]
+    if v.size == 0:
+        return {'n': 0}
+    lo, hi = float(v.min()), float(v.max())
+    counts, edges = np.histogram(v, bins=bins, range=(lo, hi if hi > lo else lo + 1))
+    mode = (edges[np.argmax(counts)] + edges[np.argmax(counts) + 1]) / 2
+    return {'n': int(v.size), 'mean': float(v.mean()), 'std': float(v.std(ddof=1)) if v.size > 1 else 0.0,
+            'min': lo, 'max': hi, 'mode': float(mode), 'counts': counts, 'edges': edges}

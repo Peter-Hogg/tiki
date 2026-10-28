@@ -487,7 +487,8 @@ def _sphere_movie(nt=3):
 def _open_with_axes(tiki, data, roles, name, steps=None):
     from tiki import axes
 
-    info = axes.AxesInfo([axes.Axis(r, n, (steps or {}).get(r), 'µm' if (steps or {}).get(r) else None)
+    units = {'T': 's', 'Z': 'µm', 'Y': 'µm', 'X': 'µm'}
+    info = axes.AxesInfo([axes.Axis(r, n, (steps or {}).get(r), units.get(r) if (steps or {}).get(r) else None)
                           for r, n in zip(roles, data.shape)], 'test', True)
     return tiki.open_data(data, name, axes=info)
 
@@ -558,3 +559,169 @@ def test_filter_3d_option(tiki):
     deep = run_filter(tiki, 'gaussian', v, image, {'sigma': 2}, whole_stack=True, three_d=True)
     assert flat.data.shape == deep.data.shape == image.data.shape
     assert not np.allclose(flat.data, deep.data) and '3D' in deep.name
+
+
+# ------------------------------------------------------ process extras
+
+@pytest.fixture
+def accept_dialogs(monkeypatch):
+    """Make modal dialogs return OK immediately, after an optional configure(dlg)."""
+    from qtpy.QtWidgets import QDialog
+
+    state = {'configure': None}
+
+    def fake_exec(dlg):
+        if state['configure']:
+            state['configure'](dlg)
+        return QDialog.Accepted
+
+    monkeypatch.setattr(QDialog, 'exec_', fake_exec)
+    monkeypatch.setattr(QDialog, 'exec', fake_exec, raising=False)
+    return state
+
+
+def _combo(dlg, text):
+    """The QComboBox in ``dlg`` that offers ``text``."""
+    from qtpy.QtWidgets import QComboBox
+
+    for box in dlg.findChildren(QComboBox):
+        if box.findText(text) >= 0:
+            return box
+    raise AssertionError(f'no combo offers {text!r}')
+
+
+def _tyx_movie(tiki, n=50):
+    rng = np.random.default_rng(1)
+    movie = (200 + rng.normal(0, 1, (n, 24, 30))).astype(np.float32)
+    movie[20:25, 10:14, 10:14] += 100
+    return _open_with_axes(tiki, movie, 'TYX', 'movie.tif', {'T': 0.01, 'Y': 0.5, 'X': 0.5}), movie
+
+
+def test_dff_dialog(tiki, accept_dialogs):
+    from tiki import process
+
+    v, movie = _tyx_movie(tiki)
+    layer = process.dff_dialog(tiki)
+    assert layer.name == 'movie.tif ΔF/F (median)' and layer.colormap.name == 'bwr'
+    assert layer.data[22, 12, 12] == pytest.approx(0.5, abs=0.03)
+
+    def first_frames_with_f0(dlg):
+        _combo(dlg, 'movie.tif').setCurrentText('movie.tif')  # not the ΔF/F layer now on top
+        _combo(dlg, 'first frames').setCurrentText('first frames')
+        from qtpy.QtWidgets import QCheckBox
+
+        next(b for b in dlg.findChildren(QCheckBox) if 'F0' in b.text()).setChecked(True)
+
+    accept_dialogs['configure'] = first_frames_with_f0
+    process.dff_dialog(tiki)
+    assert 'movie.tif F0' in v.layers and v.layers['movie.tif F0'].data.shape == (24, 30)
+    assert 'movie.tif ΔF/F (first frames)' in v.layers
+
+
+def test_bleach_dialog_exponential(tiki, accept_dialogs):
+    from tiki import process
+
+    n = 80
+    decay = (100 + 400 * np.exp(-np.arange(n) / 20)).astype(np.float32)
+    movie = np.ones((n, 16, 16), np.float32) * decay[:, None, None]
+    v = _open_with_axes(tiki, movie, 'TYX', 'bleach.tif', {'T': 0.5})
+    layer = process.bleach_dialog(tiki)  # exponential fit is the default
+    means = layer.data.mean(axis=(1, 2))
+    assert np.allclose(means, means[0], rtol=1e-3)
+    assert 'τ = 20' in tiki.status_label.text() and '= 10 s' in tiki.status_label.text()
+
+
+def test_kymograph_dialog(tiki, accept_dialogs):
+    from tiki import process
+
+    n = 15
+    movie = np.zeros((n, 20, 40), np.float32)
+    for k in range(n):
+        movie[k, 9:12, 5 + 2 * k] = 50
+    v = _open_with_axes(tiki, movie, 'TYX', 'move.tif', {'T': 0.1, 'Y': 0.2, 'X': 0.2})
+    v.layers[roi.ROI_NAME].add_lines(np.array([[10.0, 1.0], [10.0, 38.0]]))
+    kv = process.kymograph_dialog(tiki)
+    kymo = kv.layers[0].data
+    assert kymo.shape == (15, 38)
+    assert np.all(np.diff(kymo.argmax(axis=1)) == 2)  # 2 px per frame
+    assert 'rows = t, 1 px = 0.1 s' in tiki.status_label.text()
+
+
+def test_kymograph_needs_a_line(tiki, accept_dialogs, monkeypatch):
+    from tiki import process
+    from tiki.app import TikiError
+
+    _tyx_movie(tiki)
+    with pytest.raises(TikiError, match='line'):
+        process.kymograph_dialog(tiki)
+
+
+def test_image_calculator_dialog(tiki, accept_dialogs):
+    from tiki import process
+
+    a = np.full((4, 8, 8), 10, np.uint16)
+    b = np.full((8, 8), 3, np.uint16)
+    tiki.open_data(a, 'a.tif')
+    tiki.open_data(b, 'flat.tif')
+    tiki.windows.activate(tiki.windows.viewers[0])
+
+    def configure(dlg):
+        _combo(dlg, 'Subtract').setCurrentText('Subtract')
+        from qtpy.QtWidgets import QComboBox
+
+        boxes = [bx for bx in dlg.findChildren(QComboBox) if bx.findText('flat.tif') >= 0]
+        boxes[0].setCurrentText('a.tif')
+        boxes[1].setCurrentText('flat.tif')
+
+    accept_dialogs['configure'] = configure
+    result = process.calculator_dialog(tiki)
+    assert result.title == 'Result of a.tif'
+    np.testing.assert_array_equal(result.layers[0].data, np.full((4, 8, 8), 7, np.float32))
+
+
+def test_set_scale_from_line(tiki, accept_dialogs):
+    from qtpy.QtWidgets import QDoubleSpinBox
+
+    from tiki import process
+
+    v = tiki.open_data(np.zeros((64, 64), np.uint8), 'img.tif')
+    layer = v.layers[roi.ROI_NAME]
+    layer.add_lines(np.array([[10.0, 5.0], [10.0, 55.0]]))  # 50 px
+
+    def configure(dlg):
+        spins = dlg.findChildren(QDoubleSpinBox)
+        assert spins[0].value() == pytest.approx(50)
+        spins[1].setValue(10.0)  # 10 µm
+
+    accept_dialogs['configure'] = configure
+    step = process.set_scale_dialog(tiki)
+    assert step == pytest.approx(0.2)
+    assert tuple(v.layers['img.tif'].scale) == pytest.approx((0.2, 0.2))
+    assert tuple(layer.scale) == pytest.approx((0.2, 0.2))  # the ROI moved with the image
+
+
+def test_histogram_window(tiki):
+    v = tiki.open_data(np.arange(100, dtype=np.uint16).reshape(10, 10), 'ramp.tif')
+    tiki.histogram()
+    win = tiki.profiles[-1]
+    assert win.stats['n'] == 100 and win.stats['max'] == 99
+    _rect(v.layers[roi.ROI_NAME], -0.5, 1.5, -0.5, 9.5)  # first two rows
+    tiki.histogram()
+    assert tiki.profiles[-1].stats['n'] == 20 and 'selection' in tiki.profiles[-1].windowTitle()
+
+
+def test_open_recent(tiki, tmp_path, monkeypatch):
+    from tiki import recent
+
+    monkeypatch.setattr(recent, 'RECENT_FILE', tmp_path / 'recent.json')
+    paths = []
+    for name in ('one.npy', 'two.npy'):
+        np.save(tmp_path / name, np.zeros((4, 4)))
+        paths.append(tmp_path / name)
+        tiki.open_paths([str(tmp_path / name)])
+    assert recent.load() == [str(paths[1].resolve()), str(paths[0].resolve())]
+    paths[0].unlink()
+    tiki._fill_recent_menu()
+    texts = [a.text() for a in tiki.recent_menu.actions()]
+    assert texts[:2] == ['two.npy', 'one.npy (missing)']
+    assert not tiki.recent_menu.actions()[1].isEnabled()

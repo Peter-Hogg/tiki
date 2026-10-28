@@ -40,3 +40,27 @@ Gaussian and median kernels account for anisotropic voxel dimensions.
 Choose **File → Export → Send to Notebook…**. TIKI writes labels, ROIs, traces,
 results and a manifest into a folder, plus a lightweight `load_session.py`.
 The source movie is referenced by path rather than duplicated.
+
+## ΔF/F and bleaching
+
+**Process → ΔF/F…** computes a ΔF/F movie along T. Choose F0 as the median,
+mean, a percentile, the mean of the first frames, or a sliding percentile for
+slow drift, and optionally subtract a camera offset first. The result uses a
+diverging colormap centred on zero.
+
+**Process → Bleach Correction…** fits a single exponential to the frame means
+and divides by it, reporting τ. If the means are not an exponential decay (for
+example a dip caused by a stimulus or motion), TIKI shows the plot and corrects
+nothing. The simple-ratio method removes every change in whole-frame
+brightness, including real global signals.
+
+## Kymographs
+
+Draw a straight line or a path with the line tool, then choose **Image → Stacks
+→ Kymograph / Reslice…**. Rows are time (or Z), columns are distance along the
+line; a line width greater than one averages across the line.
+
+## Calibrate from a known distance
+
+Draw a line across a feature of known length and choose **Analyze → Set
+Scale…**. The pixel length is filled in; enter the known distance and unit.

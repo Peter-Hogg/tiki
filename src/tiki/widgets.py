@@ -219,9 +219,10 @@ class PlotWindow(QWidget):
         figure = Figure(figsize=(5.2, 2.8), layout='constrained')
         canvas = FigureCanvasQTAgg(figure)
         ax = figure.add_subplot()
-        ax.plot(self.x, self.y, lw=1, color='k')
+        ax.plot(self.x, self.y, lw=1, color='k', label=ylabel)
         ax.set_xlabel(xlabel)
         ax.set_ylabel(ylabel)
+        self.ax, self.canvas = ax, canvas
         copy = QPushButton('Copy')
         copy.clicked.connect(
             lambda: QApplication.clipboard().setText('\n'.join(f'{a}\t{b}' for a, b in zip(self.x, self.y)))
@@ -229,6 +230,11 @@ class PlotWindow(QWidget):
         layout = QVBoxLayout(self)
         layout.addWidget(canvas)
         layout.addWidget(copy, alignment=Qt.AlignRight)
+
+    def add_line(self, x, y, label: str) -> None:
+        self.ax.plot(x, y, lw=1, color='tab:red', label=label)
+        self.ax.legend(fontsize=8, frameon=False)
+        self.canvas.draw_idle()
 
 
 class TracesWindow(QWidget):
@@ -361,3 +367,40 @@ class TracesWindow(QWidget):
             except Exception:
                 pass
         super().closeEvent(event)
+
+
+class HistogramWindow(QWidget):
+    """Analyze > Histogram: counts plus ImageJ's summary statistics."""
+
+    def __init__(self, title: str, stats: dict, parent=None):
+        super().__init__(parent, Qt.Window)
+        style.apply(self)
+        self.setWindowTitle(title)
+        self.resize(460, 340)
+        self.stats = stats
+        figure = Figure(figsize=(4.6, 2.4), layout='constrained')
+        canvas = FigureCanvasQTAgg(figure)
+        ax = figure.add_subplot()
+        edges, counts = stats['edges'], stats['counts']
+        ax.bar((edges[:-1] + edges[1:]) / 2, counts, width=edges[1] - edges[0], color='#333333', linewidth=0)
+        ax.set_xlabel('value')
+        ax.set_ylabel('count')
+        from qtpy.QtWidgets import QLabel
+
+        text = QLabel(
+            f"N: {stats['n']}    Mean: {stats['mean']:.4g}    StdDev: {stats['std']:.4g}\n"
+            f"Min: {stats['min']:.4g}    Max: {stats['max']:.4g}    Mode: {stats['mode']:.4g}"
+        )
+        copy = QPushButton('Copy list')
+        copy.clicked.connect(self.copy)
+        bar = QHBoxLayout()
+        bar.addWidget(text, 1)
+        bar.addWidget(copy)
+        layout = QVBoxLayout(self)
+        layout.addWidget(canvas)
+        layout.addLayout(bar)
+
+    def copy(self) -> None:
+        edges, counts = self.stats['edges'], self.stats['counts']
+        QApplication.clipboard().setText(
+            '\n'.join(['bin start\tcount'] + [f'{e:.6g}\t{c}' for e, c in zip(edges[:-1], counts)]))

@@ -170,6 +170,24 @@ pixel value.
   by the voxel size so an anisotropic z-step is handled
 - Non-destructive: the result is added as a new layer above the original
 
+### Movies: ΔF/F, bleaching, kymographs
+
+- **Process ▸ ΔF/F…** makes a ΔF/F movie (blue–white–red, symmetric range) with
+  F0 from the median, mean, a percentile, the first N frames or a sliding
+  percentile window, after subtracting an optional camera offset; the F0 image
+  can be added too
+- **Process ▸ Bleach Correction…** divides by a fitted single-exponential decay
+  (reports τ in frames and seconds, and refuses when the frame means are not an
+  exponential decay) or scales frames to the first frame's mean; a plot of
+  frame means is shown either way
+- **Image ▸ Stacks ▸ Kymograph / Reslice…** samples a line or path through T
+  (or Z), averaged across a chosen width
+- **Process ▸ Image Calculator…** combines any two images from any windows
+  (32-bit result); a single plane can be applied to a whole stack, e.g. a
+  flat-field or background frame
+- **Analyze ▸ Set Scale…** calibrates from a line drawn across a known distance;
+  **Analyze ▸ Histogram** shows counts and statistics for the plane or selection
+
 ### Send to Notebook
 
 - Exports the current window to a folder: labels, other layers, ROIs
@@ -205,6 +223,10 @@ pixel value.
 | Process | Subtract Background… (rolling ball, light background) | |
 | Image → Stacks | Plot Z-axis Profile | <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>Y</kbd> |
 | Analyze | Measure | <kbd>Ctrl</kbd>+<kbd>M</kbd> |
+| Process | ΔF/F…, Bleach Correction…, Image Calculator… | |
+| Image → Stacks | Kymograph / Reslice… (from a line or path) | |
+| Analyze | Histogram / Set Scale… | <kbd>Ctrl</kbd>+<kbd>H</kbd> / — |
+| File | Open Recent | |
 | Analyze | Analyze Particles… (per-object table from a Labels layer) | |
 | Analyze → Traces | From ROI Manager / From Labels (cells × time) | |
 | Analyze → Tools | ROI Manager… / Add to Manager | — / <kbd>Ctrl</kbd>+<kbd>T</kbd> |
