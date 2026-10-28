@@ -122,3 +122,38 @@ def test_editor_keys_run_and_save_not_tiki(tiki, qtbot, tmp_path, monkeypatch):
     assert 'ran 7.0' in ed.output.toPlainText()
     qtbot.keyClick(ed.editor, Qt.Key_S, Qt.ControlModifier)
     assert (tmp_path / 'm.py').read_text().startswith('result =') and not saved_tiff
+
+
+def test_api_select_layers_and_windows_by_name_or_index(tiki):
+    from tiki import axes
+
+    data = np.zeros((2, 3, 8, 8), np.float32)
+    data[:, 1] = 7  # channel 2
+    info = axes.AxesInfo([axes.Axis('T', 2), axes.Axis('C', 3), axes.Axis('Y', 8), axes.Axis('X', 8)], 't', True)
+    v = tiki.open_data(data, 'two.tif', axes=info)
+    tiki.split_channels()
+    other = tiki.open_data(np.ones((4, 4), np.float32), 'other.tif')
+    tiki.windows.activate(v)
+    code = '''
+names = tiki.layers()
+wins = tiki.windows()
+c2 = tiki.image('C2-two.tif')
+top = tiki.layer(-1).name
+bottom = tiki.image(0)
+far = tiki.image(window='other.tif')
+far_by_index = tiki.image(0, window=1)
+tiki.add_labels((c2[0] > 1).astype(int), 'c2 mask', like='C2-two.tif')
+lab = tiki.labels('c2 mask')
+'''
+    ok, out, ns = macros.run_code(tiki, code)
+    assert ok, out
+    assert ns['names'] == ['C1-two.tif', 'C2-two.tif', 'C3-two.tif']
+    assert ns['wins'] == ['two.tif', 'other.tif']
+    assert ns['c2'].max() == 7 and ns['bottom'].max() == 0
+    assert ns['top'] == 'C3-two.tif'
+    assert ns['far'].shape == (4, 4) and ns['far_by_index'].shape == (4, 4)
+    assert ns['lab'].sum() == 64
+    ok, out, _ = macros.run_code(tiki, "tiki.image('nope')")
+    assert not ok and "no image layer named 'nope'" in out and 'C1-two.tif' in out
+    ok, out, _ = macros.run_code(tiki, "tiki.image(window='missing')")
+    assert not ok and 'open windows' in out

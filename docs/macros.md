@@ -17,17 +17,33 @@ and `np` for numpy; anything installed in TIKI's environment can be imported
 
 ## The `tiki` object
 
+Without arguments, calls use the current image of the current window, as in
+ImageJ. To pick another, pass `which`: a layer name or an index among that
+window's image (or labels) layers, 0 = bottom and -1 = top, as listed in the
+Layers panel. Pass `window` with a window title or index for another window.
+
+```python
+tiki.windows()                       # ['movie.tif', 'MAX_movie.tif']
+tiki.layers()                        # ['C1-movie.tif', 'C2-movie.tif']
+green = tiki.image('C1-movie.tif')
+red = tiki.image(1)
+avg = tiki.image(window='MAX_movie.tif')
+```
+
+A wrong name raises an error listing the names that exist.
+
 | Call | Returns / does |
 |---|---|
-| `tiki.image()` | data of the current image (memory-mapped when possible) |
-| `tiki.layer()`, `tiki.viewer()` | the current napari layer and window |
-| `tiki.axes()`, `tiki.scale()`, `tiki.index()` | axis roles (`'TYX'`), physical steps, slider position |
+| `tiki.windows()`, `tiki.layers(kind='image')` | open window titles; layer names, bottom to top |
+| `tiki.image(which=None, window=None)` | data of an image (memory-mapped when possible) |
+| `tiki.layer(which, window)`, `tiki.viewer(window)` | the napari layer and window |
+| `tiki.axes(which)`, `tiki.scale(which)`, `tiki.index()` | axis roles (`'TYX'`), physical steps, slider position |
 | `tiki.show(data, name, axes='TYX', scale=None)` | open data in a new window |
-| `tiki.add_image(data, name)`, `tiki.add_labels(data, name)` | add a layer to the current window |
-| `tiki.labels()` | the current Labels layer's data |
+| `tiki.add_image(data, name, like=None, window=None)`, `tiki.add_labels(...)` | add a layer aligned with image `like` |
+| `tiki.labels(which=None, window=None)` | a Labels layer's data |
 | `tiki.rois()`, `tiki.roi_masks()` | ROI Manager entries, (n, Y, X) masks |
 | `tiki.add_roi(yx)`, `tiki.rois_from_labels(labels)` | add ROIs to the manager |
-| `tiki.traces(masks=None)` | (n, frames) mean traces of the current image |
+| `tiki.traces(masks=None, which=None, window=None)` | (n, frames) mean traces |
 | `tiki.measure(**values)` | add a row to the Results table |
 | `tiki.run('Measure')` | run any menu command by name, like ImageJ's `run()` |
 | `tiki.progress(iterable, 'label')` | progress bar with Cancel; keeps TIKI responsive |

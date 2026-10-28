@@ -47,23 +47,29 @@ class MacroCancelled(Exception):
 class MacroAPI:
     """The ``tiki`` object available in every macro.
 
+    Choosing layers and windows
+        Most calls take ``which`` = a layer name or index (0 = bottom, -1 = top,
+        among that window's image or labels layers) and ``window`` = a window
+        title or index. Leave them out for the current image of the current window.
+        ``tiki.windows()``      titles of the open windows
+        ``tiki.layers(kind='image', window=None)``   layer names, bottom to top
     Images
-        ``tiki.image()``        data of the current image (memory-mapped when possible)
-        ``tiki.layer()``        the current napari Image layer
-        ``tiki.viewer()``       the current napari viewer (window)
-        ``tiki.axes()``         axis roles, e.g. ``'TYX'``
-        ``tiki.scale()``        physical step per axis (1.0 if uncalibrated)
+        ``tiki.image(which=None, window=None)``   data (memory-mapped when possible)
+        ``tiki.layer(which=None, window=None)``   the napari Image layer
+        ``tiki.viewer(window=None)``  the napari viewer (window)
+        ``tiki.axes(which)``    axis roles, e.g. ``'TYX'``
+        ``tiki.scale(which)``   physical step per axis (1.0 if uncalibrated)
         ``tiki.index()``        current slider position
         ``tiki.show(data, name, axes='TYX', scale=None)``   open data in a new window
-        ``tiki.add_image(data, name)``   add a layer to the current window (aligned)
-        ``tiki.add_labels(data, name)``  add a Labels layer to the current window
-        ``tiki.labels()``       data of the current (or topmost) Labels layer
+        ``tiki.add_image(data, name, like=None, window=None)``   add an aligned layer
+        ``tiki.add_labels(data, name, like=None, window=None)``  add a Labels layer
+        ``tiki.labels(which=None, window=None)``  data of a Labels layer
     ROIs and measurements
         ``tiki.rois()``         ROI Manager entries (``.name``, ``.kind``, ``.yx``, ``.mask(shape)``)
         ``tiki.roi_masks()``    (n, Y, X) boolean masks of all manager ROIs
         ``tiki.add_roi(yx, kind='polygon', name=None)``   add an ROI to the manager
         ``tiki.rois_from_labels(labels)``   one ROI per label id
-        ``tiki.traces(masks=None)``   (n, T) mean traces of the current image
+        ``tiki.traces(masks=None, which=None, window=None)``   (n, T) mean traces
         ``tiki.measure(**values)``    add a row to the Results table
     Running things
         ``tiki.run('Gaussian Blur…')``   run a menu command by name, as ImageJ's run()
@@ -78,33 +84,91 @@ class MacroAPI:
 
         self.ops = ops
 
-    # -- images ------------------------------------------------------------
+    # -- choosing windows and layers ------------------------------------------
+    #
+    # Most calls take ``which`` (a layer name, or an index among the window's
+    # layers of that type: 0 = bottom, -1 = top) and ``window`` (a window title,
+    # or an index into tiki.windows()). Leaving both out means "the current
+    # image of the current window", as in ImageJ.
 
-    def viewer(self):
-        viewer = self._app.windows.active
-        if viewer is None:
-            raise RuntimeError('no image window is open')
-        return viewer
+    def windows(self) -> list[str]:
+        """Titles of the open image windows, in opening order."""
+        return [v.title for v in self._app.windows.viewers]
 
-    def layer(self):
-        viewer, image = self._app.windows.active_image()
-        if image is None:
-            raise RuntimeError('no image is open')
-        return image
+    def viewer(self, window=None):
+        if window is None:
+            viewer = self._app.windows.active
+            if viewer is None:
+                raise RuntimeError('no image window is open')
+            return viewer
+        viewers = self._app.windows.viewers
+        if isinstance(window, int):
+            try:
+                return viewers[window]
+            except IndexError:
+                raise IndexError(f'window index {window} out of range; open windows: {self.windows()}') from None
+        for v in viewers:
+            if v.title == window:
+                return v
+        raise KeyError(f'no window titled {window!r}; open windows: {self.windows()}')
 
-    def image(self):
-        return self.layer().data
-
-    def axes(self) -> str:
-        return axes_mod.get(self.layer()).roles
-
-    def scale(self) -> list[float]:
-        return [float(s) for s in self.layer().scale]
-
-    def index(self) -> tuple:
+    def _layers_of(self, kind, window=None) -> list:
         from . import roi as roi_mod
 
-        return roi_mod.current_index(self.viewer(), self.layer())
+        return [ly for ly in self.viewer(window).layers
+                if isinstance(ly, kind) and ly.name not in roi_mod.PREVIEW_NAMES]
+
+    def layers(self, kind: str = 'image', window=None) -> list[str]:
+        """Names of the window's layers of ``kind`` ('image', 'labels' or 'all'), bottom to top."""
+        from napari.layers import Image, Labels, Layer
+
+        cls = {'image': Image, 'labels': Labels, 'all': Layer}[kind]
+        return [ly.name for ly in self._layers_of(cls, window)]
+
+    def _pick(self, kind, which, window, what: str):
+        layers = self._layers_of(kind, window)
+        if not layers:
+            raise RuntimeError(f'no {what} layer in window {self.viewer(window).title!r}')
+        if isinstance(which, int):
+            try:
+                return layers[which]
+            except IndexError:
+                raise IndexError(f'{what} layer index {which} out of range; '
+                                 f'layers: {[ly.name for ly in layers]}') from None
+        for ly in layers:
+            if ly.name == which:
+                return ly
+        raise KeyError(f'no {what} layer named {which!r}; layers: {[ly.name for ly in layers]}')
+
+    # -- images ------------------------------------------------------------
+
+    def layer(self, which=None, window=None):
+        """An Image layer: the current one, or by name / index (see above)."""
+        from napari.layers import Image
+
+        from . import roi as roi_mod
+
+        if which is None:
+            image = roi_mod.target_image(self.viewer(window))
+            if image is None:
+                raise RuntimeError('no image is open')
+            return image
+        return self._pick(Image, which, window, 'image')
+
+    def image(self, which=None, window=None):
+        """Data of an image layer (memory-mapped when possible)."""
+        return self.layer(which, window).data
+
+    def axes(self, which=None, window=None) -> str:
+        return axes_mod.get(self.layer(which, window)).roles
+
+    def scale(self, which=None, window=None) -> list[float]:
+        return [float(s) for s in self.layer(which, window).scale]
+
+    def index(self, window=None) -> tuple:
+        from . import roi as roi_mod
+
+        return roi_mod.current_index(self.viewer(window), self.layer(window=window))
 
     def _axes_info(self, data, axes, scale):
         data = np.asarray(data) if not hasattr(data, 'shape') else data
@@ -127,30 +191,38 @@ class MacroAPI:
         """Open ``data`` in a new image window; returns the napari viewer."""
         return self._app.open_data(data, name, axes=self._axes_info(data, axes, scale))
 
-    def add_image(self, data, name: str = 'macro result', **kwargs):
-        """Add an image layer to the current window, aligned with the current image."""
+    def add_image(self, data, name: str = 'macro result', like=None, window=None, **kwargs):
+        """Add an image layer to a window, aligned with image ``like`` (default: current)."""
         from napari.layers import Image
 
-        source = self.layer()
+        source = self.layer(like, window)
         geometry = axes_mod.geometry(source, ndim=np.ndim(data) if np.ndim(data) < source.ndim else None)
         layer = Image(data, name=name, **(geometry | kwargs))
-        self.viewer().add_layer(layer)
-        self._app.reapply_tool(self.viewer())
+        viewer = self.viewer(window)
+        viewer.add_layer(layer)
+        self._app.reapply_tool(viewer)
         return layer
 
-    def add_labels(self, data, name: str = 'macro labels'):
+    def add_labels(self, data, name: str = 'macro labels', like=None, window=None):
+        """Add a Labels layer to a window, aligned with image ``like`` (default: current)."""
         from napari.layers import Labels
 
-        source = self.layer()
+        source = self.layer(like, window)
         data = np.asarray(data)
         geometry = axes_mod.geometry(source, ndim=data.ndim if data.ndim < source.ndim else None)
         layer = Labels(data.astype(np.int32, copy=False), name=name, opacity=0.6, **geometry)
-        self.viewer().add_layer(layer)
-        self._app.reapply_tool(self.viewer())
+        viewer = self.viewer(window)
+        viewer.add_layer(layer)
+        self._app.reapply_tool(viewer)
         return layer
 
-    def labels(self):
-        return self._app.labels_layer(self.viewer()).data
+    def labels(self, which=None, window=None):
+        """Data of a Labels layer: the selected/topmost one, or by name / index."""
+        from napari.layers import Labels
+
+        if which is None:
+            return self._app.labels_layer(self.viewer(window)).data
+        return self._pick(Labels, which, window, 'labels').data
 
     # -- ROIs --------------------------------------------------------------
 
@@ -160,8 +232,8 @@ class MacroAPI:
     def rois(self):
         return list(self._manager().rois)
 
-    def roi_masks(self) -> np.ndarray:
-        shape = self.layer().data.shape[-2:]
+    def roi_masks(self, which=None, window=None) -> np.ndarray:
+        shape = self.layer(which, window).data.shape[-2:]
         rois = self.rois()
         return np.stack([r.mask(shape) for r in rois]) if rois else np.zeros((0,) + shape, bool)
 
@@ -179,13 +251,13 @@ class MacroAPI:
         self._manager().add(rois)
         return rois
 
-    def traces(self, masks=None) -> np.ndarray:
-        """Mean trace of each mask along T (else Z) of the current image: (n, frames)."""
+    def traces(self, masks=None, which=None, window=None) -> np.ndarray:
+        """Mean trace of each mask along T (else Z) of an image: (n, frames)."""
         from . import ops
         from . import roi as roi_mod
 
-        viewer, image = self.viewer(), self.layer()
-        masks = self.roi_masks() if masks is None else np.asarray(masks, bool)
+        viewer, image = self.viewer(window), self.layer(which, window)
+        masks = self.roi_masks(which, window) if masks is None else np.asarray(masks, bool)
         if masks.ndim == 2:
             masks = masks[None]
         axis = self._app._stack_axis(viewer, image)
@@ -272,7 +344,9 @@ def list_macros() -> list[Path]:
 TEMPLATES = {
     'Blank (API reference)': '''"""TIKI macro: plain Python with a `tiki` object and numpy as `np`.
 
-tiki.image()  tiki.layer()  tiki.viewer()  tiki.axes()  tiki.scale()  tiki.index()
+tiki.windows()  tiki.layers()        # what is open: window titles, layer names
+tiki.image(which=None, window=None)  # which = layer name or index (0 bottom, -1 top)
+tiki.layer()  tiki.viewer()  tiki.axes()  tiki.scale()  tiki.index()
 tiki.show(data, name, axes='TYX', scale=None)   tiki.add_image(data, name)
 tiki.add_labels(data, name)   tiki.labels()
 tiki.rois()  tiki.roi_masks()  tiki.add_roi(yx)  tiki.rois_from_labels(labels)
@@ -281,8 +355,12 @@ tiki.run('Command…')   tiki.progress(iterable, 'label')   tiki.status('msg')
 tiki.ops  (z_project, dff_movie, correlation_image, segment, ...)
 """
 
-data = tiki.image()
+print('windows:', tiki.windows())
+print('layers in this window:', tiki.layers())
+data = tiki.image()                  # the current image
 print(tiki.layer().name, data.shape, data.dtype, tiki.axes())
+# e.g. two channels after Image > Color > Split Channels:
+# green, red = tiki.image('C1-movie.tif'), tiki.image('C2-movie.tif')
 ''',
     'Motion correction (rigid)': '''"""Rigid motion correction by phase correlation against a median template.
 
