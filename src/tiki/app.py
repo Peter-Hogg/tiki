@@ -211,6 +211,16 @@ class Tiki(QMainWindow):
         self._add(tools, 'ROI Manager…', self.show_roi_manager)
         self._add(tools, 'Add to Manager', self.add_to_manager, 'Ctrl+T')
 
+        m = mb.addMenu('&Plugins')
+        macros = m.addMenu('Macros')
+        self.macros_menu = macros
+        self._add(macros, 'New Macro…', self.new_macro, 'Ctrl+Shift+M')
+        self._add(macros, 'Edit Macro…', self.edit_macro)
+        self._add(macros, 'Run Macro…', self.run_macro_file)
+        self._add(macros, 'Show Macros Folder', self.show_macros_folder)
+        self._macro_fixed = len(macros.actions())
+        macros.aboutToShow.connect(self._fill_macros_menu)
+
         self.window_menu = mb.addMenu('&Window')
         self.window_menu.aboutToShow.connect(self._fill_window_menu)
 
@@ -1008,6 +1018,75 @@ class Tiki(QMainWindow):
             )
         return snippet
 
+    # ---------------------------------------------------------------- Macros
+
+    def new_macro(self, path=None):
+        from .macros import MacroEditor
+
+        editor = MacroEditor(self, path)
+        self.keep_window(editor)
+        editor.show()
+        return editor
+
+    def edit_macro(self):
+        from . import macros
+
+        macros.MACROS_DIR.mkdir(parents=True, exist_ok=True)
+        path, _ = QFileDialog.getOpenFileName(self, 'Edit macro', str(macros.MACROS_DIR), 'Python (*.py)')
+        if path:
+            self.new_macro(path)
+
+    def run_macro_file(self, path: str | None = None) -> bool:
+        from . import macros
+
+        if path is None:
+            macros.MACROS_DIR.mkdir(parents=True, exist_ok=True)
+            path, _ = QFileDialog.getOpenFileName(self, 'Run macro', str(macros.MACROS_DIR), 'Python (*.py)')
+            if not path:
+                return False
+        code = Path(path).read_text()
+        ok, out, _ = macros.run_code(self, code, str(path))
+        if out:
+            self.log(f'── {Path(path).name}\n{out}')
+        if not ok:
+            raise TikiError(f'macro {Path(path).name} stopped:\n\n{out.strip()[-1500:]}')
+        self.status(f'Macro {Path(path).name} finished')
+        return ok
+
+    def log(self, text: str) -> None:
+        from .macros import LogWindow
+
+        if getattr(self, 'log_window', None) is None:
+            self.log_window = LogWindow()
+        self.log_window.append(text)
+        self.log_window.show()
+
+    def show_macros_folder(self) -> None:
+        from qtpy.QtCore import QUrl
+        from qtpy.QtGui import QDesktopServices
+
+        from . import macros
+
+        macros.MACROS_DIR.mkdir(parents=True, exist_ok=True)
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(macros.MACROS_DIR)))
+        self.status(f'Macros folder: {macros.MACROS_DIR} (every .py here appears in Plugins ▸ Macros)')
+
+    def _fill_macros_menu(self) -> None:
+        from . import macros
+
+        menu = self.macros_menu
+        for action in menu.actions()[self._macro_fixed:]:
+            menu.removeAction(action)
+        found = macros.list_macros()
+        menu.addSeparator()
+        if not found:
+            menu.addAction('(save macros to the macros folder to list them here)').setEnabled(False)
+        for path in found:
+            name = path.stem.replace('_', ' ')
+            action = menu.addAction(name)
+            action.setToolTip(str(path))
+            action.triggered.connect(lambda _=False, p=str(path): self._run(p, lambda: self.run_macro_file(p)))
+
     # ------------------------------------------- Process extras & helpers
 
     def _process(self, name: str):
@@ -1085,7 +1164,8 @@ class Tiki(QMainWindow):
     def closeEvent(self, event):
         self.windows.close_all()
         self.results.close()
-        for w in (self.threshold_window, self.roi_manager, getattr(self, 'channels_window', None)):
+        for w in (self.threshold_window, self.roi_manager, getattr(self, 'channels_window', None),
+                  getattr(self, 'log_window', None)):
             if w is not None:
                 w.close()
         for w in list(self.profiles):

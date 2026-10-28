@@ -59,6 +59,7 @@ concepts
 workflows
 multidimensional-data
 roi-manager
+macros
 troubleshooting
 ```
 

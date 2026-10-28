@@ -194,6 +194,16 @@ pixel value.
 - **Analyze ▸ Set Scale…** calibrates from a line drawn across a known distance;
   **Analyze ▸ Histogram** shows counts and statistics for the plane or selection
 
+### Python macros
+
+- **Plugins ▸ Macros ▸ New Macro…** opens a Python editor (Run with Ctrl+R) with
+  a `tiki` object for the open windows: `tiki.image()`, `tiki.show(...)`,
+  `tiki.add_labels(...)`, `tiki.rois()`, `tiki.traces()`, `tiki.run('Measure')`,
+  `tiki.progress(...)` and more
+- Templates: rigid motion correction (runs as is), CaImAn CNMF → ROIs,
+  measure ROIs over time
+- `.py` files in the macros folder become Plugins ▸ Macros menu items
+
 ### Send to Notebook
 
 - Exports the current window to a folder: labels, other layers, ROIs
@@ -233,6 +243,7 @@ pixel value.
 | Image → Stacks | Kymograph / Reslice… (from a line or path) | |
 | Analyze | Histogram / Set Scale… | <kbd>Ctrl</kbd>+<kbd>H</kbd> / — |
 | File | Open Recent | |
+| Plugins → Macros | New / Edit / Run Macro…, macros folder (Python) | <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>M</kbd> |
 | Analyze | Analyze Particles… (per-object table from a Labels layer) | |
 | Analyze → Traces | From ROI Manager / From Labels (cells × time) | |
 | Analyze → Tools | ROI Manager… / Add to Manager | — / <kbd>Ctrl</kbd>+<kbd>T</kbd> |
