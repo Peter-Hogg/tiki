@@ -34,7 +34,7 @@ from qtpy.QtWidgets import (
     QWidget,
 )
 
-from . import io, ops
+from . import io, ops, style
 from . import roi as roi_mod
 from .icons import tool_icon
 from .manager import WindowManager
@@ -63,6 +63,7 @@ class TikiError(Exception):
 class Tiki(QMainWindow):
     def __init__(self):
         super().__init__()
+        style.apply(self)
         self.setWindowTitle('TIKI')
         self.setAcceptDrops(True)
         self.tool = 'rectangle'

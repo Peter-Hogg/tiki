@@ -20,7 +20,7 @@ from qtpy.QtWidgets import (
     QWidget,
 )
 
-from . import ops
+from . import ops, style
 from . import roi as roi_mod
 
 
@@ -29,12 +29,14 @@ class ResultsTable(QWidget):
 
     def __init__(self, parent=None):
         super().__init__(parent, Qt.Window)
+        style.apply(self)
         self.setWindowTitle('Results')
         self.resize(640, 260)
         self.columns: list[str] = []
         self.rows: list[dict] = []
         self.table = QTableWidget(0, 0)
         self.table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.table.setAlternatingRowColors(True)
         buttons = QHBoxLayout()
         for text, slot in (('Copy', self.copy), ('Save As…', self.save_as), ('Clear', self.clear)):
             b = QPushButton(text)
@@ -105,6 +107,7 @@ class ProfileWindow(QWidget):
 
     def __init__(self, viewer, image, axis: int, parent=None):
         super().__init__(parent, Qt.Window)
+        style.apply(self)
         self.viewer = viewer
         self.image = image
         self.axis = axis
@@ -209,6 +212,7 @@ class PlotWindow(QWidget):
 
     def __init__(self, title: str, x, y, xlabel: str, ylabel: str, parent=None):
         super().__init__(parent, Qt.Window)
+        style.apply(self)
         self.setWindowTitle(title)
         self.resize(520, 300)
         self.x, self.y = np.asarray(x), np.asarray(y)
