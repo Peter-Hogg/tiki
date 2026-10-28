@@ -4,7 +4,7 @@ TIKI is an early-stage desktop application and does not yet have supported
 release branches.
 
 Please do not open a public issue for a vulnerability. Email
-**peterhogg@fas.harvard.edu** with a description, reproduction steps and the
+**peterhogg2006@gmail.com** with a description, reproduction steps and the
 affected version or commit. You should receive an acknowledgement within seven
 days.
 

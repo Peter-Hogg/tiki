@@ -17,8 +17,9 @@ match.
 ## ImageJ interoperability
 
 TIKI reads and writes individual ImageJ `.roi` files and `RoiSet.zip`
-archives. Pixel coordinates are preserved for round trips between Fiji and
-TIKI.
+archives, converting between ImageJ's pixel-corner coordinates and napari's
+pixel-centre coordinates. Saving and re-opening in TIKI selects the same
+pixels; composite (shape) ROIs from Fiji are skipped with a message.
 
 ## Labels and traces
 

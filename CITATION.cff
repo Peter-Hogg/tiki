@@ -5,7 +5,7 @@ type: software
 authors:
   - family-names: Hogg
     given-names: Peter
-    email: peterhogg@fas.harvard.edu
+    email: peterhogg2006@gmail.com
 repository-code: "https://github.com/Peter-Hogg/tiki"
 url: "https://peter-hogg.github.io/tiki/"
 license: BSD-3-Clause

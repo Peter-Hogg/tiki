@@ -27,7 +27,7 @@ Run the application and tests:
 
 ```bash
 tiki
-xvfb-run -a python -m pytest -q  # Linux CI/headless
+QT_QPA_PLATFORM=offscreen python -m pytest -q  # headless, as in CI
 sphinx-build -W --keep-going -b html docs docs/_build/html
 ```
 
@@ -40,8 +40,9 @@ sphinx-build -W --keep-going -b html docs docs/_build/html
    and chunked operations where practical.
 5. Confirm the test and documentation builds pass before opening the PR.
 
-On a normal desktop, `python -m pytest -q` uses your current display and does
-not require `xvfb-run`.
+Without `QT_QPA_PLATFORM=offscreen` the tests open real windows on your
+display. Offscreen mode has no OpenGL, so tests stub out napari's layer-control
+panels (see the `tiki` fixture in `tests/test_app.py`).
 
 By contributing, you agree that your contribution is licensed under the
 project's BSD 3-Clause License.

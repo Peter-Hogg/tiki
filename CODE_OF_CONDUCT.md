@@ -27,7 +27,7 @@ acceptable.
 
 ## Enforcement
 
-Report unacceptable behavior privately to **peterhogg@fas.harvard.edu**.
+Report unacceptable behavior privately to **peterhogg2006@gmail.com**.
 Reports will be reviewed promptly and handled as confidentially as possible.
 Maintainers may remove, edit or reject comments, commits, issues and other
 contributions that violate this policy, and may temporarily or permanently ban

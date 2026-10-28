@@ -8,7 +8,7 @@ version = "0.0.1"
 description = "TIKI Is Kinda ImageJ: an ImageJ-style toolbar that drives napari windows"
 readme = "README.md"
 requires-python = ">=3.10"
-authors = [{ name = "Peter Hogg", email = "peterhogg@fas.harvard.edu" }]
+authors = [{ name = "Peter Hogg", email = "peterhogg2006@gmail.com" }]
 license = "BSD-3-Clause"
 license-files = ["LICENSE"]
 keywords = ["napari", "imagej", "fiji", "microscopy", "bioimage-analysis"]
