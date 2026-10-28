@@ -108,6 +108,34 @@ pixel value.
 - Brush and eraser tools on the TIKI toolbar paint into the selected Labels
   layer, or create an empty one for annotating from scratch
 
+### Particles, ROI Manager and traces
+
+- **Analyze Particles** measures every object in a Labels layer (Area, Mean,
+  StdDev, Min, Max, X, Y, Perim., Circ., AR, Solidity, IntDen), on one slice or
+  the whole stack, with min size and exclude-on-edges options
+- **ROI Manager**: Add (<kbd>Ctrl</kbd>+<kbd>T</kbd>), Update, Delete, Rename,
+  Measure, Multi Plot, Show All with names; it is global, so ROIs drawn on one
+  window (e.g. an average projection) can be used on another (the movie)
+- ImageJ/Fiji compatible: Open and Save `.roi` and `RoiSet.zip`
+- **From Labels / To Labels** converts between objects and ROIs
+- **Traces**: one mean trace per ROI or label through the stack, shown as
+  stacked lines or a heatmap, optional ΔF/F (F0 = median), exported as a
+  cells × frames `.npy` (plus names) or CSV
+- ROI layers are 2D, so a selection stays in place while you scroll frames
+
+### Filters
+
+- Gaussian Blur, Median and rolling-ball Subtract Background with a live
+  preview of the current slice
+- Non-destructive: the result is added as a new layer above the original
+
+### Send to Notebook
+
+- Exports the current window to a folder: labels, other layers, ROIs
+  (`RoiSet.zip`, `rois.json`, `roi_masks.npy`), traces, results and a manifest
+- Writes `load_session.py` (numpy/tifffile only) and copies it to the clipboard;
+  the source movie is referenced by path, not copied
+
 ### File handling
 
 - TIFF/OME-TIFF via `tifffile`
@@ -130,8 +158,14 @@ pixel value.
 | Image | Show Info | <kbd>Ctrl</kbd>+<kbd>I</kbd> |
 | Image | Crop | <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>X</kbd> |
 | Image | Duplicate | <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>D</kbd> |
+| Process → Filters | Gaussian Blur…, Median… (live preview, result as new layer) | |
+| Process | Subtract Background… (rolling ball, light background) | |
 | Image → Stacks | Plot Z-axis Profile | <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>Y</kbd> |
 | Analyze | Measure | <kbd>Ctrl</kbd>+<kbd>M</kbd> |
+| Analyze | Analyze Particles… (per-object table from a Labels layer) | |
+| Analyze → Traces | From ROI Manager / From Labels (cells × time) | |
+| Analyze → Tools | ROI Manager… / Add to Manager | — / <kbd>Ctrl</kbd>+<kbd>T</kbd> |
+| File → Export | Send to Notebook… | <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>N</kbd> |
 | Analyze | Plot Profile | <kbd>Ctrl</kbd>+<kbd>K</kbd> |
 | Help | Find Commands | <kbd>Ctrl</kbd>+<kbd>L</kbd> |
 
@@ -162,14 +196,16 @@ src/tiki/
 ├── io.py        TIFF and NumPy loading
 ├── widgets.py   Results and profile windows
 ├── threshold.py Threshold dialog producing napari Labels
+├── rois.py      ROI model, ImageJ .roi/.zip and Labels conversion
+├── roi_manager.py ROI Manager window
+├── filters.py   Process filters with live preview
+├── export.py    Send to Notebook
 ├── style.py     fixed light theme for TIKI windows
 └── icons.py     toolbar icon drawing
 ```
 
 ## Roadmap
 
-- ROI Manager with rename, show/hide, save/load and Multi Measure
-- ImageJ `.roi` and ROI-set `.zip` compatibility
 - A dedicated Brightness/Contrast dialog
 - Better OME and acquisition metadata handling
 - Calibration-aware measurements in physical units

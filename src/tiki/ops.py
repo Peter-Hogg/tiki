@@ -210,3 +210,175 @@ def threshold_stack(
                 mask = label_objects(mask, min_size) > 0
             out[idx] = mask
     return out
+
+
+# ---------------------------------------------------------------- particles
+
+def particle_table(labels: np.ndarray, intensity: np.ndarray, scale=(1.0, 1.0)) -> list[dict]:
+    """Analyze Particles: one row per labelled object in a 2D label image.
+
+    Columns follow ImageJ (Area, Mean, StdDev, Min, Max, X, Y, Perim.,
+    Circ., AR, Solidity, IntDen). Lengths and areas use ``scale`` (sy, sx);
+    shape descriptors assume square pixels.
+    """
+    from skimage.measure import regionprops
+
+    sy, sx = float(scale[0]), float(scale[1])
+    rows = []
+    for region in regionprops(np.asarray(labels).astype(np.int32, copy=False), np.asarray(intensity)):
+        vals = region.image_intensity[region.image].astype(np.float64)
+        area_px = float(region.area)
+        perim_px = float(region.perimeter)
+        cy, cx = region.centroid
+        major, minor = region.axis_major_length, region.axis_minor_length
+        rows.append({
+            'Label': int(region.label),
+            'Area': area_px * sy * sx,
+            'Mean': float(vals.mean()),
+            'StdDev': float(vals.std(ddof=1)) if vals.size > 1 else 0.0,
+            'Min': float(vals.min()),
+            'Max': float(vals.max()),
+            'X': cx * sx,
+            'Y': cy * sy,
+            'Perim.': perim_px * sx,
+            'Circ.': min(1.0, 4 * np.pi * area_px / perim_px**2) if perim_px > 0 else 1.0,
+            'AR': major / minor if minor > 0 else float('nan'),
+            'Solidity': float(region.solidity),
+            'IntDen': area_px * sy * sx * float(vals.mean()),
+        })
+    return rows
+
+
+# ------------------------------------------------------------------- traces
+
+def _lead_slices(ndim: int, axis: int, index: tuple, t0: int, t1: int) -> tuple:
+    return tuple(slice(t0, t1) if d == axis else int(index[d]) for d in range(ndim - 2))
+
+
+def roi_traces(data, axis: int, index: tuple, masks: list[np.ndarray], chunk: int = 256, progress=None) -> np.ndarray:
+    """Mean inside each mask at every position along ``axis``: (n_rois, n_frames).
+
+    Reads each chunk of frames once (only the union bounding box of all masks)
+    however many ROIs there are. ``progress(done, total)`` may return False to cancel.
+    """
+    n_t = data.shape[axis]
+    out = np.full((len(masks), n_t), np.nan)
+    if not masks:
+        return out
+    union = np.any(masks, axis=0)
+    rows, cols = np.flatnonzero(union.any(1)), np.flatnonzero(union.any(0))
+    if rows.size == 0:
+        return out
+    ys, xs = slice(rows[0], rows[-1] + 1), slice(cols[0], cols[-1] + 1)
+    flat_idx = [np.flatnonzero(m[ys, xs].ravel()) for m in masks]
+    for t0 in range(0, n_t, chunk):
+        t1 = min(t0 + chunk, n_t)
+        block = np.asarray(data[_lead_slices(data.ndim, axis, index, t0, t1) + (ys, xs)], dtype=np.float64)
+        block = block.reshape(t1 - t0, -1)
+        for i, idx in enumerate(flat_idx):
+            if idx.size:
+                out[i, t0:t1] = block[:, idx].mean(axis=1)
+        if progress is not None and progress(t1, n_t) is False:
+            break
+    return out
+
+
+def label_traces(data, axis: int, index: tuple, labels: np.ndarray, chunk: int = 256, progress=None):
+    """Mean of every label in a 2D label image at each frame: ``(ids, (n_ids, n_frames))``."""
+    labels = np.asarray(labels)
+    ids = np.unique(labels)
+    ids = ids[ids > 0]
+    n_t = data.shape[axis]
+    out = np.full((ids.size, n_t), np.nan)
+    if ids.size == 0:
+        return ids, out
+    # compact ids so bincount stays small even with sparse label numbers
+    compact = np.zeros(int(labels.max()) + 1, dtype=np.int64)
+    compact[ids] = np.arange(1, ids.size + 1)
+    lab = compact[labels].ravel()
+    counts = np.bincount(lab, minlength=ids.size + 1)[1:].astype(np.float64)
+    for t0 in range(0, n_t, chunk):
+        t1 = min(t0 + chunk, n_t)
+        block = np.asarray(data[_lead_slices(data.ndim, axis, index, t0, t1)], dtype=np.float64)
+        block = block.reshape(t1 - t0, -1)
+        for j in range(t1 - t0):
+            sums = np.bincount(lab, weights=block[j], minlength=ids.size + 1)[1:]
+            out[:, t0 + j] = sums / counts
+        if progress is not None and progress(t1, n_t) is False:
+            break
+    return ids, out
+
+
+def dff(traces: np.ndarray) -> np.ndarray:
+    """ΔF/F with F0 = each trace's median."""
+    f0 = np.nanmedian(traces, axis=-1, keepdims=True)
+    with np.errstate(divide='ignore', invalid='ignore'):
+        return (traces - f0) / f0
+
+
+# ------------------------------------------------------------------ filters
+
+def gaussian_blur(plane: np.ndarray, sigma: float) -> np.ndarray:
+    from scipy.ndimage import gaussian_filter
+
+    return gaussian_filter(np.asarray(plane, dtype=np.float32), sigma)
+
+
+def median_filter(plane: np.ndarray, radius: float) -> np.ndarray:
+    """Median over a disk of ``radius`` pixels (ImageJ's Median filter)."""
+    from scipy.ndimage import median_filter as _median
+    from skimage.morphology import disk
+
+    r = max(int(round(radius)), 0)
+    if r == 0:
+        return np.asarray(plane).copy()
+    return _median(np.asarray(plane), footprint=disk(r))
+
+
+def subtract_background(plane: np.ndarray, radius: float, light_background: bool = False) -> np.ndarray:
+    """Rolling-ball background subtraction (ImageJ's Subtract Background).
+
+    Like ImageJ, large radii work on a shrunken image (min-pooled) and the
+    background is interpolated back up, which keeps big balls fast.
+    Integer images are clipped at zero.
+    """
+    from skimage.restoration import rolling_ball
+    from skimage.transform import resize
+
+    plane = np.asarray(plane)
+    img = plane.astype(np.float32)
+    # Light background: invert, subtract, invert back, so the background
+    # ends up at the image maximum (white) as in ImageJ.
+    top = float(img.max())
+    work = top - img if light_background else img
+    shrink = 8 if radius > 100 else 4 if radius > 30 else 2 if radius > 10 else 1
+    if shrink > 1:
+        h, w = work.shape
+        hp, wp = -(-h // shrink) * shrink, -(-w // shrink) * shrink
+        padded = np.pad(work, ((0, hp - h), (0, wp - w)), mode='edge')
+        small = padded.reshape(hp // shrink, shrink, wp // shrink, shrink).min(axis=(1, 3))
+        bg_small = rolling_ball(small, radius=radius / shrink)
+        background = resize(bg_small, (hp, wp), order=1, preserve_range=True)[:h, :w]
+        background = np.minimum(background, work)  # never subtract more than the pixel
+    else:
+        background = rolling_ball(work, radius=radius)
+    result = work - background
+    if light_background:
+        result = top - result
+    if np.issubdtype(plane.dtype, np.integer):
+        info = np.iinfo(plane.dtype)
+        return np.clip(np.round(result), max(info.min, 0), info.max).astype(plane.dtype)
+    return result.astype(np.float32)
+
+
+def map_planes(func, data, out_dtype=None, progress=None) -> np.ndarray:
+    """Apply a 2D ``func`` to every plane of ``data`` (chunk-safe for memmaps)."""
+    lead = data.shape[:-2]
+    first = func(np.asarray(data[(0,) * len(lead)]))
+    out = np.empty(lead + first.shape, dtype=out_dtype or first.dtype)
+    total = int(np.prod(lead)) if lead else 1
+    for n, idx in enumerate(np.ndindex(*lead) if lead else [()]):
+        out[idx] = first if n == 0 else func(np.asarray(data[idx]))
+        if progress is not None and progress(n + 1, total) is False:
+            break
+    return out

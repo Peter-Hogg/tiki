@@ -15,6 +15,7 @@ from qtpy.QtWidgets import (
     QAction,
     QActionGroup,
     QApplication,
+    QCheckBox,
     QComboBox,
     QDialog,
     QDialogButtonBox,
@@ -74,6 +75,8 @@ class Tiki(QMainWindow):
         self._message_until = 0.0
         self._actions: dict[str, QAction] = {}
         self.threshold_window = None
+        self.roi_manager = None
+        self.traces: list = []  # open TracesWindows (exported by Send to Notebook)
 
         self._build_menus()
         self.windows = WindowManager(
@@ -134,6 +137,8 @@ class Tiki(QMainWindow):
         self._add(m, 'Close', self.close_active, 'Ctrl+W')
         self._add(m, 'Close All', self.windows_close_all, 'Ctrl+Shift+W')
         self._add(m, 'Save As TIFF…', self.save_as, 'Ctrl+S')
+        export = m.addMenu('Export')
+        self._add(export, 'Send to Notebook…', self.send_to_notebook, 'Ctrl+Shift+N')
         m.addSeparator()
         self._add(m, 'Quit', self.close, 'Ctrl+Q')
 
@@ -156,12 +161,25 @@ class Tiki(QMainWindow):
         self._add(stacks, 'Z Project…', self.z_project_dialog)
         self._add(stacks, 'Plot Z-axis Profile', self.plot_z_profile, 'Ctrl+Shift+Y')
 
+        m = mb.addMenu('&Process')
+        filt = m.addMenu('Filters')
+        self._add(filt, 'Gaussian Blur…', lambda: self.filter_dialog('gaussian'))
+        self._add(filt, 'Median…', lambda: self.filter_dialog('median'))
+        self._add(m, 'Subtract Background…', lambda: self.filter_dialog('background'))
+
         m = mb.addMenu('&Analyze')
         self._add(m, 'Measure', self.measure, 'Ctrl+M')
+        self._add(m, 'Analyze Particles…', self.analyze_particles)
         self._add(m, 'Clear Results', self.results.clear)
         self._add(m, 'Show Results', self.show_results)
         m.addSeparator()
         self._add(m, 'Plot Profile', self.plot_line_profile, 'Ctrl+K')
+        traces = m.addMenu('Traces')
+        self._add(traces, 'From ROI Manager', self.traces_from_manager)
+        self._add(traces, 'From Labels', self.traces_from_labels)
+        tools = m.addMenu('Tools')
+        self._add(tools, 'ROI Manager…', self.show_roi_manager)
+        self._add(tools, 'Add to Manager', self.add_to_manager, 'Ctrl+T')
 
         self.window_menu = mb.addMenu('&Window')
         self.window_menu.aboutToShow.connect(self._fill_window_menu)
@@ -319,6 +337,8 @@ class Tiki(QMainWindow):
             self.apply_tool(viewer)
         if self.threshold_window is not None and self.threshold_window.isVisible():
             self.threshold_window.set_target(viewer)
+        if self.roi_manager is not None and self.roi_manager.isVisible():
+            self.roi_manager.refresh_overlay(viewer)
 
     # ------------------------------------------------------------ helpers
 
@@ -391,9 +411,7 @@ class Tiki(QMainWindow):
         viewer, image = self.require_image()
         h, w = roi_mod.spatial_shape(image)
         layer = self._roi(viewer)
-        index = roi_mod.current_index(viewer, image)
-        lead = list(index[:-2])
-        corners = [lead + [y, x] for y, x in ((-0.5, -0.5), (-0.5, w - 0.5), (h - 0.5, w - 0.5), (h - 0.5, -0.5))]
+        corners = [[-0.5, -0.5], [-0.5, w - 0.5], [h - 0.5, w - 0.5], [h - 0.5, -0.5]]
         layer.data = []
         layer.add_rectangles(np.array([corners], dtype=float))
 
@@ -601,6 +619,193 @@ class Tiki(QMainWindow):
         win.destroyed.connect(lambda _=None, w=win: self.profiles.remove(w) if w in self.profiles else None)
         win.show()
 
+    # ----------------------------------------------- ROI Manager & traces
+
+    def roi_layer(self, viewer) -> Shapes:
+        return self._roi(viewer)
+
+    def reapply_tool(self, viewer) -> None:
+        """After adding a layer: keep the live ROI on top and the current tool armed."""
+        roi = roi_mod.roi_layer(viewer, create=False)
+        if roi is not None:
+            viewer.layers.move(viewer.layers.index(roi), len(viewer.layers))
+        self.apply_tool(viewer)
+
+    def labels_layer(self, viewer) -> Labels:
+        """The selected Labels layer, else the topmost one (previews excluded)."""
+        active = viewer.layers.selection.active
+        if isinstance(active, Labels) and active.name not in roi_mod.PREVIEW_NAMES:
+            return active
+        labels = [ly for ly in viewer.layers if isinstance(ly, Labels) and ly.name not in roi_mod.PREVIEW_NAMES]
+        if not labels:
+            raise TikiError('no Labels layer in this window (use Image ▸ Adjust ▸ Threshold… and Apply)')
+        return labels[-1]
+
+    def labels_plane(self, viewer, layer: Labels) -> np.ndarray:
+        """The 2D labels on the current slice (a 2D layer is used as is)."""
+        data = layer.data
+        if data.ndim == 2:
+            return np.asarray(data)
+        point = layer.world_to_data(viewer.dims.point[-layer.ndim:])
+        idx = tuple(int(np.clip(np.round(point[d]), 0, data.shape[d] - 1)) for d in range(data.ndim - 2))
+        return np.asarray(data[idx])
+
+    def show_roi_manager(self):
+        from .roi_manager import RoiManager
+
+        if self.roi_manager is None:
+            self.roi_manager = RoiManager(self)
+        self.roi_manager.show()
+        self.roi_manager.raise_()
+        return self.roi_manager
+
+    def add_to_manager(self) -> None:
+        self.show_roi_manager().add_current()
+
+    def _stack_axis(self, viewer, image) -> int:
+        if image.ndim < 3:
+            raise TikiError('traces need a stack or movie')
+        last = viewer.dims.last_used - (viewer.dims.ndim - image.ndim)
+        return last if 0 <= last < image.ndim - 2 else 0
+
+    def show_traces(self, viewer, image, names, masks=None, labels=None):
+        """Compute traces (masks list or a 2D labels image) and open a TracesWindow."""
+        from .widgets import TracesWindow
+
+        axis = self._stack_axis(viewer, image)
+        index = roi_mod.current_index(viewer, image)
+        data = image.data
+        n_t = data.shape[axis]
+        t0 = time.perf_counter()
+        with self.progress('Traces', n_t) as tick:
+            if labels is not None:
+                ids, traces = ops.label_traces(data, axis, index, labels, progress=tick)
+                names = [f'label {int(i)}' for i in ids]
+            else:
+                traces = ops.roi_traces(data, axis, index, masks, progress=tick)
+        if tick.cancelled:
+            self.status('Traces cancelled')
+            return None
+        if len(names) == 0:
+            raise TikiError('nothing to plot')
+        win = TracesWindow(f'Traces — {image.name}', names, traces, viewer, image, axis,
+                           xlabel=roi_mod.axis_name(viewer, image, axis))
+        win.setAttribute(Qt.WA_DeleteOnClose)
+        self.traces.append(win)
+        self.profiles.append(win)
+        win.destroyed.connect(lambda _=None, w=win: [lst.remove(w) for lst in (self.traces, self.profiles) if w in lst])
+        win.show()
+        self.status(f'{len(names)} traces x {n_t} frames in {time.perf_counter() - t0:.1f} s')
+        return win
+
+    def traces_from_manager(self) -> None:
+        self.show_roi_manager().multi_plot()
+
+    def traces_from_labels(self) -> None:
+        viewer, image = self.require_image()
+        layer = self.labels_layer(viewer)
+        self.show_traces(viewer, image, [], labels=self.labels_plane(viewer, layer))
+
+    def progress(self, title: str, total: int):
+        return _Progress(self, title, total)
+
+    # ------------------------------------------------- Analyze Particles
+
+    def analyze_particles(self) -> None:
+        viewer, image = self.require_image()
+        layer = self.labels_layer(viewer)
+        dlg = QDialog(self)
+        dlg.setWindowTitle('Analyze Particles')
+        form = QFormLayout(dlg)
+        form.addRow(QLabel(f'Labels: <b>{layer.name}</b><br>Intensity: <b>{image.name}</b>'))
+        min_size = QSpinBox()
+        min_size.setRange(0, 10**7)
+        min_size.setSuffix(' px')
+        form.addRow('Min size:', min_size)
+        exclude = QCheckBox('Exclude on edges')
+        clear = QCheckBox('Clear results', checked=True)
+        stack = QCheckBox('Whole stack')
+        form.addRow(exclude)
+        form.addRow(clear)
+        if layer.data.ndim > 2:
+            form.addRow(stack)
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(dlg.accept)
+        buttons.rejected.connect(dlg.reject)
+        form.addRow(buttons)
+        if dlg.exec_() != QDialog.Accepted:
+            return
+        self.particles(viewer, image, layer, min_size.value(), exclude.isChecked(), clear.isChecked(),
+                       stack.isChecked() and layer.data.ndim > 2)
+
+    def particles(self, viewer, image, layer, min_size=0, exclude_edges=False, clear=True, whole_stack=False):
+        from skimage.segmentation import clear_border
+
+        if clear:
+            self.results.clear()
+        sy, sx = image.scale[-2:]
+        if whole_stack:
+            lead = layer.data.shape[:-2]
+            planes = [(idx, np.asarray(layer.data[idx]), np.asarray(image.data[idx])) for idx in np.ndindex(*lead)]
+        else:
+            idx = roi_mod.current_index(viewer, image)[:-2]
+            planes = [(idx, self.labels_plane(viewer, layer), roi_mod.current_plane(viewer, image))]
+        total = 0
+        for idx, lab, img in planes:
+            if lab.max() == 1:  # a 0/1 mask: split into objects first
+                lab = ops.label_objects(lab > 0)
+            if exclude_edges:
+                lab = clear_border(lab)
+            if min_size > 1:
+                sizes = np.bincount(lab.ravel())
+                lab = np.where(sizes[lab] >= min_size, lab, 0)
+            for row in ops.particle_table(lab, img, (sy, sx)):
+                if idx:
+                    row = {'Slice': ','.join(str(i + 1) for i in idx)} | row
+                self.results.add_row(row)
+                total += 1
+        self.show_results()
+        self.status(f'Analyze Particles: {total} objects from "{layer.name}"')
+        return total
+
+    # --------------------------------------------------- Process filters
+
+    def filter_dialog(self, key: str) -> None:
+        from .filters import FilterDialog, run_filter
+
+        viewer, image = self.require_image()
+        dlg = FilterDialog(self, key, viewer, image)
+        if dlg.exec_() != QDialog.Accepted:
+            return
+        run_filter(self, key, viewer, image, dlg.values(), dlg.whole_stack.isChecked())
+
+    # ---------------------------------------------------- Send to notebook
+
+    def send_to_notebook(self, folder: str | None = None) -> str:
+        from .export import export_session
+
+        viewer, image = self.require_image()
+        if folder is None:
+            src = image.metadata.get('path')
+            start = Path(src).parent if src else Path.home()
+            base = QFileDialog.getExistingDirectory(self, 'Export session into folder', str(start))
+            if not base:
+                return ''
+            folder = str(Path(base) / f'{Path(image.name).stem}_tiki')
+        manager = self.roi_manager.rois if self.roi_manager is not None else []
+        traces = [(w.windowTitle(), w.names, w.traces) for w in self.traces if w.viewer is viewer]
+        out, snippet = export_session(folder, viewer, image, manager, traces,
+                                      self.results.rows, self.results.columns)
+        QApplication.clipboard().setText(snippet)
+        self.status(f'Exported to {out}; loader code copied to clipboard')
+        if not getattr(self, '_quiet_export', False):
+            QMessageBox.information(
+                self, 'Send to Notebook',
+                f'Wrote {out}\n\nPaste into a notebook (already on your clipboard):\n\n'
+                f"exec(open(r'{out / 'load_session.py'}').read())\n\nor open load_session.py.",
+            )
+        return snippet
+
     # -------------------------------------------------------------- Help
 
     def find_commands(self) -> None:
@@ -627,8 +832,9 @@ class Tiki(QMainWindow):
     def closeEvent(self, event):
         self.windows.close_all()
         self.results.close()
-        if self.threshold_window is not None:
-            self.threshold_window.close()
+        for w in (self.threshold_window, self.roi_manager):
+            if w is not None:
+                w.close()
         for w in list(self.profiles):
             w.close()
         event.accept()
@@ -649,6 +855,34 @@ def install_excepthook(tiki: Tiki) -> None:
             pass
 
     sys.excepthook = hook
+
+
+class _Progress:
+    """``with tiki.progress(title, total) as tick:`` - tick(done, total) -> keep going?"""
+
+    def __init__(self, parent, title: str, total: int):
+        from qtpy.QtWidgets import QProgressDialog
+
+        self.cancelled = False
+        self.dialog = QProgressDialog(f'{title}…', 'Cancel', 0, max(total, 1), parent)
+        self.dialog.setWindowTitle(title)
+        self.dialog.setWindowModality(Qt.WindowModal)
+        self.dialog.setMinimumDuration(400)
+
+    def __enter__(self):
+        return self
+
+    def __call__(self, done: int, total: int) -> bool:
+        self.dialog.setMaximum(max(total, 1))
+        self.dialog.setValue(done)
+        QApplication.processEvents()
+        self.cancelled = self.dialog.wasCanceled()
+        return not self.cancelled
+
+    def __exit__(self, *exc):
+        self.dialog.reset()
+        self.dialog.close()
+        return False
 
 
 class CommandFinder(QDialog):

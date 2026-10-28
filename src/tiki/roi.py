@@ -3,6 +3,9 @@
 ImageJ has one "current selection" per image. TIKI keeps all ROIs of a window
 in a Shapes layer named ``ROI``; the current selection is the selected shape,
 or the most recently drawn one if nothing is selected.
+
+ROI and point layers are 2D even on stacks, so (as in ImageJ) a selection
+stays put while you scroll through slices or frames.
 """
 
 from __future__ import annotations
@@ -15,15 +18,24 @@ from skimage.draw import polygon2mask
 ROI_NAME = 'ROI'
 POINTS_NAME = 'Points'
 ROI_COLOR = 'yellow'
+# temporary layers that must never count as "the image"
+PREVIEW_NAMES = {'filter preview', 'threshold preview'}
 
 
 def target_image(viewer) -> Image | None:
     """The image commands act on: the selected Image layer, else the topmost one."""
     active = viewer.layers.selection.active
-    if isinstance(active, Image):
+    if isinstance(active, Image) and active.name not in PREVIEW_NAMES:
         return active
-    images = [ly for ly in viewer.layers if isinstance(ly, Image)]
+    images = [ly for ly in viewer.layers if isinstance(ly, Image) and ly.name not in PREVIEW_NAMES]
     return images[-1] if images else None
+
+
+def plane_kwargs(image: Image | None) -> dict:
+    """scale/translate/ndim for a 2D overlay layer that lines up with ``image``."""
+    if image is None:
+        return {'ndim': 2}
+    return dict(scale=image.scale[-2:], translate=image.translate[-2:], ndim=2)
 
 
 def roi_layer(viewer, create: bool = True) -> Shapes | None:
@@ -31,12 +43,7 @@ def roi_layer(viewer, create: bool = True) -> Shapes | None:
         return viewer.layers[ROI_NAME]
     if not create:
         return None
-    image = target_image(viewer)
-    kwargs = {}
-    if image is not None:
-        kwargs = dict(scale=image.scale, translate=image.translate)
-        ndim = image.ndim - (1 if image.rgb else 0)
-        kwargs['ndim'] = ndim
+    kwargs = plane_kwargs(target_image(viewer))
     layer = Shapes(
         name=ROI_NAME,
         edge_color=ROI_COLOR,
@@ -53,14 +60,7 @@ def points_layer(viewer, create: bool = True) -> Points | None:
         return viewer.layers[POINTS_NAME]
     if not create:
         return None
-    image = target_image(viewer)
-    kwargs = {}
-    if image is not None:
-        kwargs = dict(
-            scale=image.scale,
-            translate=image.translate,
-            ndim=image.ndim - (1 if image.rgb else 0),
-        )
+    kwargs = plane_kwargs(target_image(viewer))
     layer = Points(name=POINTS_NAME, face_color=ROI_COLOR, size=5, **kwargs)
     viewer.add_layer(layer)
     return layer

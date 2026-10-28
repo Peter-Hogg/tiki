@@ -229,3 +229,135 @@ class PlotWindow(QWidget):
         layout = QVBoxLayout(self)
         layout.addWidget(canvas)
         layout.addWidget(copy, alignment=Qt.AlignRight)
+
+
+class TracesWindow(QWidget):
+    """One trace per ROI or label through a stack (cells x frames).
+
+    Stacked lines for up to ``HEATMAP_ABOVE`` traces, a heatmap beyond that.
+    Exports the raw (or ΔF/F) array as .npy (cells x frames) or CSV.
+    """
+
+    HEATMAP_ABOVE = 20
+
+    def __init__(self, title, names, traces, viewer=None, image=None, axis=0, xlabel='frame', parent=None):
+        from qtpy.QtWidgets import QComboBox
+
+        super().__init__(parent, Qt.Window)
+        style.apply(self)
+        self.setWindowTitle(title)
+        self.resize(720, 460)
+        self.names = [str(n) for n in names]
+        self.raw = np.asarray(traces, dtype=np.float64)
+        self.viewer, self.image, self.axis, self.xlabel = viewer, image, axis, xlabel
+
+        self.figure = Figure(figsize=(7, 4), layout='constrained')
+        self.canvas = FigureCanvasQTAgg(self.figure)
+        self.dff = QCheckBox('ΔF/F (F0 = median)')
+        self.dff.toggled.connect(lambda _: self.draw())
+        self.mode = QComboBox()
+        self.mode.addItems(['Stacked', 'Overlay', 'Heatmap'])
+        self.mode.setCurrentText('Heatmap' if len(self.names) > self.HEATMAP_ABOVE else 'Stacked')
+        self.mode.currentTextChanged.connect(lambda _: self.draw())
+        bar = QHBoxLayout()
+        bar.addWidget(self.dff)
+        bar.addWidget(self.mode)
+        bar.addStretch()
+        for text, slot in (('Copy', self.copy), ('Save .npy…', self.save_npy), ('Save CSV…', self.save_csv)):
+            b = QPushButton(text)
+            b.clicked.connect(slot)
+            bar.addWidget(b)
+        layout = QVBoxLayout(self)
+        layout.addWidget(self.canvas)
+        layout.addLayout(bar)
+
+        self._cursor_artists = []
+        if viewer is not None:
+            viewer.dims.events.current_step.connect(self.on_step)
+        self.draw()
+
+    @property
+    def traces(self) -> np.ndarray:
+        return ops.dff(self.raw) if self.dff.isChecked() else self.raw
+
+    def draw(self) -> None:
+        self.figure.clear()
+        ax = self.figure.add_subplot()
+        data = self.traces
+        n, t = data.shape
+        x = np.arange(t)
+        mode = self.mode.currentText()
+        ylabel = 'ΔF/F' if self.dff.isChecked() else 'mean intensity'
+        if mode == 'Heatmap':
+            im = ax.imshow(data, aspect='auto', interpolation='nearest', cmap='magma',
+                           extent=(-0.5, t - 0.5, n - 0.5, -0.5))
+            self.figure.colorbar(im, ax=ax, label=ylabel, shrink=0.8)
+            ax.set_ylabel('ROI')
+            if n <= 40:
+                ax.set_yticks(range(n), self.names, fontsize=7)
+        elif mode == 'Overlay':
+            for name, tr in zip(self.names, data):
+                ax.plot(x, tr, lw=0.8, label=name)
+            ax.set_ylabel(ylabel)
+            if n <= 12:
+                ax.legend(fontsize=7, frameon=False, loc='upper right')
+        else:
+            span = np.nanpercentile(data, 99.5, axis=1) - np.nanpercentile(data, 0.5, axis=1)
+            step = 1.1 * np.nanmax(span) if np.isfinite(span).any() and np.nanmax(span) > 0 else 1.0
+            for i, (name, tr) in enumerate(zip(self.names, data)):
+                offset = -i * step
+                ax.plot(x, tr - np.nanmedian(tr) + offset, lw=0.8, color=f'C{i % 10}')
+                ax.text(-0.01, offset, name, transform=ax.get_yaxis_transform(), ha='right', va='center',
+                        fontsize=7, color=f'C{i % 10}')
+            ax.set_yticks([])
+            ax.spines[['left', 'top', 'right']].set_visible(False)
+            ax.set_title(f'{ylabel}, one trace per ROI (offset for clarity)', fontsize=9)
+        ax.set_xlabel(self.xlabel)
+        ax.set_xlim(-0.5, t - 0.5)
+        self.ax = ax
+        self._cursor_artists = [ax.axvline(0, color='tab:red', lw=0.8)]
+        self.on_step()
+
+    def on_step(self, event=None) -> None:
+        if self.viewer is None or self.image is None or not self._cursor_artists:
+            self.canvas.draw_idle()
+            return
+        try:
+            index = roi_mod.current_index(self.viewer, self.image)
+        except Exception:
+            return
+        self._cursor_artists[0].set_xdata([index[self.axis]] * 2)
+        self.canvas.draw_idle()
+
+    def table_text(self, sep='\t') -> str:
+        lines = [sep.join(['frame'] + self.names)]
+        for t, row in enumerate(self.traces.T):
+            lines.append(sep.join([str(t)] + [f'{v:.6g}' for v in row]))
+        return '\n'.join(lines)
+
+    def copy(self) -> None:
+        QApplication.clipboard().setText(self.table_text())
+
+    def save_npy(self, path: str | None = None) -> None:
+        if path is None:
+            path, _ = QFileDialog.getSaveFileName(self, 'Save traces (cells x frames)', 'traces.npy', 'NumPy (*.npy)')
+            if not path:
+                return
+        np.save(path, self.traces)
+        names = str(path)[:-4] + '_names.txt' if str(path).endswith('.npy') else str(path) + '_names.txt'
+        with open(names, 'w') as f:
+            f.write('\n'.join(self.names) + '\n')
+
+    def save_csv(self) -> None:
+        path, _ = QFileDialog.getSaveFileName(self, 'Save traces', 'traces.csv', 'CSV (*.csv)')
+        if path:
+            with open(path, 'w') as f:
+                f.write(self.table_text(','))
+
+    def closeEvent(self, event):
+        if self.viewer is not None:
+            try:
+                self.viewer.dims.events.current_step.disconnect(self.on_step)
+            except Exception:
+                pass
+        super().closeEvent(event)

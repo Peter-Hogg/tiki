@@ -75,3 +75,50 @@ def test_threshold_stack_labels_unique_and_min_size():
     assert set(np.unique(labels[0])) == {0, 1} and set(np.unique(labels[1])) == {0, 2}
     mask = ops.threshold_stack(data, 200, 1000, split=False)
     assert mask.dtype == np.uint8 and mask.sum() == 9 + 1 + 16
+
+
+def test_particle_table_matches_simple_shapes():
+    labels = np.zeros((20, 20), np.int32)
+    labels[2:6, 2:8] = 1      # 4x6 rectangle
+    labels[10:15, 10:15] = 2  # 5x5 square
+    img = np.full((20, 20), 10.0)
+    img[labels == 2] = 50
+    rows = ops.particle_table(labels, img, scale=(0.5, 0.5))
+    assert [r['Label'] for r in rows] == [1, 2]
+    assert rows[0]['Area'] == 24 * 0.25 and rows[1]['Mean'] == 50
+    assert rows[1]['X'] == pytest.approx(12 * 0.5) and rows[1]['Y'] == pytest.approx(12 * 0.5)
+    assert rows[1]['AR'] == pytest.approx(1.0)
+
+
+def test_roi_and_label_traces_agree():
+    rng = np.random.default_rng(3)
+    data = rng.normal(100, 5, (2, 30, 16, 16))
+    labels = np.zeros((16, 16), np.int32)
+    labels[1:5, 1:5] = 3
+    labels[8:14, 9:15] = 7
+    ids, lt = ops.label_traces(data, axis=1, index=(1, 0, 0, 0), labels=labels, chunk=7)
+    rt = ops.roi_traces(data, axis=1, index=(1, 0, 0, 0), masks=[labels == 3, labels == 7], chunk=7)
+    assert list(ids) == [3, 7]
+    np.testing.assert_allclose(lt, rt)
+    np.testing.assert_allclose(rt[1], data[1, :, 8:14, 9:15].mean(axis=(1, 2)))
+
+
+def test_filters_shapes_and_background():
+    yy, xx = np.mgrid[:64, :64]
+    ramp = (yy * 2).astype(np.uint16) + 100
+    spot = ramp.copy()
+    spot[30:34, 30:34] += 500
+    flat = ops.subtract_background(spot, radius=10)
+    assert flat.dtype == np.uint16
+    assert flat[5:20, 5:20].max() < 20          # ramp removed
+    assert flat[31, 31] > 400                    # small object kept
+    gentle = (yy * 0.2).astype(np.uint16) + 100
+    gentle[30:34, 30:34] += 500
+    big = ops.subtract_background(gentle, radius=40)  # shrunken (ImageJ-style) path
+    assert big[31, 31] > 400 and np.median(big) < 10
+    light = ops.subtract_background(65000 - spot, radius=10, light_background=True)
+    assert light[31, 31] < light[5, 5]
+    assert ops.gaussian_blur(spot, 2).dtype == np.float32
+    assert ops.median_filter(spot, 2).shape == spot.shape
+    stack = ops.map_planes(lambda p: ops.median_filter(p, 1), np.stack([spot, spot]))
+    assert stack.shape == (2, 64, 64)
