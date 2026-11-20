@@ -165,6 +165,8 @@ class ProfileWindow(QWidget):
         return kind, np.round(verts[:, -2:], 2).tobytes()
 
     def update_profile(self, force: bool = False) -> None:
+        if self.image not in self.viewer.layers:
+            return
         sig = self._roi_signature()
         if not force and sig == self._signature:
             return
@@ -185,6 +187,8 @@ class ProfileWindow(QWidget):
         self.on_step()
 
     def on_step(self, event=None) -> None:
+        if self.image not in self.viewer.layers:
+            return
         index = roi_mod.current_index(self.viewer, self.image)
         self.cursor_line.set_xdata([index[self.axis]] * 2)
         self.canvas.draw_idle()

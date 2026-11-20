@@ -54,22 +54,26 @@ class WindowManager(QObject):
         """
         title = self.unique_title(name)
         viewer = napari.Viewer(title=title, show=True)
-        self._slim(viewer)
-        if data is not None:
-            image_kwargs.setdefault('name', title)
-            if axes is not None and not axes.problems(tuple(data.shape[: len(axes.axes)])):
-                # create the layer at its physical scale so the camera frames it correctly
-                image_kwargs['scale'] = axes.scale
-            layer = viewer.add_image(data, **image_kwargs)
-            shape = tuple(layer.data.shape[: layer.ndim])
-            info = axes if axes is not None and not axes.problems(shape) else axes_mod.guess(shape)
-            if axes is None and 'scale' in image_kwargs:  # caller gave a scale (e.g. derived data)
-                for a, s in zip(info.axes, layer.scale):
-                    a.step = float(s) if s != 1 else None
-            axes_mod.apply(viewer, layer, info)
-            viewer.reset_view()
-            # ImageJ opens stacks at the first slice; napari at the middle.
-            viewer.dims.current_step = (0,) * viewer.dims.ndim
+        try:
+            self._slim(viewer)
+            if data is not None:
+                image_kwargs.setdefault('name', title)
+                if axes is not None and not axes.problems(tuple(data.shape[: len(axes.axes)])):
+                    # create the layer at its physical scale so the camera frames it correctly
+                    image_kwargs['scale'] = axes.scale
+                layer = viewer.add_image(data, **image_kwargs)
+                shape = tuple(layer.data.shape[: layer.ndim])
+                info = axes if axes is not None and not axes.problems(shape) else axes_mod.guess(shape)
+                if axes is None and 'scale' in image_kwargs:  # caller gave a scale (e.g. derived data)
+                    for a, s in zip(info.axes, layer.scale):
+                        a.step = float(s) if s != 1 else None
+                axes_mod.apply(viewer, layer, info)
+                viewer.reset_view()
+                # ImageJ opens stacks at the first slice; napari at the middle.
+                viewer.dims.current_step = (0,) * viewer.dims.ndim
+        except Exception:
+            viewer.close()
+            raise
         self.register(viewer)
         return viewer
 
@@ -120,8 +124,10 @@ class WindowManager(QObject):
         """Remove napari menu shortcuts that TIKI uses app-wide (e.g. Ctrl+M)."""
         if not self.reserved_shortcuts or viewer not in self.viewers:
             return
+        qwin = getattr(viewer.window, '_qt_window', None)
+        if qwin is None:
+            return
         reserved = {s.toString() for s in self.reserved_shortcuts}
-        qwin = viewer.window._qt_window
         # napari's app-model actions are shared and parented to the QApplication,
         # so reach them through the window's menus as well as its children.
         actions = set(qwin.findChildren(QAction))
@@ -185,7 +191,7 @@ class WindowManager(QObject):
 
     def viewer_for_window(self, qwin) -> napari.Viewer | None:
         for v in self.viewers:
-            if v.window._qt_window is qwin:
+            if getattr(v.window, '_qt_window', None) is qwin:
                 return v
         return None
 
@@ -229,11 +235,38 @@ class WindowManager(QObject):
 
     def close(self, viewer: napari.Viewer) -> None:
         self.unregister(viewer)
-        viewer.close()
+        try:
+            viewer.close()
+        except Exception:
+            qwin = getattr(viewer.window, '_qt_window', None)
+            if qwin is not None:
+                qwin.close()
+            raise
 
     def close_all(self) -> None:
-        for v in list(self.viewers):
-            self.close(v)
+        viewers = list(self.viewers)
+        for v in list(getattr(napari.Viewer, '_instances', ())):
+            if v not in viewers and getattr(v.window, '_qt_window', None) is not None:
+                viewers.append(v)
+        self.viewers.clear()
+        self.set_active(None)
+        if viewers:
+            self.windows_changed.emit()
+        first_err = None
+        for v in viewers:
+            try:
+                v.close()
+            except Exception as exc:
+                if first_err is None:
+                    first_err = exc
+                try:
+                    qwin = getattr(v.window, '_qt_window', None)
+                    if qwin is not None:
+                        qwin.close()
+                except Exception:
+                    pass
+        if first_err is not None:
+            raise first_err
 
     # -- convenience -------------------------------------------------------
 

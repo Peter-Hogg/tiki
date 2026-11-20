@@ -210,6 +210,9 @@ class FilterDialog(QDialog):
         except Exception:
             pass
         self._remove_preview()
+        self.image_box.blockSignals(True)
+        self.image_box.set_viewer(None)
+        self.image_box.blockSignals(False)
         super().done(result)
 
 

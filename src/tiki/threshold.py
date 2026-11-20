@@ -176,7 +176,7 @@ class ThresholdWindow(QWidget):
     def _set_image(self, image) -> None:
         self._remove_preview()
         self.image = image
-        if image is None:
+        if image is None or self.viewer is None:
             self.setWindowTitle('Threshold (no image)')
             self.info = None
             return
@@ -217,6 +217,7 @@ class ThresholdWindow(QWidget):
         self.image_box.refresh()
 
     def _detach(self) -> None:
+        self._redraw.stop()
         self._remove_preview()
         if self.viewer is not None:
             for ev in (self.viewer.dims.events.current_step, self.viewer.dims.events.ndisplay):
@@ -225,6 +226,9 @@ class ThresholdWindow(QWidget):
                 except Exception:
                     pass
         self.viewer = self.image = None
+        self.image_box.blockSignals(True)
+        self.image_box.set_viewer(None)
+        self.image_box.blockSignals(False)
 
     def _scope_key(self) -> str:
         return self.scope.currentData() or nd.PLANE

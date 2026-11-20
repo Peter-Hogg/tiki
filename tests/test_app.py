@@ -803,3 +803,50 @@ def test_drop_on_image_window_opens_new_window_not_layer(tiki, tmp_path, monkeyp
     assert len(v.layers) == n_layers  # napari did not add it as a layer
     new = tiki.windows.viewers[-1]
     assert new.title == 'movie.tif' and new.dims.axis_labels[0] == 't'  # TIKI read its axes
+
+
+def test_close_all_after_dialogs_and_multiple_layers(tiki, qtbot):
+    from tiki.filters import FilterDialog, run_filter
+
+    v1 = tiki.open_data(np.ones((5, 16, 16), np.float32), 'm1.tif')
+    v2 = tiki.open_data(np.ones((5, 16, 16), np.float32), 'm2.tif')
+    filt = run_filter(tiki, 'gaussian', v2, v2.layers['m2.tif'], {'sigma': 1.0})
+    tiki.plot_z_profile()
+    prof = tiki.profiles[-1]
+    tiki.threshold()
+    tiki.threshold_window.close()
+    dlg = FilterDialog(tiki, 'gaussian', v2, filt)
+    dlg.reject()
+    tiki.windows.activate(v1)
+    activations = []
+    tiki.windows.active_changed.connect(activations.append)
+
+    tiki._actions['File>Close All'].trigger()
+    qtbot.wait(220)
+
+    assert tiki.windows.viewers == []
+    assert tiki.windows.active is None
+    assert activations == [None]  # no cascading activation through closing windows
+    assert list(v2.layers) == []
+    prof.update_profile(force=True)  # safe after its viewer closed
+
+
+def test_single_instance_forwards_to_running_toolbar(tiki, qtbot, tmp_path, monkeypatch):
+    from tiki import __main__, instance, recent
+
+    monkeypatch.setattr(recent, 'RECENT_FILE', tmp_path / 'recent.json')
+    sock = f'tiki-test-{tmp_path.name}'
+    monkeypatch.setattr(instance, 'socket_name', lambda: sock)
+    server = instance.listen(tiki, sock)
+    try:
+        a, b = tmp_path / 'a.npy', tmp_path / 'b.npy'
+        np.save(a, np.zeros((6, 6)))
+        np.save(b, np.ones((6, 6)))
+        assert __main__.main([str(a)]) == 0
+        assert __main__.main([str(b)]) == 0
+        qtbot.waitUntil(lambda: [v.title for v in tiki.windows.viewers] == ['a.npy', 'b.npy'], timeout=2000)
+
+        tiki._actions['File>Close All'].trigger()
+        assert tiki.windows.viewers == []
+    finally:
+        server.close()

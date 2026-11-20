@@ -1190,6 +1190,9 @@ class Tiki(QMainWindow):
             self.status('Nothing to open')
 
     def closeEvent(self, event):
+        srv = getattr(self, '_instance_server', None)
+        if srv is not None:
+            srv.close()
         self.windows.close_all()
         self.results.close()
         for w in (self.threshold_window, self.roi_manager, getattr(self, 'channels_window', None),

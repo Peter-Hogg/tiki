@@ -26,6 +26,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument('files', nargs='*', help='images (.tif, .npy, ...), folders, ImageJ ROIs (.roi, .zip) '
                                                  'or macros (.py) to open')
     parser.add_argument('--sample', action='store_true', help='open a small synthetic movie to try TIKI')
+    parser.add_argument('--new-instance', action='store_true',
+                        help='start a separate TIKI toolbar instead of opening in a running one')
     parser.add_argument('--version', action='version', version=f'TIKI {_version()}')
     parser.add_argument('--install-desktop', action='store_true',
                         help='add TIKI to the application menu (Linux): pin it to the dock, drop files on it')
@@ -47,6 +49,11 @@ def main(argv: list[str] | None = None) -> int:
             print('TIKI is now in your applications menu (it may take a moment to appear).')
         return 0
 
+    from . import instance
+
+    if not args.new_instance and instance.send_to_running(args.files, sample=args.sample):
+        return 0
+
     from napari.qt import get_qapp
     from qtpy.QtGui import QIcon
 
@@ -61,6 +68,8 @@ def main(argv: list[str] | None = None) -> int:
     app.setWindowIcon(QIcon(str(desktop.ICON)))
     tiki = Tiki()
     install_excepthook(tiki)
+    if not args.new_instance:
+        tiki._instance_server = instance.listen(tiki)
     tiki.show()
     if args.files:
         tiki.open_dropped(args.files)
