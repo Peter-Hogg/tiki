@@ -279,3 +279,119 @@ def test_correlation_image_finds_cell_not_brightness():
     ref = np.mean([np.mean(z[:, 10, 10] * z[:, 10 + dy, 10 + dx])
                    for dy in (-1, 0, 1) for dx in (-1, 0, 1) if (dy, dx) != (0, 0)])
     assert cn[10, 10] == pytest.approx(ref, abs=1e-4)
+
+
+def test_parse_slice_spec_and_substack(tmp_path):
+    assert ops.parse_slice_spec('', 10) == slice(None)
+    assert ops.parse_slice_spec('all', 10) == slice(None)
+    assert ops.parse_slice_spec('1-10', 10) == slice(None)
+    assert ops.parse_slice_spec('2-8-2', 10) == slice(1, 8, 2)
+    np.testing.assert_array_equal(ops.parse_slice_spec('1, 4, 7-9', 10), [0, 3, 6, 7, 8])
+    np.testing.assert_array_equal(ops.parse_slice_spec('5', 10), [4])
+    for bad in ('0-5', '5-2', '1-12', 'abc', '1,,2'):
+        with pytest.raises(ValueError):
+            ops.parse_slice_spec(bad, 10)
+
+    data = np.arange(10 * 2 * 16 * 16, dtype=np.float32).reshape(10, 2, 16, 16)
+    out, dropped, mults = ops.substack(data, specs={0: '1-10-2', 1: '2'}, box=(2, 10, 4, 12))
+    assert out.shape == (5, 8, 8)
+    assert dropped == [1]
+    assert mults == {0: 2}
+    np.testing.assert_array_equal(out, data[::2, 1, 2:10, 4:12])
+
+    mm_path = tmp_path / 'mm.dat'
+    mm = np.memmap(mm_path, dtype=np.float32, mode='w+', shape=(8, 12, 12))
+    mm[:] = np.arange(8 * 12 * 12, dtype=np.float32).reshape(8, 12, 12)
+    mm.flush()
+    mm_ro = np.memmap(mm_path, dtype=np.float32, mode='r', shape=(8, 12, 12))
+    view, dropped2, _ = ops.substack(mm_ro, specs={0: '2-6'})
+    assert view.shape == (5, 12, 12) and dropped2 == []
+    assert np.shares_memory(view, mm_ro)
+
+    fancy, _, _ = ops.substack(mm_ro, specs={0: '1, 4, 7-8'})
+    assert fancy.shape == (4, 12, 12)
+    np.testing.assert_array_equal(fancy, mm_ro[[0, 3, 6, 7]])
+
+
+def test_bin_image_2d_nd_and_chunks():
+    arr2d = np.arange(9 * 7, dtype=np.uint16).reshape(9, 7)
+    binned_mean = ops.bin_image(arr2d, (2, 3), 'mean')
+    assert binned_mean.shape == (4, 2) and binned_mean.dtype == np.float32
+    np.testing.assert_allclose(binned_mean[0, 0], arr2d[:2, :3].mean())
+    binned_max = ops.bin_image(arr2d, (2, 3), 'max')
+    assert binned_max.dtype == np.uint16 and binned_max[1, 1] == arr2d[2:4, 3:6].max()
+
+    movie = np.arange(10 * 12 * 14, dtype=np.uint16).reshape(10, 12, 14)
+    old = ops.CHUNK_BYTES
+    ops.CHUNK_BYTES = 1000
+    try:
+        out_sum = ops.bin_image(movie, (2, 2, 2), 'sum')
+        out_med = ops.bin_image(movie, (2, 2, 2), 'median')
+    finally:
+        ops.CHUNK_BYTES = old
+    assert out_sum.shape == (5, 6, 7) and out_sum.dtype == np.float32
+    ref = movie.reshape(5, 2, 6, 2, 7, 2)
+    np.testing.assert_allclose(out_sum, ref.sum(axis=(1, 3, 5)))
+    np.testing.assert_allclose(out_med, np.median(ref, axis=(1, 3, 5)))
+
+    vol4d = np.ones((4, 4, 8, 8), dtype=np.float32)
+    assert ops.bin_image(vol4d, (2, 2, 2, 2), 'mean').shape == (2, 2, 4, 4)
+
+
+def test_motion_correct_recovers_shifts_and_clamps():
+    from scipy.ndimage import gaussian_filter
+    from scipy.ndimage import shift as nd_shift
+
+    rng = np.random.default_rng(7)
+    field = gaussian_filter(rng.normal(0, 1, (120, 120)).astype(np.float32), 2) * 50 + 100
+    true = rng.uniform(-3, 3, (25, 2))
+    c1 = np.stack([nd_shift(field, s, order=3)[30:90, 30:90] for s in true]).astype(np.float32)
+    c1 += rng.normal(0, 2, c1.shape).astype(np.float32)
+    c2 = np.stack([nd_shift(field * 0.5, s, order=3)[30:90, 30:90] for s in true]).astype(np.float32)
+
+    reg1, info = ops.motion_correct(c1, axis=0, template='median', upsample=10)
+    est = info['shifts']
+    err = np.abs((est - est.mean(0)) + (true - true.mean(0))).mean()
+    assert err < 0.2
+    inner = (slice(None), slice(6, -6), slice(6, -6))
+    assert reg1[inner].std(axis=0).mean() < 0.4 * c1[inner].std(axis=0).mean()
+
+    reg2 = ops.apply_shifts(c2, est, axis=0)
+    assert reg2[inner].std(axis=0).mean() < 0.35 * c2[inner].std(axis=0).mean()
+
+    clamped, _ = ops.estimate_shifts(c1, axis=0, max_shift=1.2)
+    assert np.abs(clamped).max() <= 1.2 + 1e-6
+
+
+def test_fill_holes_and_watershed_2d_and_3d():
+    yy, xx = np.mgrid[:64, :64]
+    mask = np.zeros((64, 64), dtype=np.int32)
+    # two touching disks
+    mask[(yy - 20) ** 2 + (xx - 15) ** 2 <= 9**2] = 1
+    mask[(yy - 20) ** 2 + (xx - 27) ** 2 <= 9**2] = 1
+    # donut cell with an interior hole
+    donut = ((yy - 48) ** 2 + (xx - 45) ** 2 <= 8**2) & ((yy - 48) ** 2 + (xx - 45) ** 2 >= 3**2)
+    mask[donut] = 2
+    # tiny isolated object
+    mask[4:7, 50:53] = 3
+
+    filled = ops.fill_holes_labels(mask)
+    assert filled[48, 45] == 2  # hole filled with its own label ID
+
+    split = ops.watershed_labels(mask, min_distance=5.0, fill_holes=True)
+    assert split[48, 45] > 0  # donut filled and kept whole
+    assert split[5, 51] > 0   # tiny object preserved
+    assert split[20, 15] != split[20, 27] and split[20, 15] > 0 and split[20, 27] > 0
+    assert len(np.unique(split)) == 5  # bg + 4 objects
+
+    # 3D anisotropic touching spheres (z_ratio = 0.25 -> z step 4x XY pixel)
+    zz, yy3, xx3 = np.ogrid[:14, :40, :40]
+    vol = ((zz - 4) ** 2 * 16 + (yy3 - 15) ** 2 + (xx3 - 20) ** 2 <= 10**2) | (
+        (zz - 9) ** 2 * 16 + (yy3 - 15) ** 2 + (xx3 - 20) ** 2 <= 10**2
+    )
+    split3d = ops.watershed_labels(vol, min_distance=4.0, z_ratio=0.25, fill_holes=True)
+    assert split3d[4, 15, 20] != split3d[9, 15, 20] and split3d.max() == 2
+
+    stack = np.stack([mask, mask])
+    blk = ops.watershed_blocks(stack, [(0, slice(None), slice(None)), (1, slice(None), slice(None))], min_distance=5.0)
+    assert blk[0].max() == 4 and blk[1].min() == 0 and set(np.unique(blk[1])) - {0} == {5, 6, 7, 8}

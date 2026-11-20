@@ -740,3 +740,551 @@ def histogram_stats(values: np.ndarray, bins: int = 256) -> dict:
     mode = (edges[np.argmax(counts)] + edges[np.argmax(counts) + 1]) / 2
     return {'n': int(v.size), 'mean': float(v.mean()), 'std': float(v.std(ddof=1)) if v.size > 1 else 0.0,
             'min': lo, 'max': hi, 'mode': float(mode), 'counts': counts, 'edges': edges}
+
+
+# -------------------------------------------------------- substacks & binning
+
+def parse_slice_spec(spec: str, size: int) -> slice | np.ndarray:
+    """Parse a 1-based inclusive ImageJ slice specification for an axis of length ``size``.
+
+    Supports empty / ``'all'`` (full range), single index (``'5'``), range
+    (``'2-10'``), stepped range (``'1-100-2'``), and comma-separated lists
+    (``'1, 4, 7-9'``). Contiguous/stepped ranges return a ``slice`` so
+    memory-mapped files stay zero-copy; single values and lists return a 0-based
+    integer ``np.ndarray``.
+    """
+    if size < 1:
+        raise ValueError('axis has length 0')
+    text = (spec or '').strip()
+    if not text or text.lower() == 'all':
+        return slice(None)
+
+    import re
+
+    parts = [p.strip() for p in text.split(',')]
+    if any(not p for p in parts):
+        raise ValueError(f'invalid slice range {spec!r}')
+
+    if len(parts) == 1 and '-' in parts[0]:
+        part = parts[0]
+        if not re.fullmatch(r'\d+(?:-\d+(?:-\d+)?)?', part):
+            raise ValueError(f'invalid slice range {spec!r}')
+        nums = [int(x) for x in part.split('-')]
+        a, b = nums[0], nums[1]
+        step = nums[2] if len(nums) == 3 else 1
+        if step < 1 or a < 1 or b < a or b > size:
+            raise ValueError(f'slice range {part!r} out of bounds for length {size} (1–{size})')
+        if a == 1 and b == size and step == 1:
+            return slice(None)
+        return slice(a - 1, b, None if step == 1 else step)
+
+    indices: list[int] = []
+    for part in parts:
+        if not re.fullmatch(r'\d+(?:-\d+(?:-\d+)?)?', part):
+            raise ValueError(f'invalid slice range {part!r}')
+        nums = [int(x) for x in part.split('-')]
+        if len(nums) == 1:
+            k = nums[0]
+            if k < 1 or k > size:
+                raise ValueError(f'slice {k} out of bounds for length {size} (1–{size})')
+            indices.append(k - 1)
+        else:
+            a, b = nums[0], nums[1]
+            step = nums[2] if len(nums) == 3 else 1
+            if step < 1 or a < 1 or b < a or b > size:
+                raise ValueError(f'slice range {part!r} out of bounds for length {size} (1–{size})')
+            indices.extend(range(a - 1, b, step))
+    return np.asarray(indices, dtype=int)
+
+
+def _is_lazy_backing(data) -> bool:
+    if isinstance(data, np.memmap) or hasattr(data, 'compute'):
+        return True
+    return isinstance(getattr(data, 'base', None), np.memmap)
+
+
+def substack(
+    data,
+    specs: dict[int, str | int | slice | np.ndarray] | None = None,
+    box: tuple[int, int, int, int] | None = None,
+    squeeze_single: bool = True,
+    rgb: bool = False,
+) -> tuple[np.ndarray, list[int], dict[int, int]]:
+    """Extract a cropped and/or substack view or array from ``data``.
+
+    Returns ``(result, dropped_axes, step_multipliers)`` where ``dropped_axes``
+    are original leading axes reduced to a single index and
+    ``step_multipliers`` maps original axes with ``step > 1`` to their stride.
+    """
+    import itertools
+
+    spatial_end = data.ndim - 1 if rgb and data.ndim >= 3 else data.ndim
+    n_lead = max(0, spatial_end - 2)
+    indexer: list = [slice(None)] * data.ndim
+    dropped_axes: list[int] = []
+    step_multipliers: dict[int, int] = {}
+
+    for d, raw in (specs or {}).items():
+        if not (0 <= d < n_lead):
+            raise ValueError(f'axis {d} is not a stack axis')
+        size = data.shape[d]
+        if isinstance(raw, str):
+            idx = parse_slice_spec(raw, size)
+        elif isinstance(raw, (int, np.integer)):
+            k = int(raw)
+            if k < 0 or k >= size:
+                raise ValueError(f'index {k} out of bounds for axis {d} of length {size}')
+            idx = np.array([k], dtype=int)
+        elif isinstance(raw, slice):
+            idx = raw
+        else:
+            idx = np.asarray(raw, dtype=int)
+            if idx.size == 0 or (idx < 0).any() or (idx >= size).any():
+                raise ValueError(f'indices out of bounds for axis {d} of length {size}')
+
+        if isinstance(idx, np.ndarray) and idx.size == 1 and squeeze_single:
+            indexer[d] = int(idx.item())
+            dropped_axes.append(d)
+        elif isinstance(idx, slice):
+            start, stop, step = idx.indices(size)
+            count = len(range(start, stop, step))
+            if count == 0:
+                raise ValueError(f'empty selection on axis {d}')
+            if count == 1 and squeeze_single:
+                indexer[d] = start
+                dropped_axes.append(d)
+            else:
+                indexer[d] = idx
+                if step > 1:
+                    step_multipliers[d] = step
+        else:
+            indexer[d] = idx
+
+    if box is not None:
+        h, w = data.shape[spatial_end - 2], data.shape[spatial_end - 1]
+        y0, y1, x0, x1 = box
+        y0, y1 = max(0, int(y0)), min(h, int(y1))
+        x0, x1 = max(0, int(x0)), min(w, int(x1))
+        if y1 <= y0 or x1 <= x0:
+            raise ValueError('crop selection is empty')
+        indexer[spatial_end - 2] = slice(y0, y1)
+        indexer[spatial_end - 1] = slice(x0, x1)
+
+    has_fancy = any(isinstance(indexer[d], np.ndarray) for d in range(n_lead))
+    if not has_fancy:
+        view = data[tuple(indexer)]
+        result = view if _is_lazy_backing(data) else np.array(view, copy=True)
+        return result, sorted(dropped_axes), step_multipliers
+
+    lead_src: list[list[int]] = []
+    out_lead_shape: list[int] = []
+    for d in range(n_lead):
+        ix = indexer[d]
+        if isinstance(ix, int):
+            lead_src.append([ix])
+        elif isinstance(ix, slice):
+            vals = list(range(*ix.indices(data.shape[d])))
+            lead_src.append(vals)
+            out_lead_shape.append(len(vals))
+        else:
+            vals = [int(v) for v in ix.tolist()]
+            lead_src.append(vals)
+            out_lead_shape.append(len(vals))
+
+    sy = indexer[spatial_end - 2]
+    sx = indexer[spatial_end - 1]
+    ry = len(range(*sy.indices(data.shape[spatial_end - 2])))
+    rx = len(range(*sx.indices(data.shape[spatial_end - 1])))
+    tail_shape = (ry, rx) + ((data.shape[-1],) if rgb and data.ndim >= 3 else ())
+    out = np.empty(tuple(out_lead_shape) + tail_shape, dtype=data.dtype)
+    tail_slices = (sy, sx) + ((slice(None),) if rgb and data.ndim >= 3 else ())
+
+    out_ranges = [range(n) for n in out_lead_shape]
+    for src_idx, dst_idx in zip(itertools.product(*lead_src), itertools.product(*out_ranges)):
+        out[dst_idx] = np.asarray(data[src_idx + tail_slices])
+    return out, sorted(dropped_axes), step_multipliers
+
+
+BIN_METHODS = {
+    'Average': 'mean',
+    'Max': 'max',
+    'Min': 'min',
+    'Median': 'median',
+    'Sum': 'sum',
+}
+
+
+def _bin_block(block: np.ndarray, factors: tuple[int, ...], method: str, out_dtype) -> np.ndarray:
+    interleaved: list[int] = []
+    reduce_axes: list[int] = []
+    for s, f in zip(block.shape, factors):
+        if f > 1:
+            interleaved.extend([s // f, f])
+            reduce_axes.append(len(interleaved) - 1)
+        else:
+            interleaved.append(s)
+    if not reduce_axes:
+        return np.asarray(block, dtype=out_dtype).copy()
+    work = block if method in ('max', 'min') else block.astype(
+        np.float64 if method in ('mean', 'sum') else np.float32, copy=False
+    )
+    fn = {'mean': np.mean, 'max': np.max, 'min': np.min, 'median': np.median, 'sum': np.sum}[method]
+    reduced = fn(work.reshape(interleaved), axis=tuple(reduce_axes))
+    return np.asarray(reduced, dtype=out_dtype)
+
+
+def bin_image(data, factors: tuple[int, ...], method: str = 'mean', progress=None) -> np.ndarray:
+    """Downsample ``data`` by integer ``factors`` along each axis.
+
+    Remainder pixels/frames that do not fill a full bin are trimmed at the end.
+    Works chunk-wise on memory-mapped or dask arrays.
+    """
+    import itertools
+
+    method = BIN_METHODS.get(method, method)
+    if method not in ('mean', 'max', 'min', 'median', 'sum'):
+        raise ValueError(f'unknown bin method {method!r}')
+    factors = tuple(int(f) for f in factors)
+    if len(factors) != data.ndim:
+        raise ValueError(f'expected {data.ndim} bin factors, got {len(factors)}')
+    if any(f < 1 for f in factors):
+        raise ValueError('bin factors must be >= 1')
+
+    trim = tuple((s // f) * f for s, f in zip(data.shape, factors))
+    out_shape = tuple(s // f for s, f in zip(data.shape, factors))
+    if any(n < 1 for n in out_shape):
+        raise ValueError('bin factor exceeds image dimension')
+
+    out_dtype = data.dtype if method in ('max', 'min') else np.float32
+    if all(f == 1 for f in factors):
+        return np.asarray(data, dtype=out_dtype).copy()
+
+    out = np.empty(out_shape, dtype=out_dtype)
+    work_bytes = max(int(np.dtype(data.dtype).itemsize), 8 if method in ('mean', 'sum') else 4)
+
+    if data.ndim == 2:
+        fy, fx = factors
+        row_bins = max(1, CHUNK_BYTES // max(1, fy * trim[1] * work_bytes))
+        total = out_shape[0]
+        for b0 in range(0, out_shape[0], row_bins):
+            b1 = min(out_shape[0], b0 + row_bins)
+            chunk = np.asarray(data[b0 * fy : b1 * fy, : trim[1]])
+            out[b0:b1] = _bin_block(chunk, factors, method, out_dtype)
+            if progress is not None and progress(b1, total) is False:
+                break
+        return out
+
+    lead = data.ndim - 2
+    tail_trim = tuple(slice(0, t) for t in trim[lead:])
+    slab_bytes = int(np.prod([factors[d] for d in range(lead)] + list(trim[lead:]))) * work_bytes
+
+    if lead == 1 or (slab_bytes <= CHUNK_BYTES and int(np.prod(out_shape[1:lead])) == 1):
+        # Single non-trivial leading axis: batch consecutive bins under CHUNK_BYTES,
+        # or fall back to row chunks if even one bin exceeds CHUNK_BYTES.
+        f0 = factors[0]
+        per_bin = int(np.prod(trim[1:])) * f0 * work_bytes
+        if per_bin <= CHUNK_BYTES:
+            batch = max(1, CHUNK_BYTES // max(1, per_bin))
+            fixed = (slice(0, trim[d]) for d in range(1, lead))
+            fixed_t = tuple(fixed)
+            for b0 in range(0, out_shape[0], batch):
+                b1 = min(out_shape[0], b0 + batch)
+                block = np.asarray(data[(slice(b0 * f0, b1 * f0),) + fixed_t + tail_trim])
+                out[b0:b1] = _bin_block(block, factors, method, out_dtype)
+                if progress is not None and progress(b1, out_shape[0]) is False:
+                    break
+            return out
+
+    # General nD streaming: one output-bin tuple along leading axes at a time,
+    # chunked along the first spatial axis when needed.
+    fy = factors[lead]
+    combos = list(itertools.product(*(range(out_shape[d]) for d in range(lead))))
+    bin_lead_bytes = int(np.prod([factors[d] for d in range(lead)])) * int(np.prod(trim[lead + 1 :])) * fy * work_bytes
+    row_bins = max(1, CHUNK_BYTES // max(1, bin_lead_bytes))
+    y_chunks = list(range(0, out_shape[lead], row_bins))
+    total = len(combos) * len(y_chunks)
+    done = 0
+    for idx in combos:
+        lead_sl = tuple(slice(k * factors[d], (k + 1) * factors[d]) for d, k in enumerate(idx))
+        for yb0 in y_chunks:
+            yb1 = min(out_shape[lead], yb0 + row_bins)
+            y_sl = slice(yb0 * fy, yb1 * fy)
+            rest_sl = tuple(slice(0, trim[d]) for d in range(lead + 1, data.ndim))
+            block = np.asarray(data[lead_sl + (y_sl,) + rest_sl])
+            binned = _bin_block(block, factors, method, out_dtype)
+            out[idx + (slice(yb0, yb1),)] = binned[(0,) * len(idx) + (slice(None),)]
+            done += 1
+            if progress is not None and progress(done, total) is False:
+                return out
+    return out
+
+
+# ---------------------------------------------------------- motion correction
+
+def _prep_for_correlation(img: np.ndarray, hann: np.ndarray) -> np.ndarray:
+    arr = np.asarray(img, dtype=np.float32)
+    if np.isnan(arr).any():
+        fill = float(np.nanmean(arr))
+        arr = np.where(np.isfinite(arr), arr, 0.0 if np.isnan(fill) else fill)
+    return (arr - float(arr.mean())) * hann
+
+
+def estimate_shifts(
+    data,
+    axis: int = 0,
+    template: str | np.ndarray = 'median',
+    n_template: int = 200,
+    ref_index: int = 0,
+    upsample: int = 10,
+    max_shift: float | None = 32.0,
+    index: tuple | None = None,
+    progress=None,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Estimate subpixel rigid ``(dy, dx)`` shifts along ``axis`` via phase cross-correlation."""
+    from skimage.filters import window
+    from skimage.registration import phase_cross_correlation
+
+    axis = axis % data.ndim
+    if axis >= data.ndim - 2:
+        raise ValueError('motion correction needs a stack axis, not Y or X')
+    n_t = data.shape[axis]
+    h, w = data.shape[-2:]
+    lead = data.ndim - 2
+    idx = (0,) * data.ndim if index is None else index
+
+    def frame2d(t: int) -> np.ndarray:
+        sl = tuple(t if d == axis else int(idx[d]) for d in range(lead))
+        return np.asarray(data[sl], dtype=np.float32)
+
+    if isinstance(template, np.ndarray):
+        ref_img = np.asarray(template, dtype=np.float32)
+        if ref_img.shape != (h, w):
+            raise ValueError(f'template shape {ref_img.shape} does not match frame shape {(h, w)}')
+    elif template == 'median':
+        picks = np.unique(np.linspace(0, n_t - 1, min(max(1, int(n_template)), n_t)).astype(int))
+        ref_img = np.median(np.stack([frame2d(int(t)) for t in picks]), axis=0).astype(np.float32)
+    elif template == 'first_mean':
+        k = min(max(1, int(n_template)), n_t)
+        acc = np.zeros((h, w), dtype=np.float64)
+        for t in range(k):
+            acc += frame2d(t)
+        ref_img = (acc / k).astype(np.float32)
+    elif template == 'current':
+        ref_img = frame2d(int(np.clip(ref_index, 0, n_t - 1)))
+    else:
+        raise ValueError(f'unknown template mode {template!r}')
+
+    hann = window('hann', (h, w)).astype(np.float32)
+    ref_prep = _prep_for_correlation(ref_img, hann)
+    shifts = np.zeros((n_t, 2), dtype=np.float64)
+    up = max(1, int(upsample))
+    for t in range(n_t):
+        s, _, _ = phase_cross_correlation(
+            ref_prep,
+            _prep_for_correlation(frame2d(t), hann),
+            upsample_factor=up,
+            normalization=None,
+        )
+        if max_shift is not None and max_shift > 0:
+            s = np.clip(s, -float(max_shift), float(max_shift))
+        shifts[t] = s
+        if progress is not None and progress(t + 1, n_t) is False:
+            break
+    return shifts, ref_img
+
+
+def apply_shifts(
+    data,
+    shifts: np.ndarray,
+    axis: int = 0,
+    order: int = 1,
+    mode: str = 'nearest',
+    progress=None,
+) -> np.ndarray:
+    """Apply ``(n_t, 2)`` ``(dy, dx)`` shifts to every 2D plane along ``axis``."""
+    import itertools
+
+    from scipy.ndimage import shift as nd_shift
+
+    axis = axis % data.ndim
+    if axis >= data.ndim - 2:
+        raise ValueError('shifts must be applied along a stack axis')
+    shifts = np.asarray(shifts, dtype=np.float64)
+    n_t = data.shape[axis]
+    if shifts.shape != (n_t, 2):
+        raise ValueError(f'shifts shape {shifts.shape} must be ({n_t}, 2)')
+
+    out_dtype = np.float32 if order > 0 else data.dtype
+    out = np.empty(data.shape, dtype=out_dtype)
+    lead = data.ndim - 2
+    other_axes = [d for d in range(lead) if d != axis]
+    other_ranges = [range(data.shape[d]) for d in other_axes]
+    other_combos = list(itertools.product(*other_ranges)) if other_axes else [()]
+
+    for t in range(n_t):
+        dy, dx = shifts[t]
+        for combo in other_combos:
+            pos = dict(zip(other_axes, combo))
+            sl = tuple(t if d == axis else pos[d] for d in range(lead))
+            plane = np.asarray(data[sl], dtype=np.float32 if order > 0 else data.dtype)
+            if abs(dy) < 1e-6 and abs(dx) < 1e-6:
+                out[sl] = plane
+            else:
+                out[sl] = nd_shift(plane, (dy, dx), order=order, mode=mode)
+        if progress is not None and progress(t + 1, n_t) is False:
+            break
+    return out
+
+
+def motion_correct(
+    data,
+    axis: int = 0,
+    template: str | np.ndarray = 'median',
+    n_template: int = 200,
+    ref_index: int = 0,
+    upsample: int = 10,
+    max_shift: float | None = 32.0,
+    order: int = 1,
+    index: tuple | None = None,
+    progress=None,
+) -> tuple[np.ndarray, dict]:
+    """Rigid motion correction along ``axis``: returns ``(corrected, info)``."""
+    axis = axis % data.ndim
+    n_t = data.shape[axis]
+    total = 2 * n_t
+    cancelled = {'flag': False}
+
+    def p1(done, _tot):
+        if progress is not None and progress(done, total) is False:
+            cancelled['flag'] = True
+            return False
+        return True
+
+    def p2(done, _tot):
+        if progress is not None and progress(n_t + done, total) is False:
+            cancelled['flag'] = True
+            return False
+        return True
+
+    shifts, ref_img = estimate_shifts(
+        data,
+        axis=axis,
+        template=template,
+        n_template=n_template,
+        ref_index=ref_index,
+        upsample=upsample,
+        max_shift=max_shift,
+        index=index,
+        progress=p1,
+    )
+    if cancelled['flag']:
+        return np.empty(0, dtype=np.float32), {'shifts': shifts, 'template': ref_img, 'cancelled': True}
+    corrected = apply_shifts(data, shifts, axis=axis, order=order, progress=p2)
+    return corrected, {'shifts': shifts, 'template': ref_img, 'cancelled': cancelled['flag']}
+
+
+# ---------------------------------------------------- labels & watershed
+
+def fill_holes_labels(labels: np.ndarray) -> np.ndarray:
+    """Fill interior background holes in a 2D or 3D mask or label image."""
+    from scipy.ndimage import binary_fill_holes
+    from skimage.measure import regionprops
+
+    arr = np.asarray(labels)
+    if arr.size == 0 or arr.max() == 0:
+        return arr.copy()
+    if arr.max() <= 1 and arr.min() >= 0:
+        filled = binary_fill_holes(arr > 0)
+        return filled.astype(arr.dtype if np.issubdtype(arr.dtype, np.integer) else np.uint8)
+    out = arr.astype(np.int32, copy=True)
+    for region in regionprops(out):
+        filled = binary_fill_holes(region.image)
+        view = out[region.slice]
+        view[filled & (view == 0)] = int(region.label)
+    return out
+
+
+def watershed_labels(
+    labels: np.ndarray,
+    min_distance: float = 5.0,
+    z_ratio: float = 1.0,
+    fill_holes: bool = True,
+) -> np.ndarray:
+    """Split touching 2D or 3D objects using distance-transform watershed."""
+    from scipy.ndimage import binary_fill_holes, distance_transform_edt, gaussian_filter
+    from skimage.feature import peak_local_max
+    from skimage.measure import label
+    from skimage.segmentation import watershed
+
+    arr = np.asarray(labels)
+    fg = arr > 0
+    if not fg.any():
+        return np.zeros(arr.shape, dtype=np.int32)
+    if fill_holes:
+        fg = binary_fill_holes(fg)
+
+    z_ratio = max(float(z_ratio), 1e-6)
+    sampling = (1.0 / z_ratio, 1.0, 1.0) if fg.ndim == 3 else (1.0, 1.0)
+    dist = distance_transform_edt(fg, sampling=sampling)
+    sigma = (0.5 * z_ratio, 0.5, 0.5) if fg.ndim == 3 else 0.5
+    dist_smooth = np.where(fg, gaussian_filter(dist, sigma=sigma), 0.0)
+
+    r = max(1, int(round(min_distance)))
+    if fg.ndim == 3:
+        rz = max(0, int(round(min_distance * z_ratio)))
+        zz, yy, xx = np.ogrid[-rz : rz + 1, -r : r + 1, -r : r + 1]
+        footprint = (xx / r) ** 2 + (yy / r) ** 2 + ((zz / rz) ** 2 if rz else zz.astype(float) * 0) <= 1
+    else:
+        yy, xx = np.ogrid[-r : r + 1, -r : r + 1]
+        footprint = (xx / r) ** 2 + (yy / r) ** 2 <= 1
+
+    conn = label(fg, connectivity=fg.ndim).astype(np.int32)
+    coords = peak_local_max(dist_smooth, footprint=footprint, labels=conn, exclude_border=False)
+    markers = np.zeros(fg.shape, dtype=np.int32)
+    seen_components: set[int] = set()
+    next_id = 1
+    for pt in coords:
+        idx = tuple(int(c) for c in pt)
+        markers[idx] = next_id
+        seen_components.add(int(conn[idx]))
+        next_id += 1
+
+    # Guarantee every connected component gets at least one marker so small objects are never dropped.
+    n_comp = int(conn.max())
+    if len(seen_components) < n_comp:
+        from skimage.measure import regionprops
+
+        for region in regionprops(conn):
+            cid = int(region.label)
+            if cid in seen_components:
+                continue
+            sub_mask = region.image
+            sub_dist = np.where(sub_mask, dist_smooth[region.slice], -1.0)
+            local = np.unravel_index(int(np.argmax(sub_dist)), sub_dist.shape)
+            global_idx = tuple(sl.start + offset for sl, offset in zip(region.slice, local))
+            markers[global_idx] = next_id
+            next_id += 1
+
+    return watershed(-dist, markers, mask=fg).astype(np.int32)
+
+
+def watershed_blocks(
+    data,
+    blocks: list[tuple],
+    min_distance: float = 5.0,
+    z_ratio: float = 1.0,
+    fill_holes: bool = True,
+    progress=None,
+) -> np.ndarray:
+    """Apply distance-transform watershed block by block with globally unique label IDs."""
+    out = np.zeros(data.shape, dtype=np.int32)
+    next_id = 0
+    for n, b in enumerate(blocks):
+        result = watershed_labels(np.asarray(data[b]), min_distance=min_distance, z_ratio=z_ratio, fill_holes=fill_holes)
+        if result.max():
+            result[result > 0] += next_id
+            next_id = int(result.max())
+        out[b] = result
+        if progress is not None and progress(n + 1, len(blocks)) is False:
+            break
+    return out

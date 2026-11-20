@@ -850,3 +850,244 @@ def test_single_instance_forwards_to_running_toolbar(tiki, qtbot, tmp_path, monk
         assert tiki.windows.viewers == []
     finally:
         server.close()
+
+
+def test_brightness_contrast_window_luts_and_channels_tool(tiki, hyperstack):
+    img1 = np.arange(100, dtype=np.uint16).reshape(10, 10)
+    img2 = np.arange(200, 300, dtype=np.uint16).reshape(10, 10)
+    v1 = tiki.open_data(img1, 'one.tif')
+    v2 = tiki.open_data(img2, 'two.tif')
+
+    tiki.brightness_contrast()
+    bc = tiki.contrast_window
+    assert bc is not None and bc.isVisible() and bc.viewer is v2
+
+    bc.set_limits(210, 280)
+    assert tuple(v2.layers['two.tif'].contrast_limits) == pytest.approx((210.0, 280.0))
+    assert bc.lo_spin.value() == pytest.approx(210.0) and bc.hi_spin.value() == pytest.approx(280.0)
+
+    bc.propagate()
+    assert tuple(v1.layers['one.tif'].contrast_limits) == pytest.approx((210.0, 280.0))
+
+    bc.auto()
+    lo_a, hi_a = v2.layers['two.tif'].contrast_limits
+    assert 200.0 <= lo_a < hi_a <= 299.0
+
+    bc.reset()
+    assert tuple(v2.layers['two.tif'].contrast_limits) == pytest.approx((200.0, 299.0))
+
+    tiki.set_lut('Fire')
+    assert v2.layers['two.tif'].colormap.name == 'fire'
+    tiki.set_lut('HiLo')
+    assert v2.layers['two.tif'].colormap.name.lower() == 'hilo'
+
+    tiki.windows.activate(v1)
+    assert bc.viewer is v1
+
+    path, _ = hyperstack
+    tiki.open_paths([str(path)])
+    hv = tiki.windows.active
+    tiki.split_channels()
+    tiki.channels_tool()
+    ct = tiki.channels_window
+    assert ct.isVisible()
+    from qtpy.QtWidgets import QPushButton
+
+    auto_buttons = ct.findChildren(QPushButton)
+    assert len(auto_buttons) == 2
+    auto_buttons[0].click()
+    ch1 = hv.layers[f'C1-{path.name}']
+    assert ch1.contrast_limits[0] < ch1.contrast_limits[1]
+
+
+def test_duplicate_substack_and_bin_dialogs(tiki, accept_dialogs):
+    from qtpy.QtWidgets import QCheckBox, QLineEdit, QSpinBox
+
+    from tiki import process
+
+    v, movie = _tyx_movie(tiki, n=12)
+    _rect(v.layers[roi.ROI_NAME], 2, 12, 4, 20)
+
+    def configure_stepped(dlg):
+        edits = dlg.findChildren(QLineEdit)
+        edits[-1].setText('1-10-2')
+
+    accept_dialogs['configure'] = configure_stepped
+    sub_v = process.duplicate_dialog(tiki)
+    assert sub_v.layers[0].data.shape == (5, 10, 16)
+    assert sub_v.layers[0].scale[0] == pytest.approx(0.02)
+
+    tiki.windows.activate(v)
+    accept_dialogs['configure'] = None
+    sub2 = process.duplicate_dialog(tiki, substack_only=True)
+    assert sub2.layers[0].data.shape == (12, 10, 16)
+
+    tiki.windows.activate(v)
+
+    def configure_plane_only(dlg):
+        boxes = dlg.findChildren(QCheckBox)
+        next(b for b in boxes if 'stack' in b.text().lower()).setChecked(False)
+
+    accept_dialogs['configure'] = configure_plane_only
+    plane_v = process.duplicate_dialog(tiki)
+    assert plane_v.layers[0].data.ndim == 2
+
+    tiki.windows.activate(v)
+
+    def configure_bin(dlg):
+        spins = dlg.findChildren(QSpinBox)
+        for sp in spins:
+            sp.setValue(2)
+
+    accept_dialogs['configure'] = configure_bin
+    bin_v = process.bin_dialog(tiki)
+    assert bin_v.layers[0].data.shape == (6, 12, 15)
+    assert tuple(bin_v.layers[0].scale) == pytest.approx((0.02, 1.0, 1.0))
+
+
+def test_sequence_dialog_and_smart_folder_drop(tiki, tmp_path, accept_dialogs, monkeypatch):
+    import tifffile
+
+    from tiki import process
+
+    seq = tmp_path / 'frames'
+    seq.mkdir()
+    for i in range(1, 6):
+        tifffile.imwrite(seq / f'frame{i}.tif', np.full((12, 14), i * 10, dtype=np.uint16))
+
+    accept_dialogs['configure'] = None
+    v = process.sequence_dialog(tiki, folder=seq)
+    assert v.layers[0].data.shape == (5, 12, 14)
+    assert hasattr(v.layers[0].data, 'compute')
+
+    monkeypatch.setattr(tiki, '_ask_folder_drop', lambda folder, n: 'stack')
+    tiki.open_dropped([str(seq)])
+    assert len(tiki.windows.viewers) == 2
+    assert tiki.windows.active.layers[0].data.shape == (5, 12, 14)
+
+
+def test_save_hyperstack_split_channels_and_labels(tiki, hyperstack, tmp_path):
+    from napari.layers import Labels
+
+    from tiki import io
+
+    path, _ = hyperstack
+    tiki.open_paths([str(path)])
+    v = tiki.windows.active
+    tiki.split_channels()
+    c1 = v.layers[f'C1-{path.name}']
+    c2 = v.layers[f'C2-{path.name}']
+    v.layers.selection.active = c1
+    tiki.set_lut('Green')
+    v.layers.selection.active = c2
+    tiki.set_lut('Fire')
+
+    out = tmp_path / 'merged_out.tif'
+    tiki.save_layer(out, viewer=v, merge_split=True)
+    reopened, meta = io.read_image(out)
+    assert reopened.shape == (6, 4, 2, 24, 20)
+    assert meta['axes'].roles == 'TZCYX'
+    assert meta['axes'].scale == pytest.approx([0.5, 2.0, 1.0, 0.25, 0.25])
+    assert len(meta['imagej_luts']) == 2
+
+    lab_data = np.zeros((24, 20), dtype=np.int32)
+    lab_data[4:10, 4:10] = 7
+    lab_layer = Labels(lab_data, name='cells')
+    v.add_layer(lab_layer)
+    lab_out = tmp_path / 'cells_labels.tif'
+    tiki.save_layer(lab_out, layer=lab_layer, viewer=v)
+    lab_back, lab_meta = io.read_image(lab_out)
+    assert lab_back[6, 6] == 7 and lab_meta['axes'].scale == pytest.approx([0.25, 0.25])
+
+
+def test_motion_correction_dialog_dual_channel(tiki, accept_dialogs):
+    from qtpy.QtCore import Qt
+    from qtpy.QtWidgets import QComboBox
+    from scipy.ndimage import gaussian_filter
+    from scipy.ndimage import shift as nd_shift
+
+    from tiki import process
+
+    rng = np.random.default_rng(11)
+    field = gaussian_filter(rng.normal(0, 1, (100, 100)).astype(np.float32), 2) * 50 + 100
+    shifts = rng.uniform(-2.5, 2.5, (15, 2))
+    c1 = np.stack([nd_shift(field, s, order=3)[25:75, 25:75] for s in shifts]).astype(np.float32)
+    c2 = np.stack([nd_shift(field * 2, s, order=3)[25:75, 25:75] for s in shifts]).astype(np.float32)
+    hyper = np.stack([c1, c2], axis=1)
+    v = _open_with_axes(tiki, hyper, 'TCYX', 'dual.tif', {'T': 0.1, 'Y': 0.5, 'X': 0.5})
+    tiki.split_channels()
+    v.layers.selection.active = v.layers['C1-dual.tif']
+
+    def configure(dlg):
+        for cb in dlg.findChildren(QComboBox):
+            idx = cb.findText('C2-dual.tif', Qt.MatchContains)
+            if idx >= 0 and cb.findText('None') >= 0:
+                cb.setCurrentIndex(idx)
+
+    accept_dialogs['configure'] = configure
+    reg1 = process.motion_correct_dialog(tiki)
+    assert reg1 is not None and 'C1-dual.tif registered' in v.layers
+    assert 'C2-dual.tif registered' in v.layers
+    inner = (slice(None), slice(5, -5), slice(5, -5))
+    assert v.layers['C2-dual.tif registered'].data[inner].std(0).mean() < 0.4 * c2[inner].std(0).mean()
+    assert any('Motion shifts' in w.windowTitle() for w in tiki.profiles)
+
+
+def test_watershed_dialog_preview_cleanup_and_fill_holes(tiki, accept_dialogs):
+    from napari.layers import Labels
+
+    from tiki import process
+
+    yy, xx = np.mgrid[:64, :64]
+    img = np.zeros((64, 64), dtype=np.float32)
+    img[(yy - 20) ** 2 + (xx - 16) ** 2 <= 8**2] = 500
+    img[(yy - 20) ** 2 + (xx - 27) ** 2 <= 8**2] = 500
+    donut = ((yy - 46) ** 2 + (xx - 45) ** 2 <= 8**2) & ((yy - 46) ** 2 + (xx - 45) ** 2 >= 3**2)
+    img[donut] = 500
+    v = tiki.open_data(img, 'cells.tif')
+    labels = Labels((img > 100).astype(np.int32), name='mask')
+    v.add_layer(labels)
+    v.layers.selection.active = labels
+
+    accept_dialogs['configure'] = None
+    ws = process.watershed_dialog(tiki)
+    assert 'watershed preview' not in [ly.name for ly in v.layers]
+    assert ws is not None and ws.data.max() == 3
+    assert ws.data[46, 45] > 0
+
+    v.layers.selection.active = labels
+    filled = process.fill_holes_command(tiki)
+    assert filled is not None and filled.data[46, 45] > 0
+
+
+def test_open_czi_multi_scene_and_split_channels(tiki, tmp_path, monkeypatch):
+    from tiki import axes, io
+
+    info = axes.AxesInfo(
+        [
+            axes.Axis('C', 2),
+            axes.Axis('Z', 3, 1.0, 'µm'),
+            axes.Axis('Y', 10, 0.2, 'µm'),
+            axes.Axis('X', 10, 0.2, 'µm'),
+        ],
+        'CZI metadata',
+        True,
+    )
+    lut_g = io._czi_color_to_lut('#FF00FF00')
+    lut_m = io._czi_color_to_lut('#FFFF00FF')
+    p = tmp_path / 'zeiss.czi'
+    p.write_bytes(b'dummy')
+    monkeypatch.setattr(
+        io,
+        'read_czi_scenes',
+        lambda _path: [
+            (np.zeros((2, 3, 10, 10), np.uint16), {'name': 'zeiss.czi [S0]', 'path': str(p), 'axes': info, 'imagej_luts': [lut_g, lut_m]}),
+            (np.ones((2, 3, 10, 10), np.uint16), {'name': 'zeiss.czi [S1]', 'path': str(p), 'axes': info, 'imagej_luts': [lut_g, lut_m]}),
+        ],
+    )
+    tiki.open_paths([str(p)])
+    assert [v.title for v in tiki.windows.viewers] == ['zeiss.czi [S0]', 'zeiss.czi [S1]']
+    v = tiki.windows.active
+    assert tuple(v.dims.axis_labels) == ('c', 'z', 'y', 'x')
+    tiki.split_channels()
+    assert [ly.name for ly in v.layers if ly.name.startswith('C')] == ['C1-zeiss.czi [S1]', 'C2-zeiss.czi [S1]']

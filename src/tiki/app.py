@@ -76,6 +76,8 @@ FIXES = {'properties': ('Open Properties…', 'properties'), 'split': ('Split Ch
 
 
 class Tiki(QMainWindow):
+    FOLDER_SEQUENCE_MIN = 4
+
     def __init__(self):
         super().__init__()
         style.apply(self)
@@ -86,6 +88,7 @@ class Tiki(QMainWindow):
         self.profiles: list[ProfileWindow] = []
         self._message_until = 0.0
         self._actions: dict[str, QAction] = {}
+        self.contrast_window = None
         self.threshold_window = None
         self.roi_manager = None
         self.traces: list = []  # open TracesWindows (exported by Send to Notebook)
@@ -140,11 +143,15 @@ class Tiki(QMainWindow):
         return action
 
     def _build_menus(self) -> None:
+        from .contrast import LUTS
+
         mb = self.menuBar()
         m = mb.addMenu('&File')
         self._add(m, 'Open…', self.open_dialog, 'Ctrl+O')
         self.recent_menu = m.addMenu('Open Recent')
         self.recent_menu.aboutToShow.connect(self._fill_recent_menu)
+        imp = m.addMenu('Import')
+        self._add(imp, 'Image Sequence…', lambda: self._process('sequence_dialog'), 'Ctrl+Shift+I')
         samples = m.addMenu('Open Samples')
         self._add(samples, 'Synthetic movie', self.open_sample_movie)
         self._add(samples, 'Blobs', lambda: self._open_skimage('blobs'))
@@ -165,10 +172,13 @@ class Tiki(QMainWindow):
 
         m = mb.addMenu('&Image')
         adjust = m.addMenu('Adjust')
-        self._add(adjust, 'Brightness/Contrast…', self.toggle_layer_controls, 'Ctrl+Shift+C')
+        self._add(adjust, 'Brightness/Contrast…', self.brightness_contrast, 'Ctrl+Shift+C')
         self._add(adjust, 'Threshold…', self.threshold, 'Ctrl+Shift+T')
         self._add(adjust, 'Enhance Contrast', self.enhance_contrast, 'Ctrl+Shift+E')
         self._add(adjust, 'Reset Display Range', self.reset_contrast)
+        luts = m.addMenu('Lookup Tables')
+        for lut_name in LUTS:
+            self._add(luts, lut_name, lambda n=lut_name: self.set_lut(n))
         m.addSeparator()
         self._add(m, 'Show Info…', self.show_info, 'Ctrl+I')
         self._add(m, 'Properties…', self.properties, 'Ctrl+Shift+P')
@@ -177,9 +187,11 @@ class Tiki(QMainWindow):
         self._add(color, 'Merge Channels', self.merge_channels)
         self._add(color, 'Channels Tool…', self.channels_tool, 'Ctrl+Shift+Z')
         self._add(m, 'Crop', self.crop, 'Ctrl+Shift+X')
-        self._add(m, 'Duplicate…', self.duplicate, 'Ctrl+Shift+D')
+        self._add(m, 'Duplicate…', lambda: self._process('duplicate_dialog'), 'Ctrl+Shift+D')
         stacks = m.addMenu('Stacks')
         self._add(stacks, 'Z Project…', self.z_project_dialog)
+        self._add(stacks, 'Make Substack…', lambda: self._process('duplicate_dialog', substack_only=True))
+        self._add(stacks, 'Bin…', lambda: self._process('bin_dialog'))
         self._add(stacks, 'Plot Z-axis Profile', self.plot_z_profile, 'Ctrl+Shift+Y')
         self._add(stacks, 'Kymograph / Reslice…', lambda: self._process('kymograph_dialog'))
         self._add(stacks, 'Correlation Image', lambda: self._process('correlation_image'))
@@ -194,7 +206,11 @@ class Tiki(QMainWindow):
         m.addSeparator()
         self._add(m, 'ΔF/F…', lambda: self._process('dff_dialog'))
         self._add(m, 'Bleach Correction…', lambda: self._process('bleach_dialog'))
+        self._add(m, 'Motion Correction…', lambda: self._process('motion_correct_dialog'))
         self._add(m, 'Image Calculator…', lambda: self._process('calculator_dialog'))
+        labels_menu = m.addMenu('Labels')
+        self._add(labels_menu, 'Watershed…', lambda: self._process('watershed_dialog'))
+        self._add(labels_menu, 'Fill Holes', lambda: self._process('fill_holes_command'))
 
         m = mb.addMenu('&Analyze')
         self._add(m, 'Measure', self.measure, 'Ctrl+M')
@@ -234,6 +250,8 @@ class Tiki(QMainWindow):
         menu.clear()
         toggle = menu.addAction('Show Layer List')
         toggle.triggered.connect(self.toggle_layer_list)
+        controls = menu.addAction('Show Layer Controls')
+        controls.triggered.connect(self.toggle_layer_controls)
         menu.addAction('Show Results').triggered.connect(self.show_results)
         menu.addSeparator()
         if not self.windows.viewers:
@@ -407,6 +425,8 @@ class Tiki(QMainWindow):
     def _on_active_changed(self, viewer) -> None:
         if viewer is not None:
             self.apply_tool(viewer)
+        if self.contrast_window is not None and self.contrast_window.isVisible():
+            self.contrast_window.set_target(viewer)
         if self.threshold_window is not None and self.threshold_window.isVisible():
             self.threshold_window.set_target(viewer)
         if self.roi_manager is not None and self.roi_manager.isVisible():
@@ -435,27 +455,62 @@ class Tiki(QMainWindow):
         for path in paths:
             t0 = time.perf_counter()
             try:
-                data, meta = io.read_image(path)
+                if Path(path).suffix.lower() == '.czi':
+                    loaded = io.read_czi_scenes(path)
+                else:
+                    loaded = [io.read_image(path)]
             except Exception as exc:
                 traceback.print_exc()
                 self.report('Open', f'Could not open {Path(path).name}:\n{exc}')
                 continue
-            metadata = {'path': meta['path']}
-            if meta.get('imagej_luts') is not None:
-                metadata['imagej_luts'] = meta['imagej_luts']
-            info = meta['axes']
-            self.open_data(data, meta['name'], axes=info, metadata=metadata)
+            for data, meta in loaded:
+                metadata = {'path': meta['path']}
+                if meta.get('imagej_luts') is not None:
+                    metadata['imagej_luts'] = meta['imagej_luts']
+                info = meta['axes']
+                open_kw: dict = {'axes': info, 'metadata': metadata}
+                rgb = data.ndim == len(info.axes) + 1 and data.shape[-1] in (3, 4)
+                luts = meta.get('imagej_luts')
+                if info.index('C') is None and not rgb and luts and len(luts) == 1:
+                    lut = np.asarray(luts[0], dtype=float)
+                    if lut.shape == (3, 256):
+                        ramp = np.arange(256, dtype=float)
+                        if not all(np.allclose(lut[ch], ramp, atol=1.5) for ch in range(3)):
+                            from napari.utils.colormaps import Colormap
+
+                            rgba = np.column_stack([np.clip(lut.T / 255.0, 0.0, 1.0), np.ones(256)])
+                            open_kw['colormap'] = Colormap(rgba, name='imagej_lut')
+                self.open_data(data, meta['name'], **open_kw)
+                msg = f'Opened {meta["name"]}: {info.describe()} {data.dtype} [{info.source}]'
+                if info.notes:
+                    msg += ' — ' + '; '.join(info.notes)
+                if not info.confident:
+                    msg += ' — check Image ▸ Properties (Ctrl+Shift+P)'
+                self.status(msg)
+                if not info.confident or info.notes:
+                    self._message_until = time.monotonic() + 10
+                if 'warning' in meta:
+                    self.report('Open', f'{meta["name"]}: {meta["warning"]}')
             recent.add(path)
-            msg = f'Opened {meta["name"]}: {info.describe()} {data.dtype} [{info.source}]'
-            if info.notes:
-                msg += ' — ' + '; '.join(info.notes)
-            if not info.confident:
-                msg += ' — check Image ▸ Properties (Ctrl+Shift+P)'
-            self.status(msg)
-            if not info.confident or info.notes:
-                self._message_until = time.monotonic() + 10
-            if 'warning' in meta:
-                self.report('Open', f'{meta["name"]}: {meta["warning"]}')
+
+    def open_sequence(self, folder_or_paths, **kwargs):
+        t0 = time.perf_counter()
+        data, meta = io.read_sequence(folder_or_paths, **kwargs)
+        info = meta['axes']
+        open_kw: dict = {'axes': info, 'metadata': {'path': meta['path']}}
+        if not meta.get('rgb'):
+            open_kw['contrast_limits'] = ops.saturated_limits(meta['first_plane'])
+        viewer = self.open_data(data, meta['name'], **open_kw)
+        msg = (
+            f'Opened sequence {meta["name"]}: {info.describe()} {data.dtype} '
+            f'({meta["n_files"]} files, lazy) in {time.perf_counter() - t0:.2f} s'
+        )
+        if not info.confident:
+            msg += ' — check Image ▸ Properties (Ctrl+Shift+P)'
+        self.status(msg)
+        if not info.confident:
+            self._message_until = time.monotonic() + 10
+        return viewer
 
     def open_dialog(self) -> None:
         paths, _ = QFileDialog.getOpenFileNames(self, 'Open', str(Path.home()), io.OPEN_FILTER)
@@ -478,14 +533,131 @@ class Tiki(QMainWindow):
     def windows_close_all(self) -> None:
         self.windows.close_all()
 
+    def save_layer(self, path: str | Path, layer=None, viewer=None, merge_split: bool = False) -> Path:
+        from . import contrast
+
+        viewer = viewer or self.windows.active
+        if viewer is None:
+            raise TikiError('no image open')
+        if merge_split:
+            parts = sorted(
+                [ly for ly in viewer.layers if isinstance(ly, Image) and 'split_from' in ly.metadata],
+                key=lambda ly: ly.metadata.get('channel', 0),
+            )
+            if not parts:
+                raise TikiError('this window has no split channels to merge')
+            original = parts[0].metadata['split_from']
+            info = axes_mod.get(original)
+            c = info.index('C')
+            if c is None or len(parts) != original.data.shape[c]:
+                data = np.stack([np.asarray(ly.data) for ly in parts], axis=0)
+                p_info = axes_mod.get(parts[0])
+                info = axes_mod.AxesInfo(
+                    [axes_mod.Axis('C', len(parts))] + list(p_info.axes),
+                    p_info.source,
+                    p_info.confident,
+                )
+            else:
+                data = np.stack([np.asarray(ly.data) for ly in parts], axis=c)
+            luts = [contrast.layer_lut_bytes(ly) for ly in parts]
+            io.save_tiff(path, data, axes=info, luts=luts)
+            self.status(f'Saved hyperstack {path}')
+            return Path(path)
+
+        if layer is None:
+            active = viewer.layers.selection.active
+            if isinstance(active, (Image, Labels)) and active.name not in roi_mod.PREVIEW_NAMES:
+                layer = active
+            else:
+                layer = roi_mod.target_image(viewer)
+        if layer is None:
+            raise TikiError('no image or labels layer to save')
+
+        if isinstance(layer, Labels):
+            info = None
+            if layer.metadata.get('axes'):
+                info = axes_mod.get(layer)
+            else:
+                ref = roi_mod.target_image(viewer)
+                shape = tuple(layer.data.shape[: layer.ndim])
+                if ref is not None:
+                    ref_info = axes_mod.get(ref)
+                    if len(ref_info.axes) >= layer.ndim:
+                        cand = axes_mod.AxesInfo(
+                            [axes_mod.Axis(a.role, n, a.step, a.unit)
+                             for a, n in zip(ref_info.axes[-layer.ndim :], shape)],
+                            ref_info.source,
+                            ref_info.confident,
+                        )
+                        if not cand.problems(shape):
+                            info = cand
+                if info is None:
+                    info = axes_mod.guess(shape)
+            io.save_tiff(path, layer.data, axes=info)
+            self.status(f'Saved labels "{layer.name}" to {path}')
+            return Path(path)
+
+        info = axes_mod.get(layer)
+        luts = None
+        if info.index('C') is None and not layer.rgb and layer.colormap.name != 'gray':
+            luts = [contrast.layer_lut_bytes(layer)]
+        io.save_tiff(path, layer.data, axes=info, luts=luts)
+        self.status(f'Saved {path}')
+        return Path(path)
+
     def save_as(self) -> None:
-        viewer, image = self.require_image()
-        default = Path(image.metadata.get('path', image.name)).with_suffix('.tif').name
-        path, _ = QFileDialog.getSaveFileName(self, 'Save As TIFF', default, 'TIFF (*.tif)')
+        viewer = self.windows.active
+        if viewer is None:
+            raise TikiError('no image open')
+        savable = [
+            ly for ly in viewer.layers
+            if isinstance(ly, (Image, Labels)) and ly.name not in roi_mod.PREVIEW_NAMES
+        ]
+        if not savable:
+            raise TikiError('no image or labels layer to save')
+        parts = [ly for ly in savable if isinstance(ly, Image) and 'split_from' in ly.metadata]
+        merge_split = False
+        chosen = savable[-1]
+
+        if parts or len(savable) > 1:
+            dlg = QDialog(self)
+            style.apply(dlg)
+            dlg.setWindowTitle('Save As TIFF')
+            form = QFormLayout(dlg)
+            what = QComboBox()
+            if parts:
+                orig = parts[0].metadata['split_from']
+                what.addItem(f'Merged hyperstack ({orig.name}, {len(parts)} channels)', ('merge', orig))
+            active = viewer.layers.selection.active
+            for ly in savable:
+                kind = 'Labels' if isinstance(ly, Labels) else 'Image'
+                what.addItem(f'{ly.name} ({kind})', ('layer', ly))
+            if not parts and active in savable:
+                idx = next(i for i in range(what.count()) if what.itemData(i) == ('layer', active))
+                what.setCurrentIndex(idx)
+            form.addRow('Save:', what)
+            buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+            buttons.accepted.connect(dlg.accept)
+            buttons.rejected.connect(dlg.reject)
+            form.addRow(buttons)
+            if dlg.exec_() != QDialog.Accepted:
+                return
+            mode, target = what.currentData()
+            if mode == 'merge':
+                merge_split = True
+                default_name = Path(target.metadata.get('path', target.name)).with_suffix('.tif').name
+            else:
+                chosen = target
+                default_name = Path(chosen.metadata.get('path', chosen.name)).with_suffix('.tif').name
+        else:
+            chosen = savable[0]
+            default_name = Path(chosen.metadata.get('path', chosen.name)).with_suffix('.tif').name
+
+        path, _ = QFileDialog.getSaveFileName(
+            self, 'Save As TIFF', default_name, 'TIFF (*.tif *.tiff);;OME-TIFF (*.ome.tif)'
+        )
         if path:
-            scale = tuple(image.scale) if np.any(np.asarray(image.scale) != 1) else None
-            io.save_tiff(path, image.data, scale)
-            self.status(f'Saved {path}')
+            self.save_layer(path, layer=chosen, viewer=viewer, merge_split=merge_split)
 
     # ------------------------------------------------------------- Edit
 
@@ -561,6 +733,25 @@ class Tiki(QMainWindow):
         if win is not None and win.isVisible():
             win.refresh(viewer)
 
+    def brightness_contrast(self) -> None:
+        from .contrast import BrightnessContrastWindow
+
+        viewer, _ = self.require_image()
+        if self.contrast_window is None:
+            self.contrast_window = BrightnessContrastWindow(self)
+        win = self.contrast_window
+        win.show()
+        win.raise_()
+        win.set_target(viewer)
+
+    def set_lut(self, name: str) -> None:
+        from . import contrast
+
+        viewer, image = self.require_image()
+        contrast.apply_lut(image, name)
+        self._refresh_channels_tool(viewer)
+        self.status(f'{image.name}: LUT → {name}')
+
     def threshold(self) -> None:
         from .threshold import ThresholdWindow
 
@@ -610,12 +801,41 @@ class Tiki(QMainWindow):
             return None
         return roi_mod.shape_box(current[0], roi_mod.spatial_shape(image))
 
-    def duplicate(self) -> None:
-        viewer, image = self.require_image()
-        box = self._roi_box(viewer, image)
-        data = image.data if box is None else ops.crop_to_box(image.data, box)
+    def duplicate(self, image=None, title: str | None = None, crop: bool = True,
+                  stack: bool = True, ranges: dict | None = None):
+        viewer, active = self.require_image()
+        image = image or active
+        box = self._roi_box(viewer, image) if crop else None
+        info = axes_mod.get(image)
+        specs: dict = {}
+        if not stack and image.ndim > 2:
+            idx = roi_mod.current_index(viewer, image)
+            for d in range(image.ndim - 2):
+                specs[d] = idx[d]
+        elif ranges:
+            specs = dict(ranges)
+        result, dropped, mults = ops.substack(
+            image.data, specs=specs, box=box, squeeze_single=True, rgb=bool(image.rgb)
+        )
+        new_axes = []
+        for d, ax in enumerate(info.axes):
+            if d in dropped:
+                continue
+            out_d = len(new_axes)
+            step = ax.step * mults[d] if (ax.step and d in mults) else ax.step
+            new_axes.append(axes_mod.Axis(ax.role, result.shape[out_d], step, ax.unit))
+        new_info = axes_mod.AxesInfo(new_axes, info.source, info.confident, list(info.notes))
+        expected_shape = result.shape[:-1] if image.rgb and result.ndim == len(new_axes) + 1 else result.shape
+        if new_info.problems(expected_shape):
+            new_info = axes_mod.fit(info, expected_shape)
         stem = Path(image.name).stem
-        self.open_data(np.array(data), f'{stem}-1.tif', axes=axes_mod.fit(axes_mod.get(image), data.shape))
+        open_kw: dict = {'axes': new_info}
+        if not image.rgb:
+            open_kw['colormap'] = image.colormap
+        if hasattr(result, 'compute') and not image.rgb:
+            plane = np.asarray(result[(0,) * max(0, result.ndim - 2)])
+            open_kw['contrast_limits'] = ops.saturated_limits(plane)
+        return self.open_data(result, title or f'{stem}-1.tif', **open_kw)
 
     def crop(self) -> None:
         viewer, image = self.require_image()
@@ -1090,10 +1310,10 @@ class Tiki(QMainWindow):
 
     # ------------------------------------------- Process extras & helpers
 
-    def _process(self, name: str):
+    def _process(self, name: str, **kwargs):
         from . import process
 
-        return getattr(process, name)(self)
+        return getattr(process, name)(self, **kwargs)
 
     def keep_window(self, win) -> None:
         """Keep a floating plot alive until it is closed (and close it with TIKI)."""
@@ -1171,11 +1391,53 @@ class Tiki(QMainWindow):
         event.acceptProposedAction()
         self.open_dropped(paths)
 
+    def _ask_folder_drop(self, folder: Path, count: int) -> str:
+        box = QMessageBox(
+            QMessageBox.Question,
+            'Open Folder',
+            f'"{folder.name}" contains {count} image files.\n\nOpen them as one lazy stack or as separate windows?',
+            QMessageBox.Cancel,
+            self,
+        )
+        as_stack = box.addButton('Open as Stack', QMessageBox.AcceptRole)
+        options = box.addButton('Sequence Options…', QMessageBox.ActionRole)
+        separate = box.addButton('Separate Windows', QMessageBox.ActionRole)
+        box.setDefaultButton(as_stack)
+        box.exec_()
+        clicked = box.clickedButton()
+        if clicked is as_stack:
+            return 'stack'
+        if clicked is options:
+            return 'options'
+        if clicked is separate:
+            return 'separate'
+        return 'cancel'
+
     def open_dropped(self, paths) -> None:
         """Open whatever was dropped, ImageJ-style: images (and folders of images)
         in new windows, .roi/.zip into the ROI Manager, .py macros in the editor."""
         self.raise_()
-        kinds = io.sort_dropped(paths)
+        remaining = []
+        opened_sequence = False
+        for raw in paths:
+            p = Path(raw)
+            if p.is_dir():
+                seq_files = io.find_sequence_files(p)
+                if len(seq_files) >= self.FOLDER_SEQUENCE_MIN:
+                    mode = self._ask_folder_drop(p, len(seq_files))
+                    if mode == 'stack':
+                        self._run('Open Sequence', lambda p=p: self.open_sequence(p))
+                        opened_sequence = True
+                        continue
+                    if mode == 'options':
+                        self._run('Import Image Sequence', lambda p=p: self._process('sequence_dialog', folder=p))
+                        opened_sequence = True
+                        continue
+                    if mode == 'cancel':
+                        continue
+            remaining.append(raw)
+
+        kinds = io.sort_dropped(remaining)
         if kinds['images']:
             self._run('Open', lambda: self.open_paths([str(p) for p in kinds['images']]))
         for p in kinds['rois']:
@@ -1184,9 +1446,9 @@ class Tiki(QMainWindow):
             self._run('Open Macro', lambda p=p: self.new_macro(str(p)))
         if kinds['skipped']:
             names = ', '.join(p.name for p in kinds['skipped'][:5])
-            self.report('Open', f'TIKI cannot open: {names}\n\nSupported: images (.tif, .tiff, .npy, .png, '
+            self.report('Open', f'TIKI cannot open: {names}\n\nSupported: images (.tif, .tiff, .czi, .npy, .png, '
                         '.jpg), folders of images, ImageJ ROIs (.roi, .zip) and macros (.py).')
-        if not any(kinds.values()):
+        if not opened_sequence and not any(kinds.values()):
             self.status('Nothing to open')
 
     def closeEvent(self, event):
@@ -1195,8 +1457,8 @@ class Tiki(QMainWindow):
             srv.close()
         self.windows.close_all()
         self.results.close()
-        for w in (self.threshold_window, self.roi_manager, getattr(self, 'channels_window', None),
-                  getattr(self, 'log_window', None)):
+        for w in (self.contrast_window, self.threshold_window, self.roi_manager,
+                  getattr(self, 'channels_window', None), getattr(self, 'log_window', None)):
             if w is not None:
                 w.close()
         for w in list(self.profiles):

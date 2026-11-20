@@ -127,7 +127,11 @@ pixel value.
 - Maximum, average, sum, standard-deviation, median and minimum projections
 - Selectable projection range
 - Chunked projection operations for memory-mapped movies
-- Crop, duplicate, enhance contrast and reset contrast
+- **Duplicate…** (<kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>D</kbd>) and **Make Substack…** with 1-based slice ranges (`1-50`, `1-100-2`, `1, 4, 7`), single-plane extraction and optional ROI crop (zero-copy views on memory-mapped/Dask stacks)
+- **Image ▸ Stacks ▸ Bin…**: temporal and XY binning (`Average`, `Max`, `Min`, `Median`, `Sum`) with updated physical scale
+- Crop, enhance contrast and reset contrast
+- **Brightness/Contrast…** (<kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>C</kbd>): floating histogram with transfer ramp, Min/Max sliders and spinboxes, **Auto** saturation cycling, **Reset**, exact **Set…** and **Propagate** across windows
+- **Image ▸ Lookup Tables**: `Grays`, `Inverted Grays`, `Fire`, `Cyan Hot`, `HiLo`, channel colors and scientific colormaps, plus per-channel contrast sliders and `Auto` buttons in **Channels Tool…**
 - First-slice opening behavior, matching ImageJ rather than napari's default
   middle-slice position
 
@@ -184,6 +188,9 @@ pixel value.
   with the brush, eraser and fill tools
 - Brush and eraser tools on the TIKI toolbar paint into the selected Labels
   layer, or create an empty one for annotating from scratch
+- **Process ▸ Labels ▸ Watershed…** and **Fill Holes**: split touching 2D or
+  anisotropic 3D objects by distance-transform watershed (with live slice
+  preview) and fill interior holes
 
 ### Particles, ROI Manager and traces
 
@@ -227,6 +234,9 @@ pixel value.
 - ImageJ movies saved as plain "slices" with a frame rate are read as T
 - **Image ▸ Stacks ▸ Kymograph / Reslice…** samples a line or path through T
   (or Z), averaged across a chosen width
+- **Process ▸ Motion Correction…**: rigid subpixel alignment by phase
+  cross-correlation (median, first-N mean or current-frame template), drift
+  plot, and optional shift application to a second channel
 - **Process ▸ Image Calculator…** combines any two images from any windows
   (32-bit result); a single plane can be applied to a whole stack, e.g. a
   flat-field or background frame
@@ -253,6 +263,13 @@ pixel value.
 ### File handling
 
 - TIFF/OME-TIFF via `tifffile`
+- Zeiss `.czi` files via `czifile` (axes, physical scaling, channel colors and multi-scene support)
+- **File ▸ Save As TIFF…**: writes calibrated ImageJ hyperstacks (including
+  reordered `TZCYX`, merged split-channel composites with LUTs, and `Labels`
+  layers) or OME-TIFF when required
+- **File ▸ Import ▸ Image Sequence…** (<kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>I</kbd>,
+  or drop a folder of 4+ images) opens naturally sorted image sequences lazily
+  via Dask
 - NumPy `.npy` arrays
 - Memory mapping where the format permits it
 - Graceful handling of incomplete ScanImage TIFFs whose header advertises more
@@ -263,22 +280,26 @@ pixel value.
 | Menu | Command | Shortcut |
 |---|---|---|
 | File | Open… | <kbd>Ctrl</kbd>+<kbd>O</kbd> |
+| File → Import | Image Sequence… | <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>I</kbd> |
 | File | Close / Close All | <kbd>Ctrl</kbd>+<kbd>W</kbd> / <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>W</kbd> |
 | File | Save As TIFF… | <kbd>Ctrl</kbd>+<kbd>S</kbd> |
 | Edit → Selection | Select All / Select None | <kbd>Ctrl</kbd>+<kbd>A</kbd> / <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>A</kbd> |
-| Image → Adjust | Brightness/Contrast | <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>C</kbd> |
+| Image → Adjust | Brightness/Contrast… | <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>C</kbd> |
 | Image → Adjust | Threshold… (preview and result are napari Labels) | <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>T</kbd> |
 | Image → Adjust | Enhance Contrast | <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>E</kbd> |
+| Image → Lookup Tables | Grays, Fire, Cyan Hot, HiLo, channel colors… | |
 | Image | Properties… (axis meanings, steps, units) | <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>P</kbd> |
 | Image → Color | Split Channels / Merge Channels / Channels Tool… | — / — / <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>Z</kbd> |
 | Image | Show Info | <kbd>Ctrl</kbd>+<kbd>I</kbd> |
 | Image | Crop | <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>X</kbd> |
-| Image | Duplicate | <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>D</kbd> |
+| Image | Duplicate… | <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>D</kbd> |
+| Image → Stacks | Z Project… / Make Substack… / Bin… | |
 | Process → Filters | Gaussian Blur…, Median… (live preview, result as new layer) | |
 | Process | Subtract Background… (rolling ball, light background) | |
 | Image → Stacks | Plot Z-axis Profile | <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>Y</kbd> |
 | Analyze | Measure | <kbd>Ctrl</kbd>+<kbd>M</kbd> |
-| Process | ΔF/F…, Bleach Correction…, Image Calculator… | |
+| Process | ΔF/F…, Bleach Correction…, Motion Correction…, Image Calculator… | |
+| Process → Labels | Watershed…, Fill Holes | |
 | Image → Stacks | Kymograph / Reslice… (from a line or path) | |
 | Analyze | Histogram / Set Scale… | <kbd>Ctrl</kbd>+<kbd>H</kbd> / — |
 | File | Open Recent | |
@@ -324,6 +345,7 @@ src/tiki/
 ├── nd.py        planes / volumes / whole-stack blocks for nD commands
 ├── layer_select.py layer dropdown used by the dialogs
 ├── widgets.py   Results and profile windows
+├── contrast.py  Brightness/Contrast dialog and lookup tables
 ├── threshold.py Threshold dialog producing napari Labels
 ├── rois.py      ROI model, ImageJ .roi/.zip and Labels conversion
 ├── roi_manager.py ROI Manager window
@@ -335,7 +357,6 @@ src/tiki/
 
 ## Roadmap
 
-- A dedicated Brightness/Contrast dialog
 - Better OME and acquisition metadata handling
 - Calibration-aware measurements in physical units
 - More everyday ImageJ stack and image commands

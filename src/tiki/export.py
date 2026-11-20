@@ -31,6 +31,8 @@ def _loader_line(var: str, path: str) -> str:
         return f"{var} = np.load(r'{path}', mmap_mode='r')"
     if path.lower().endswith(('.tif', '.tiff')):
         return f"{var} = tifffile.imread(r'{path}')  # or tifffile.memmap(...) for uncompressed files"
+    if path.lower().endswith('.czi'):
+        return f"import czifile; {var} = czifile.imread(r'{path}')"
     return f"{var} = skimage.io.imread(r'{path}')"
 
 

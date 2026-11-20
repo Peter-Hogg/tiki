@@ -25,7 +25,13 @@ MEMORY_FILE = Path.home() / '.config' / 'tiki' / 'axes_memory.json'
 # rarer codes stay unknown: better to ask than to call a movie a z-stack.
 TIFF_ROLES = {'T': 'T', 'Z': 'Z', 'C': 'C', 'Y': 'Y', 'X': 'X'}
 UNIT_ALIASES = {'micron': 'µm', 'microns': 'µm', 'um': 'µm', 'µm': 'µm', '\\u00B5m': 'µm',
-                'nm': 'nm', 'mm': 'mm', 'sec': 's', 's': 's', 'ms': 'ms', 'min': 'min'}
+                'micrometer': 'µm', 'micrometers': 'µm', 'micrometre': 'µm',
+                'nm': 'nm', 'nanometer': 'nm', 'nanometers': 'nm',
+                'mm': 'mm', 'millimeter': 'mm', 'millimeters': 'mm',
+                'm': 'm', 'meter': 'm', 'meters': 'm', 'metre': 'm',
+                'sec': 's', 's': 's', 'second': 's', 'seconds': 's',
+                'ms': 'ms', 'millisecond': 'ms', 'milliseconds': 'ms',
+                'min': 'min', 'minute': 'min', 'minutes': 'min'}
 
 
 @dataclass
@@ -274,6 +280,112 @@ def from_tiff(tf, data_shape: tuple) -> AxesInfo:
     if info.problems(tuple(a.size for a in axes)):
         fallback = guess(data_shape)
         fallback.notes = notes + ['file axes unusable: ' + '; '.join(info.problems())]
+        return fallback
+    return info
+
+
+# -------------------------------------------------------------------- CZI
+
+def _normalize_czi_step(role: str, step: float, unit: str | None) -> tuple[float, str | None]:
+    """Convert CZI SI meter distances to microscopy units (µm / nm)."""
+    u = _unit(unit)
+    if role in ('X', 'Y', 'Z') and (u == 'm' or (u is None and 0 < step < 1e-2)):
+        um = step * 1e6
+        if 0 < um < 0.01:
+            return um * 1e3, 'nm'
+        return um, 'µm'
+    return step, u or DEFAULT_UNITS.get(role)
+
+
+def from_czi_xml(xml: str) -> tuple[dict[str, tuple[float, str]], list[str]]:
+    """Extract ``({role: (step, unit)}, [channel_colors])`` from Zeiss CZI XML."""
+    import xml.etree.ElementTree as ET
+
+    steps: dict[str, tuple[float, str]] = {}
+    colors: list[str] = []
+    if not xml:
+        return steps, colors
+    try:
+        root = ET.fromstring(xml)
+    except ET.ParseError:
+        return steps, colors
+
+    for dist in root.findall('.//Scaling/Items/Distance'):
+        axis_id = (dist.get('Id') or '').upper()
+        val_el = dist.find('Value')
+        if axis_id in ('X', 'Y', 'Z') and val_el is not None and val_el.text:
+            try:
+                val = float(val_el.text)
+                if val > 0:
+                    steps[axis_id] = _normalize_czi_step(axis_id, val, 'm')
+            except ValueError:
+                pass
+
+    for path in ('.//Dimensions/T/StartTime', './/Dimensions/T/Positions/Interval/Increment', './/TimeIncrement'):
+        el = root.find(path)
+        if path.endswith('StartTime') or el is None or not el.text:
+            continue
+        try:
+            val = float(el.text)
+            if val > 0:
+                steps['T'] = (val, 's')
+                break
+        except ValueError:
+            pass
+
+    for ch in root.findall('.//Dimensions/Channels/Channel'):
+        color_el = ch.find('Color')
+        color = (color_el.text if color_el is not None and color_el.text else ch.get('Color') or '').strip()
+        if color:
+            colors.append(color)
+    if not colors:
+        for ch in root.findall('.//DisplaySetting/Channels/Channel'):
+            color_el = ch.find('Color')
+            color = (color_el.text if color_el is not None and color_el.text else '').strip()
+            if color:
+                colors.append(color)
+    return steps, colors
+
+
+def from_czi(
+    codes: str,
+    data_shape: tuple,
+    coord_scales: dict | None = None,
+    coord_units: dict | None = None,
+    xml: str = '',
+) -> AxesInfo:
+    """AxesInfo from a CZI scene's axis codes, coordinate scales/units and XML."""
+    notes: list[str] = []
+    if len(codes) != len(data_shape):
+        info = guess(data_shape)
+        info.notes.append(f'CZI axes {codes} do not match data shape {data_shape}')
+        return info
+    if codes and codes[-1] in ('S', '0') and data_shape[-1] in (3, 4):
+        codes, data_shape = codes[:-1], data_shape[:-1]
+    axes = [Axis(TIFF_ROLES.get(c, '?'), int(n)) for c, n in zip(codes, data_shape)]
+    info = AxesInfo(axes, 'CZI metadata', True, notes)
+
+    xml_steps, _ = from_czi_xml(xml)
+    scales = coord_scales or {}
+    units = coord_units or {}
+    for role in ('X', 'Y', 'Z', 'T'):
+        idx = info.index(role)
+        if idx is None:
+            continue
+        if role in scales and scales[role] is not None and float(scales[role]) > 0:
+            step, unit = _normalize_czi_step(role, float(scales[role]), units.get(role))
+            axes[idx].step, axes[idx].unit = step, unit
+        elif role in xml_steps:
+            axes[idx].step, axes[idx].unit = xml_steps[role]
+
+    if '?' in info.roles[:-2]:
+        info.confident = False
+        notes.append(f'CZI says {codes}: stack axis meaning unknown')
+    if info.index('Z') is not None and axes[info.index('Z')].step is None:
+        notes.append('z-step not in file')
+    if info.problems(tuple(a.size for a in axes)):
+        fallback = guess(data_shape)
+        fallback.notes = notes + ['CZI axes unusable: ' + '; '.join(info.problems())]
         return fallback
     return info
 
