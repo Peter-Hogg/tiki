@@ -161,7 +161,18 @@ class Tiki(QMainWindow):
         self._add(imp, 'OME-Zarr (.zarr)…', lambda: self._process('open_zarr_dialog'))
         samples = m.addMenu('Open Samples')
         self._add(samples, 'Synthetic movie', self.open_sample_movie)
-        self._add(samples, 'Blobs', lambda: self._open_skimage('blobs'))
+        samples.addSeparator()
+        self._add(samples, 'Cells 3D (2-ch Z-stack)', lambda: self._open_skimage('cells3d'))
+        self._add(samples, 'Human Mitosis (2D nuclei)', lambda: self._open_skimage('human_mitosis'))
+        self._add(samples, 'Mouse Kidney (3-ch Z-stack)', lambda: self._open_skimage('kidney'))
+        self._add(samples, 'Lily Confocal (4-ch)', lambda: self._open_skimage('lily'))
+        self._add(samples, 'Brain MRI (Z-stack)', lambda: self._open_skimage('brain'))
+        self._add(samples, 'Cell (brightfield 2D)', lambda: self._open_skimage('cell'))
+        self._add(samples, 'Immunohistochemistry (RGB)', lambda: self._open_skimage('immunohistochemistry'))
+        self._add(samples, 'Retina (RGB)', lambda: self._open_skimage('retina'))
+        self._add(samples, 'Microaneurysms (2D)', lambda: self._open_skimage('microaneurysms'))
+        samples.addSeparator()
+        self._add(samples, 'Blobs', lambda: self._open_skimage('binary_blobs'))
         self._add(samples, 'Camera', lambda: self._open_skimage('camera'))
         m.addSeparator()
         self._add(m, 'Close', self.close_active, 'Ctrl+W')
@@ -647,7 +658,77 @@ class Tiki(QMainWindow):
     def _open_skimage(self, name: str) -> None:
         from skimage import data
 
-        self.open_data(getattr(data, name)(), f'{name}.tif')
+        loader_name = 'binary_blobs' if name == 'blobs' else name
+        loader = getattr(data, loader_name, None)
+        if loader is None:
+            raise TikiError(f'Sample dataset {name!r} is not available in this scikit-image version.')
+        self.status(f'Loading sample: {name}…')
+        QApplication.processEvents()
+        try:
+            arr = loader()
+        except Exception as exc:
+            raise TikiError(
+                f'Could not load sample {name!r}.\n\n'
+                f'Larger scikit-image biology datasets download once from the internet (and are cached locally).\n\n'
+                f'Details: {exc}'
+            ) from exc
+
+        kw: dict = {}
+        # Provide physical axes / channel order for 3D & multichannel biology samples
+        if loader_name == 'cells3d' and arr.ndim == 4:
+            # (60, 2, 256, 256) ZCYX — 0.29 µm Z, 0.26 µm XY (Allen Institute)
+            kw['axes'] = axes_mod.AxesInfo(
+                [
+                    axes_mod.Axis('Z', arr.shape[0], 0.29, 'µm'),
+                    axes_mod.Axis('C', arr.shape[1]),
+                    axes_mod.Axis('Y', arr.shape[2], 0.26, 'µm'),
+                    axes_mod.Axis('X', arr.shape[3], 0.26, 'µm'),
+                ],
+                source='skimage',
+                confident=True,
+            )
+        elif loader_name == 'kidney' and arr.ndim == 4:
+            # (16, 512, 512, 3) ZYXC -> (16, 3, 512, 512) ZCYX so Split Channels works
+            arr = np.moveaxis(arr, -1, 1)
+            kw['axes'] = axes_mod.AxesInfo(
+                [
+                    axes_mod.Axis('Z', arr.shape[0]),
+                    axes_mod.Axis('C', arr.shape[1]),
+                    axes_mod.Axis('Y', arr.shape[2]),
+                    axes_mod.Axis('X', arr.shape[3]),
+                ],
+                source='skimage',
+                confident=True,
+            )
+        elif loader_name == 'lily' and arr.ndim == 3 and arr.shape[-1] == 4:
+            # (922, 922, 4) YXC -> (4, 922, 922) CYX (4-channel confocal)
+            arr = np.moveaxis(arr, -1, 0)
+            kw['axes'] = axes_mod.AxesInfo(
+                [
+                    axes_mod.Axis('C', arr.shape[0]),
+                    axes_mod.Axis('Y', arr.shape[1]),
+                    axes_mod.Axis('X', arr.shape[2]),
+                ],
+                source='skimage',
+                confident=True,
+            )
+        elif loader_name == 'brain' and arr.ndim == 3:
+            kw['axes'] = axes_mod.AxesInfo(
+                [
+                    axes_mod.Axis('Z', arr.shape[0]),
+                    axes_mod.Axis('Y', arr.shape[1]),
+                    axes_mod.Axis('X', arr.shape[2]),
+                ],
+                source='skimage',
+                confident=True,
+            )
+        elif loader_name == 'binary_blobs':
+            arr = (arr.astype(np.uint8)) * 255
+
+        self.open_data(arr, f'{loader_name}.tif', **kw)
+        if loader_name in ('cells3d', 'kidney', 'lily'):
+            self.split_channels()
+        self.status(f'Opened sample {loader_name} ({arr.shape}, {arr.dtype})')
 
     def close_active(self) -> None:
         viewer = self.windows.active

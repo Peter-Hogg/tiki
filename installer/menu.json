@@ -1,0 +1,38 @@
+{
+  "$schema": "https://json-schema.org/draft-07/schema",
+  "menu_name": "TIKI",
+  "menu_items": [
+    {
+      "name": "TIKI",
+      "description": "TIKI Is Kinda ImageJ: an ImageJ-style toolbar for napari",
+      "command": ["{{ PREFIX }}/bin/tiki"],
+      "icon": "{{ PREFIX }}/Menu/tiki.png",
+      "platforms": {
+        "win": {
+          "command": ["{{ PREFIX }}/pythonw.exe", "-m", "tiki"],
+          "icon": "{{ PREFIX }}/Menu/tiki.ico",
+          "desktop": true,
+          "quicklaunch": false,
+          "terminal": false
+        },
+        "osx": {
+          "command": ["{{ PREFIX }}/bin/tiki"],
+          "icon": "{{ PREFIX }}/Menu/tiki.icns",
+          "CFBundleIdentifier": "io.github.peterhogg.tiki",
+          "CFBundleName": "TIKI",
+          "CFBundleDisplayName": "TIKI",
+          "LSApplicationCategoryType": "public.app-category.education"
+        },
+        "linux": {
+          "command": ["{{ PREFIX }}/bin/tiki", "%F"],
+          "icon": "{{ PREFIX }}/Menu/tiki.png",
+          "Categories": ["Science", "Biology", "DataVisualization"],
+          "MimeType": ["image/tiff", "image/png", "image/jpeg"],
+          "StartupWMClass": "tiki",
+          "StartupNotify": true,
+          "Terminal": false
+        }
+      }
+    }
+  ]
+}

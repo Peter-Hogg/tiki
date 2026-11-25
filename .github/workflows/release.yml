@@ -1,0 +1,99 @@
+name: Build Standalone Installers
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            installer_ext: sh
+          - os: macos-14
+            installer_ext: pkg
+          - os: windows-latest
+            installer_ext: exe
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: conda-forge/miniforge-setup@v2
+        with:
+          conda-version: latest
+
+      - name: Install constructor & build helpers
+        shell: bash -el {0}
+        run: |
+          conda install -y -c conda-forge constructor pillow pip
+
+      - name: Determine version
+        id: ver
+        shell: bash -el {0}
+        run: |
+          if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
+            VER="${GITHUB_REF_NAME#v}"
+          else
+            VER=$(python -c "import tomllib; print(tomllib.load(open('pyproject.toml','rb'))['project']['version'])")
+          fi
+          echo "version=${VER}" >> "$GITHUB_OUTPUT"
+          sed -i.bak "s/__VERSION__/${VER}/g" installer/construct.yaml && rm -f installer/construct.yaml.bak
+
+      - name: Generate OS icons
+        shell: bash -el {0}
+        run: python installer/build_icons.py
+
+      - name: Build offline wheelhouse for TIKI & microscopy readers
+        shell: bash -el {0}
+        run: |
+          mkdir -p installer/wheels
+          python -m pip wheel --no-deps . -w installer/wheels
+          python -m pip wheel --no-deps czifile roifile nd2 readlif -w installer/wheels
+          ls -la installer/wheels
+
+      - name: Run constructor
+        shell: bash -el {0}
+        run: |
+          mkdir -p dist
+          constructor installer/ --output-dir dist/
+          ls -lh dist/
+
+      - name: Upload installer artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: TIKI-installer-${{ matrix.os }}
+          path: dist/TIKI-*.${{ matrix.installer_ext }}
+
+  release:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          body: |
+            ## TIKI Standalone Installers (No Terminal Required)
+
+            Download the installer for your OS below and double-click to install:
+            - **Windows:** `TIKI-*-Windows-x86_64.exe` *(if SmartScreen prompts, click **More info → Run anyway**)*
+            - **macOS (Apple Silicon):** `TIKI-*-MacOSX-arm64.pkg` *(if Gatekeeper prompts on first launch, right-click **TIKI.app → Open**)*
+            - **Linux:** `TIKI-*-Linux-x86_64.sh` *(run `bash TIKI-*-Linux-x86_64.sh`)*
+
+            Includes Python 3.12, napari (PyQt6), all microscopy readers (`.tif`, `.czi`, `.nd2`, `.lif`, `.zarr`, `.h5`), and built-in MP4/GIF movie export.
+          files: artifacts/*

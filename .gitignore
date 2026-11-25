@@ -8,3 +8,7 @@ build/
 .coverage
 htmlcov/
 sample_data/
+installer/wheels/
+installer/tiki.png
+installer/tiki.ico
+installer/tiki.icns

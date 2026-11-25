@@ -1368,3 +1368,16 @@ def test_stack_to_hyperstack_dialog_on_dask_sequence(tiki, accept_dialogs):
     before = len(tiki.windows.viewers)
     tiki.split_channels()
     assert len(tiki.windows.viewers) == before + 2
+
+
+def test_open_skimage_biology_samples(tiki):
+    # Test bundled offline biology samples + Blobs alias
+    tiki._open_skimage('cell')
+    assert 'cell.tif' in tiki.windows.active.title
+    assert tiki.windows.active.layers[0].data.ndim == 2
+
+    tiki._open_skimage('immunohistochemistry')
+    assert tiki.windows.active.layers[0].rgb
+
+    tiki._open_skimage('blobs')
+    assert tiki.windows.active.layers[0].data.dtype == np.uint8

@@ -1,0 +1,43 @@
+name: TIKI
+version: __VERSION__
+
+channels:
+  - conda-forge
+
+specs:
+  - python 3.12.*
+  - pip
+  - menuinst >=2.1
+  - napari >=0.9
+  - pyqt >=6
+  - numpy
+  - scipy
+  - scikit-image
+  - matplotlib
+  - tifffile
+  - imagecodecs
+  - dask-core
+  - pillow
+  - pooch
+  - imageio
+  - imageio-ffmpeg
+  - h5py
+  - zarr
+
+extra_files:
+  - wheels/: wheels/
+  - menu.json: Menu/menu.json
+  - tiki.png: Menu/tiki.png
+  - tiki.ico: Menu/tiki.ico
+  - tiki.icns: Menu/tiki.icns
+
+post_install: post_install.sh   # [unix]
+post_install: post_install.bat  # [win]
+
+license_file: ../LICENSE
+welcome_image: tiki.png         # [win]
+icon_image: tiki.png            # [win]
+initialize_by_default: false
+register_python_default: false
+write_condarc: false
+keep_pkgs: false
