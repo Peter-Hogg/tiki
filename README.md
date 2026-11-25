@@ -216,6 +216,22 @@ pixel value.
   cells × frames `.npy` (plus names) or CSV
 - ROI layers are 2D, so a selection stays in place while you scroll frames
 
+### Publication exports & orthogonal views
+
+- **File ▸ Export ▸ Snapshot (PNG / SVG)…** and **Analyze ▸ Tools ▸ Scale Bar…**:
+  flatten visible channels with current LUTs and contrast limits, optional ROI
+  overlays/labels, and a calibrated burned-in scale bar to high-DPI PNG or
+  crisp vector SVG
+- **File ▸ Export ▸ Export Movie (MP4 / GIF / AVI)…**: render T or Z stacks
+  with current LUTs, configurable playback FPS, optional burned-in scale bar,
+  timestamps (`t = 1.5 s`), and ROI overlays (GIF works everywhere; MP4/AVI
+  uses `ffmpeg` or `imageio-ffmpeg`)
+- **Image ▸ Stacks ▸ Make Montage…**: tile slices or frames into a figure grid
+  (greyscale or flattened RGB) with configurable rows, columns, step and border
+- **Image ▸ Stacks ▸ Orthogonal Views** (<kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>H</kbd>):
+  linked XY / XZ / YZ slice views with physical voxel aspect ratios and
+  click/drag crosshairs synced to the viewer's Z slider
+
 ### Filters
 
 - Gaussian Blur, Median and rolling-ball Subtract Background with a live

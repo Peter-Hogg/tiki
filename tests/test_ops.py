@@ -465,3 +465,31 @@ def test_mask_stats_extended_measurements():
     assert row['Area'] == pytest.approx(20 * 0.25)
     assert row['Median'] == pytest.approx(np.median(plane[mask]))
     assert 'X' in row and 'Y' in row and 'Perim.' in row and 'Circ.' in row and 'Feret' in row and 'Solidity' in row
+
+
+def test_make_montage_and_orthogonal_slices():
+    stack = np.arange(6 * 4 * 5, dtype=np.uint16).reshape(6, 4, 5)
+    m = ops.make_montage(stack, cols=3, rows=2, border=1, border_value=999)
+    assert m.shape == (2 * 4 + 1, 3 * 5 + 2) and m.dtype == np.uint16
+    np.testing.assert_array_equal(m[:4, :5], stack[0])
+    np.testing.assert_array_equal(m[5:9, 12:17], stack[5])
+    assert m[4, 0] == 999  # horizontal border
+
+    m_sub = ops.make_montage(stack, indices=[0, 2, 4], cols=2, border=0)
+    assert m_sub.shape == (8, 10)
+    np.testing.assert_array_equal(m_sub[4:8, :5], stack[4])
+    assert m_sub[4:8, 5:10].max() == 0  # trailing empty cell
+
+    rgb_stack = np.zeros((4, 3, 4, 3), dtype=np.uint8)
+    rgb_stack[3, :, :, 0] = 200
+    m_rgb = ops.make_montage(rgb_stack, cols=2, rows=2, border=1, border_value=255, rgb=True)
+    assert m_rgb.shape == (7, 9, 3) and m_rgb[4:7, 5:9, 0].min() == 200 and m_rgb[3, 0, 0] == 255
+
+    xy, xz, yz = ops.orthogonal_slices(stack, z=2, y=1, x=3)
+    assert xy.shape == (4, 5) and xz.shape == (6, 5) and yz.shape == (4, 6)
+    np.testing.assert_array_equal(xy, stack[2])
+    np.testing.assert_array_equal(xz, stack[:, 1, :])
+    np.testing.assert_array_equal(yz, stack[:, :, 3].T)
+    # Out-of-bounds coordinates clamp cleanly
+    xy2, _, _ = ops.orthogonal_slices(stack, z=99, y=-5, x=99)
+    np.testing.assert_array_equal(xy2, stack[-1])

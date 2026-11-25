@@ -167,6 +167,9 @@ class Tiki(QMainWindow):
         self._add(m, 'Close All', self.windows_close_all, 'Ctrl+Shift+W')
         self._add(m, 'Save As TIFF…', self.save_as, 'Ctrl+S')
         export = m.addMenu('Export')
+        self._add(export, 'Snapshot (PNG / SVG)…', lambda: self._publish('snapshot_dialog'))
+        self._add(export, 'Export Movie (MP4 / GIF / AVI)…', lambda: self._publish('export_movie_dialog'))
+        export.addSeparator()
         self._add(export, 'Send to Notebook…', self.send_to_notebook, 'Ctrl+Shift+N')
         m.addSeparator()
         self._add(m, 'Quit', self.close, 'Ctrl+Q')
@@ -216,6 +219,8 @@ class Tiki(QMainWindow):
         stacks = m.addMenu('Stacks')
         self._add(stacks, 'Z Project…', self.z_project_dialog)
         self._add(stacks, 'Make Substack…', lambda: self._process('duplicate_dialog', substack_only=True))
+        self._add(stacks, 'Make Montage…', lambda: self._publish('make_montage_dialog'))
+        self._add(stacks, 'Orthogonal Views', lambda: self._publish('orthogonal_views'), 'Ctrl+Shift+H')
         self._add(stacks, 'Bin…', lambda: self._process('bin_dialog'))
         self._add(stacks, 'Plot Z-axis Profile', self.plot_z_profile, 'Ctrl+Shift+Y')
         self._add(stacks, 'Kymograph / Reslice…', lambda: self._process('kymograph_dialog'))
@@ -253,6 +258,8 @@ class Tiki(QMainWindow):
         tools = m.addMenu('Tools')
         self._add(tools, 'ROI Manager…', self.show_roi_manager)
         self._add(tools, 'Add to Manager', self.add_to_manager, 'Ctrl+T')
+        tools.addSeparator()
+        self._add(tools, 'Scale Bar…', lambda: self._publish('snapshot_dialog', focus_scale_bar=True))
 
         m = mb.addMenu('&Plugins')
         macros = m.addMenu('Macros')
@@ -1492,6 +1499,11 @@ class Tiki(QMainWindow):
         from . import process
 
         return getattr(process, name)(self, **kwargs)
+
+    def _publish(self, name: str, **kwargs):
+        from . import publish
+
+        return getattr(publish, name)(self, **kwargs)
 
     def keep_window(self, win) -> None:
         """Keep a floating plot alive until it is closed (and close it with TIKI)."""

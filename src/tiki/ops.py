@@ -1605,3 +1605,97 @@ def composite_rgb(
         if progress is not None and progress(n + 1, len(combos)) is False:
             break
     return out
+
+
+# ------------------------------------------------ montage & orthogonal views
+
+def make_montage(
+    data,
+    axis: int = 0,
+    indices=None,
+    cols: int | None = None,
+    rows: int | None = None,
+    border: int = 0,
+    border_value: float = 0,
+    rgb: bool = False,
+) -> np.ndarray:
+    """Tile 2D planes along ``axis`` into a single grid image.
+
+    ``data`` should be 3D ``(N, Y, X)`` (greyscale) or 4D ``(N, Y, X, 3)`` when
+    ``rgb=True`` (any leading axis may be selected via ``axis``).
+    """
+    arr = np.asarray(data)
+    expected_ndim = 4 if rgb else 3
+    if arr.ndim != expected_ndim:
+        raise ValueError(f'expected {expected_ndim}D stack for montage, got {arr.ndim}D')
+    spatial_axes = 3 if rgb else 2
+    axis = axis % (arr.ndim - spatial_axes)
+    if axis != 0:
+        arr = np.moveaxis(arr, axis, 0)
+
+    n_total = arr.shape[0]
+    if indices is None:
+        sel = list(range(n_total))
+    else:
+        sel = [int(i) for i in indices]
+    if not sel:
+        raise ValueError('no slices selected for montage')
+    if min(sel) < 0 or max(sel) >= n_total:
+        raise ValueError(f'slice index out of range 0..{n_total - 1}')
+
+    n = len(sel)
+    border = max(int(border), 0)
+    if cols is None and rows is None:
+        cols = int(np.ceil(np.sqrt(n)))
+        rows = int(np.ceil(n / cols))
+    elif cols is None:
+        rows = max(int(rows), 1)
+        cols = int(np.ceil(n / rows))
+    elif rows is None:
+        cols = max(int(cols), 1)
+        rows = int(np.ceil(n / cols))
+    else:
+        cols = max(int(cols), 1)
+        rows = max(int(rows), 1)
+
+    h, w = arr.shape[1], arr.shape[2]
+    out_h = rows * h + max(rows - 1, 0) * border
+    out_w = cols * w + max(cols - 1, 0) * border
+    out_shape = (out_h, out_w, arr.shape[3]) if rgb else (out_h, out_w)
+    out = np.full(out_shape, border_value, dtype=arr.dtype)
+
+    for k, idx in enumerate(sel[: rows * cols]):
+        r, c = divmod(k, cols)
+        y0 = r * (h + border)
+        x0 = c * (w + border)
+        out[y0 : y0 + h, x0 : x0 + w] = arr[idx]
+    return out
+
+
+def orthogonal_slices(
+    data,
+    z: int,
+    y: int,
+    x: int,
+    rgb: bool = False,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Return ``(xy, xz, yz)`` orthogonal planes through ``(z, y, x)`` of a 3D volume.
+
+    Orientations match ImageJ Orthogonal Views:
+    - ``xy``: shape ``(Y, X[, C])`` at slice ``z``
+    - ``xz``: shape ``(Z, X[, C])`` at row ``y`` (aligns below ``xy``)
+    - ``yz``: shape ``(Y, Z[, C])`` at column ``x`` (aligns right of ``xy``)
+    """
+    arr = np.asarray(data)
+    expected_ndim = 4 if rgb else 3
+    if arr.ndim != expected_ndim:
+        raise ValueError(f'expected {expected_ndim}D volume for orthogonal views, got {arr.ndim}D')
+    nz, ny, nx = arr.shape[:3]
+    z = int(np.clip(z, 0, nz - 1))
+    y = int(np.clip(y, 0, ny - 1))
+    x = int(np.clip(x, 0, nx - 1))
+    xy = arr[z]
+    xz = arr[:, y, :]
+    yz_raw = arr[:, :, x]  # (Z, Y[, C])
+    yz = np.swapaxes(yz_raw, 0, 1)  # (Y, Z[, C])
+    return xy, xz, yz

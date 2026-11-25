@@ -1186,3 +1186,65 @@ def test_set_measurements_and_unit_headers(tiki, accept_dialogs):
     assert 'Median' in row and 'X' in row and 'Feret' in row
     headers = [tiki.results.table.horizontalHeaderItem(c).text() for c in range(tiki.results.table.columnCount())]
     assert 'Area (µm²)' in headers and 'X (µm)' in headers
+
+
+def test_snapshot_png_svg_and_scale_bar(tiki, tmp_path):
+    from PIL import Image as PILImage
+
+    from tiki import publish
+
+    arr = np.linspace(0, 255, 40 * 50, dtype=np.uint8).reshape(40, 50)
+    v = _open_with_axes(tiki, arr, 'YX', 'snap.tif', {'Y': 0.5, 'X': 0.5})
+    _rect(v.layers[roi.ROI_NAME], 5, 20, 10, 30)
+
+    png = tmp_path / 'out.png'
+    svg = tmp_path / 'out.svg'
+    publish.save_snapshot(v, png, dpi=100, scale_bar=True, show_rois=True)
+    publish.save_snapshot(v, svg, scale_bar=True, show_rois=True, timestamp='t = 1.0 s')
+    assert png.exists() and png.stat().st_size > 100
+    assert svg.exists() and '<svg' in svg.read_text() and 'µm' in svg.read_text()
+    with PILImage.open(png) as im:
+        assert im.size[0] > 0 and im.size[1] > 0
+
+
+def test_export_movie_gif_and_mp4(tiki, tmp_path):
+    from PIL import Image as PILImage
+
+    from tiki import publish
+
+    stack = np.zeros((6, 24, 30), dtype=np.uint8)
+    for k in range(6):
+        stack[k, 8:16, 4 + k * 3 : 10 + k * 3] = 220
+    v = _open_with_axes(tiki, stack, 'TYX', 'mov.tif', {'T': 0.1, 'Y': 0.5, 'X': 0.5})
+
+    gif = tmp_path / 'movie.gif'
+    publish.export_movie(v, gif, axis=0, indices=[0, 2, 4], fps=10.0, scale_bar=True, show_timestamp=True)
+    assert gif.exists() and gif.stat().st_size > 100
+    with PILImage.open(gif) as im:
+        assert getattr(im, 'n_frames', 1) == 3
+
+    if publish.find_ffmpeg() is not None:
+        mp4 = tmp_path / 'movie.mp4'
+        publish.export_movie(v, mp4, axis=0, indices=[0, 1, 2, 3], fps=10.0, scale_bar=False, show_timestamp=False)
+        assert mp4.exists() and mp4.stat().st_size > 100
+
+
+def test_make_montage_dialog_and_orthogonal_views(tiki, accept_dialogs):
+    from tiki import publish
+
+    vol = np.arange(8 * 20 * 24, dtype=np.uint16).reshape(8, 20, 24)
+    v = _open_with_axes(tiki, vol, 'ZYX', 'zstack.tif', {'Z': 2.0, 'Y': 0.5, 'X': 0.5})
+
+    accept_dialogs['configure'] = None
+    publish.make_montage_dialog(tiki)
+    montage_v = tiki.windows.active
+    assert montage_v is not v and 'Montage' in montage_v.title
+    assert montage_v.layers[0].data.ndim == 2
+
+    tiki.windows.activate(v)
+    ortho = publish.orthogonal_views(tiki)
+    assert ortho in tiki.profiles
+    ortho.set_coords(z=5, y=10, x=12)
+    assert v.dims.current_step[0] == 5
+    assert 'Z=5' in ortho.coord_label.text() and 'µm' in ortho.coord_label.text()
+    ortho.close()
