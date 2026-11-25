@@ -1699,3 +1699,59 @@ def orthogonal_slices(
     yz_raw = arr[:, :, x]  # (Z, Y[, C])
     yz = np.swapaxes(yz_raw, 0, 1)  # (Y, Z[, C])
     return xy, xz, yz
+
+
+# ---------------------------------------------------- stack to hyperstack
+
+HYPERSTACK_ORDERS: dict[str, tuple[str, str, str]] = {
+    # ImageJ order (fastest -> slowest) : C-order leading axes (slowest -> fastest)
+    'xyczt': ('T', 'Z', 'C'),
+    'xyctz': ('Z', 'T', 'C'),
+    'xyzct': ('T', 'C', 'Z'),
+    'xyztc': ('C', 'T', 'Z'),
+    'xytcz': ('Z', 'C', 'T'),
+    'xytzc': ('C', 'Z', 'T'),
+}
+
+
+def stack_to_hyperstack(
+    data,
+    channels: int = 1,
+    slices: int = 1,
+    frames: int = 1,
+    order: str = 'xytzc',
+    rgb: bool = False,
+) -> tuple[object, str]:
+    """Reshape a flat stack into a hyperstack with roles (zero-copy for NumPy & Dask).
+
+    ``order`` uses ImageJ's fastest-to-slowest convention:
+    - ``'xytzc'`` / ``'xyztc'``: channel blocks ``[ch1: 1..N, ch2: 1..N]``
+    - ``'xyczt'`` / ``'xyctz'``: interleaved channels ``[ch1_1, ch2_1, ch1_2, ch2_2, ...]``
+
+    Returns ``(reshaped_data, roles)`` with singleton leading axes omitted (e.g. ``'CTYX'``).
+    """
+    key = order.lower().strip()
+    if key not in HYPERSTACK_ORDERS:
+        raise ValueError(f'unknown hyperstack order {order!r}')
+    c, z, t = int(channels), int(slices), int(frames)
+    if c < 1 or z < 1 or t < 1:
+        raise ValueError('channels, slices, and frames must each be >= 1')
+
+    spatial_ndim = 3 if rgb else 2
+    if data.ndim < spatial_ndim + 1:
+        raise ValueError('need a stack (at least 3D) to convert to a hyperstack')
+    lead_shape = data.shape[:-spatial_ndim]
+    spatial_shape = data.shape[-spatial_ndim:]
+    n_total = int(np.prod(lead_shape))
+    if c * z * t != n_total:
+        raise ValueError(f'channels × slices × frames ({c}×{z}×{t}={c * z * t}) must equal total planes ({n_total})')
+
+    sizes = {'C': c, 'Z': z, 'T': t}
+    c_order_roles = HYPERSTACK_ORDERS[key]
+    kept_roles = [r for r in c_order_roles if sizes[r] > 1]
+    if not kept_roles:
+        kept_roles = ['T']
+    new_shape = tuple(sizes[r] for r in kept_roles) + spatial_shape
+    reshaped = data.reshape(new_shape)
+    roles = ''.join(kept_roles) + 'YX'
+    return reshaped, roles

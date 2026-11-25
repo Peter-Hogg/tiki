@@ -1331,3 +1331,40 @@ def test_python_console(tiki):
     con._complete()
     assert con.input.text().startswith('ops.make_montage')
     con.close()
+
+
+def test_cursor_readout_on_dask_array(tiki):
+    import dask.array as da
+
+    arr = da.from_array(np.arange(16, dtype=np.uint16).reshape(4, 4), chunks=(2, 2))
+    v = tiki.open_data(arr, 'lazy.tif')
+    tiki._message_until = 0.0
+    tiki._on_cursor(v, (2.0, 3.0))
+    assert 'value=11' in tiki.status_label.text()
+
+
+def test_stack_to_hyperstack_dialog_on_dask_sequence(tiki, accept_dialogs):
+    import dask.array as da
+
+    from tiki import process
+
+    # Simulate an image sequence [ch1: 0..4, ch2: 100..104] as a lazy Dask array
+    ch1 = np.arange(5, dtype=np.uint16)[:, None, None] * np.ones((1, 8, 8), dtype=np.uint16)
+    ch2 = (100 + np.arange(5, dtype=np.uint16))[:, None, None] * np.ones((1, 8, 8), dtype=np.uint16)
+    seq = da.from_array(np.concatenate([ch1, ch2], axis=0), chunks=(1, 8, 8))
+    tiki.open_data(seq, 'sequence')
+
+    # Default dialog settings for an even stack: order=xytzc (blocks), C=2, Z=1, T=5, Split channels=True
+    accept_dialogs['configure'] = None
+    v = process.stack_to_hyperstack_dialog(tiki)
+    assert v is not None
+    img_layers = [ly for ly in v.layers if ly.__class__.__name__ == 'Image']
+    assert len(img_layers) == 2
+    assert img_layers[0].data.shape == (5, 8, 8) and img_layers[1].data.shape == (5, 8, 8)
+    assert int(np.asarray(img_layers[0].data[2, 0, 0])) == 2
+    assert int(np.asarray(img_layers[1].data[2, 0, 0])) == 102
+
+    # Calling Split Channels again on already-split channel layers opens each in its own window
+    before = len(tiki.windows.viewers)
+    tiki.split_channels()
+    assert len(tiki.windows.viewers) == before + 2

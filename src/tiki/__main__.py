@@ -60,6 +60,7 @@ def main(argv: list[str] | None = None) -> int:
     # Show a lightweight splash screen before importing napari/scipy so
     # double-clicking the app icon gives immediate visual feedback.
     splash = None
+    splash_mod = None
     if not args.no_splash and os.environ.get('QT_QPA_PLATFORM') != 'offscreen':
         try:
             from qtpy.QtWidgets import QApplication
@@ -78,6 +79,8 @@ def main(argv: list[str] | None = None) -> int:
     from .app import Tiki, install_excepthook
 
     app = get_qapp()
+    if splash_mod is not None:
+        splash_mod.update_splash(splash, app, 'Building toolbar…')
     # match the launcher (StartupWMClass / desktop file) so the dock groups
     # TIKI's windows under its icon instead of an anonymous "napari" entry
     app.setApplicationName(desktop.APP_ID)
@@ -88,8 +91,8 @@ def main(argv: list[str] | None = None) -> int:
     if not args.new_instance:
         tiki._instance_server = instance.listen(tiki)
     tiki.show()
-    if splash is not None:
-        splash.finish(tiki)
+    if splash_mod is not None:
+        splash_mod.finish_splash(splash, app, tiki)
     if args.files:
         tiki.open_dropped(args.files)
     if args.sample:

@@ -1260,3 +1260,106 @@ def open_zarr_dialog(tiki):
         return None
     tiki.open_paths([folder])
     return tiki.windows.active
+
+
+def stack_to_hyperstack_dialog(tiki):
+    """``Image ▸ Stacks ▸ Stack to Hyperstack…``: reshape a flat stack into C / Z / T axes."""
+    _viewer, image = tiki.require_image()
+    spatial_ndim = 3 if image.rgb else 2
+    if image.data.ndim < spatial_ndim + 1:
+        _error('Need a stack (3D or higher) to convert to a hyperstack.')
+    n_total = int(np.prod(image.data.shape[:-spatial_ndim]))
+
+    dlg, form = _form(tiki, 'Stack to Hyperstack')
+    order_box = QComboBox()
+    for label, code in (
+        ('xytzc — channel blocks [1..N, 1..N]', 'xytzc'),
+        ('xyczt — interleaved channels [c1, c2, c1, c2, …]', 'xyczt'),
+        ('xyztc — Z blocks, then T, then C', 'xyztc'),
+        ('xyzct — Z blocks per channel, then T', 'xyzct'),
+        ('xytcz — T blocks per channel, then Z', 'xytcz'),
+        ('xyctz — interleaved channels, Z slowest', 'xyctz'),
+    ):
+        order_box.addItem(label, code)
+
+    default_c = 2 if n_total % 2 == 0 and n_total >= 2 else 1
+    c_spin = QSpinBox(minimum=1, maximum=n_total, value=default_c)
+    z_spin = QSpinBox(minimum=1, maximum=n_total, value=1)
+    t_spin = QSpinBox(minimum=1, maximum=n_total, value=n_total // default_c)
+    check_label = QLabel()
+    split_box = QCheckBox('Split channels immediately')
+    split_box.setChecked(default_c > 1)
+
+    form.addRow('Order:', order_box)
+    form.addRow('Channels (c):', c_spin)
+    form.addRow('Slices (z):', z_spin)
+    form.addRow('Frames (t):', t_spin)
+    form.addRow('', check_label)
+    form.addRow(split_box)
+    buttons = _buttons(dlg, form)
+    ok_btn = buttons.button(QDialogButtonBox.Ok)
+
+    updating = {'busy': False}
+
+    def _refresh_status():
+        c, z, t = c_spin.value(), z_spin.value(), t_spin.value()
+        prod = c * z * t
+        ok = prod == n_total
+        if ok:
+            check_label.setText(f'{c} × {z} × {t} = {prod} planes  ✓')
+            check_label.setStyleSheet('color: #2e7d32;')
+        else:
+            check_label.setText(f'{c} × {z} × {t} = {prod}  (must equal {n_total})')
+            check_label.setStyleSheet('color: #c62828;')
+        if ok_btn is not None:
+            ok_btn.setEnabled(ok)
+        split_box.setEnabled(c > 1)
+
+    def _auto_frames():
+        if updating['busy']:
+            return
+        c, z = c_spin.value(), z_spin.value()
+        if c * z > 0 and n_total % (c * z) == 0:
+            updating['busy'] = True
+            t_spin.setValue(n_total // (c * z))
+            updating['busy'] = False
+        split_box.setChecked(c > 1)
+        _refresh_status()
+
+    c_spin.valueChanged.connect(lambda _: _auto_frames())
+    z_spin.valueChanged.connect(lambda _: _auto_frames())
+    t_spin.valueChanged.connect(lambda _: _refresh_status())
+    _refresh_status()
+
+    if dlg.exec_() != QDialog.Accepted:
+        return None
+
+    c, z, t = c_spin.value(), z_spin.value(), t_spin.value()
+    order = order_box.currentData()
+    try:
+        reshaped, roles = ops.stack_to_hyperstack(image.data, c, z, t, order=order, rgb=bool(image.rgb))
+    except ValueError as exc:
+        _error(str(exc))
+
+    src_info = axes_mod.get(image)
+    ay, ax_x = src_info.axes[-2], src_info.axes[-1]
+    new_axes = []
+    for dim, role in enumerate(roles):
+        size = int(reshaped.shape[dim])
+        if role == 'Y':
+            new_axes.append(axes_mod.Axis('Y', size, ay.step, ay.unit))
+        elif role == 'X':
+            new_axes.append(axes_mod.Axis('X', size, ax_x.step, ax_x.unit))
+        else:
+            new_axes.append(axes_mod.Axis(role, size))
+    info = axes_mod.AxesInfo(axes=new_axes, source='hyperstack', confident=True)
+
+    kw: dict = {'axes': info, 'rgb': bool(image.rgb)}
+    if not image.rgb:
+        kw['colormap'] = image.colormap
+        kw['contrast_limits'] = tuple(image.contrast_limits)
+    v = tiki.open_data(reshaped, f'{image.name} ({roles})', **kw)
+    if split_box.isChecked() and c > 1 and not image.rgb:
+        tiki.split_channels()
+    tiki.status(f'Hyperstack {roles}: {c} ch × {z} z × {t} t ({order})')
+    return v

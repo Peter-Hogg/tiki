@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import time
 from pathlib import Path
 
 from qtpy.QtCore import Qt
@@ -55,10 +56,47 @@ def build_pixmap(version: str = '') -> QPixmap:
     return pm
 
 
-def show_splash(app, version: str = '', message: str = 'Starting TIKI…') -> QSplashScreen:
-    """Create and display the splash screen immediately."""
-    splash = QSplashScreen(build_pixmap(version), Qt.WindowStaysOnTopHint)
-    splash.showMessage(message, Qt.AlignBottom | Qt.AlignLeft, QColor('#a3be8c'))
-    splash.show()
+def _pump(app, ms: int = 80) -> None:
+    """Pump Qt events briefly so X11/Wayland compositors actually map and paint the splash."""
+    end = time.monotonic() + ms / 1000.0
+    while time.monotonic() < end:
+        app.processEvents()
+        time.sleep(0.01)
     app.processEvents()
+
+
+def show_splash(app, version: str = '', message: str = 'Starting TIKI…') -> QSplashScreen:
+    """Create, center, and paint the splash screen before heavy imports block."""
+    flags = Qt.SplashScreen | Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint
+    splash = QSplashScreen(build_pixmap(version), flags)
+    splash._shown_at = time.monotonic()
+    screen = app.primaryScreen()
+    if screen is not None:
+        geo = screen.availableGeometry()
+        splash.move(geo.center() - splash.rect().center())
+    splash.showMessage(f'  {message}', Qt.AlignBottom | Qt.AlignLeft, QColor('#a3be8c'))
+    splash.show()
+    splash.raise_()
+    splash.repaint()
+    _pump(app, ms=80)
     return splash
+
+
+def update_splash(splash: QSplashScreen | None, app, message: str) -> None:
+    """Update the splash status text and flush a repaint."""
+    if splash is None:
+        return
+    splash.showMessage(f'  {message}', Qt.AlignBottom | Qt.AlignLeft, QColor('#a3be8c'))
+    splash.repaint()
+    app.processEvents()
+
+
+def finish_splash(splash: QSplashScreen | None, app, target_window, min_ms: int = 600) -> None:
+    """Close the splash once ``target_window`` is shown (keeping a brief minimum display time)."""
+    if splash is None:
+        return
+    shown_at = getattr(splash, '_shown_at', 0.0)
+    remaining_ms = int(min_ms - (time.monotonic() - shown_at) * 1000)
+    if remaining_ms > 0:
+        _pump(app, ms=remaining_ms)
+    splash.finish(target_window)

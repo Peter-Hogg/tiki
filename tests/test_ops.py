@@ -493,3 +493,27 @@ def test_make_montage_and_orthogonal_slices():
     # Out-of-bounds coordinates clamp cleanly
     xy2, _, _ = ops.orthogonal_slices(stack, z=99, y=-5, x=99)
     np.testing.assert_array_equal(xy2, stack[-1])
+
+
+def test_stack_to_hyperstack_block_and_interleaved():
+    # 2 channels of 5 frames laid out as [ch1: 0..4, ch2: 10..14]
+    ch1 = np.arange(5, dtype=np.uint16)[:, None, None] * np.ones((1, 4, 4), dtype=np.uint16)
+    ch2 = (10 + np.arange(5, dtype=np.uint16))[:, None, None] * np.ones((1, 4, 4), dtype=np.uint16)
+    flat_blocks = np.concatenate([ch1, ch2], axis=0)
+
+    hs, roles = ops.stack_to_hyperstack(flat_blocks, channels=2, slices=1, frames=5, order='xytzc')
+    assert roles == 'CTYX' and hs.shape == (2, 5, 4, 4)
+    np.testing.assert_array_equal(hs[0], ch1)
+    np.testing.assert_array_equal(hs[1], ch2)
+
+    # Interleaved [ch1_0, ch2_0, ch1_1, ch2_1, ...]
+    interleaved = np.empty((10, 4, 4), dtype=np.uint16)
+    interleaved[0::2] = ch1
+    interleaved[1::2] = ch2
+    hs2, roles2 = ops.stack_to_hyperstack(interleaved, channels=2, slices=1, frames=5, order='xyczt')
+    assert roles2 == 'TCYX' and hs2.shape == (5, 2, 4, 4)
+    np.testing.assert_array_equal(hs2[:, 0], ch1)
+    np.testing.assert_array_equal(hs2[:, 1], ch2)
+
+    with pytest.raises(ValueError):
+        ops.stack_to_hyperstack(flat_blocks, channels=3, slices=1, frames=3, order='xytzc')

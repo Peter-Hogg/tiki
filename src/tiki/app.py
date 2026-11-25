@@ -220,6 +220,7 @@ class Tiki(QMainWindow):
         stacks = m.addMenu('Stacks')
         self._add(stacks, 'Z Project…', self.z_project_dialog)
         self._add(stacks, 'Make Substack…', lambda: self._process('duplicate_dialog', substack_only=True))
+        self._add(stacks, 'Stack to Hyperstack…', lambda: self._process('stack_to_hyperstack_dialog'))
         self._add(stacks, 'Make Montage…', lambda: self._publish('make_montage_dialog'))
         self._add(stacks, 'Orthogonal Views', lambda: self._publish('orthogonal_views'), 'Ctrl+Shift+H')
         self._add(stacks, 'Bin…', lambda: self._process('bin_dialog'))
@@ -382,12 +383,12 @@ class Tiki(QMainWindow):
         for d in range(ndim - 2):
             parts.append(f'{roi_mod.axis_name(viewer, image, d)}={idx[d]}')
         if all(0 <= i < s for i, s in zip(idx, shape)):
-            value = image.data[idx]
-            if np.ndim(value) == 0:
+            value = np.asarray(image.data[idx])
+            if value.ndim == 0:
                 v = value.item()
                 parts.append(f'value={v:.4g}' if isinstance(v, float) else f'value={v}')
             else:
-                parts.append('value=' + ','.join(str(x) for x in np.asarray(value).tolist()))
+                parts.append('value=' + ','.join(str(x) for x in value.tolist()))
         self.status_label.setText(f'{viewer.title}   ' + '  '.join(parts))
 
     # ----------------------------------------------------------------- tools
@@ -919,10 +920,21 @@ class Tiki(QMainWindow):
         from . import channels
 
         viewer, image = self.require_image()
+        if axes_mod.get(image).index('C') is None:
+            imgs = [ly for ly in viewer.layers if isinstance(ly, Image) and ly.name not in roi_mod.PREVIEW_NAMES]
+            if len(imgs) > 1:
+                for ly in imgs:
+                    kw: dict = {'axes': axes_mod.get(ly), 'rgb': bool(ly.rgb)}
+                    if not ly.rgb:
+                        kw['colormap'] = ly.colormap
+                        kw['contrast_limits'] = tuple(map(float, ly.contrast_limits))
+                    self.open_data(ly.data, ly.name, **kw)
+                self.status(f'Opened {len(imgs)} channels in separate windows')
+                return
         layers = channels.split(viewer, image)
         self.reapply_tool(viewer)
         self._refresh_channels_tool(viewer)
-        self.status(f'Split {image.name} into {len(layers)} channel layers (Image ▸ Color ▸ Merge Channels undoes)')
+        self.status(f'Split {image.name} into {len(layers)} channel layers (run Split Channels again for separate windows)')
 
     def merge_channels(self) -> None:
         from . import channels
