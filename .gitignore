@@ -9,6 +9,7 @@ build/
 htmlcov/
 sample_data/
 installer/wheels/
+installer/wheels.zip
 installer/tiki.png
 installer/tiki.ico
 installer/tiki.icns

@@ -29,7 +29,7 @@ specs:
   - zarr
 
 extra_files:
-  - wheels/: wheels/
+  - wheels.zip: wheels.zip
   - menu.json: Menu/menu.json
   - tiki.png: Menu/tiki.png
   - tiki.ico: Menu/tiki.ico

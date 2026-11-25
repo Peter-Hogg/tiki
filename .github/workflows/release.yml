@@ -60,7 +60,8 @@ jobs:
           mkdir -p installer/wheels
           python -m pip wheel --no-deps . -w installer/wheels
           python -m pip wheel --no-deps czifile roifile readlif -w installer/wheels
-          ls -la installer/wheels
+          python -c "import glob, os, zipfile; zf = zipfile.ZipFile('installer/wheels.zip', 'w'); [zf.write(p, os.path.basename(p)) for p in sorted(glob.glob('installer/wheels/*.whl'))]; zf.close()"
+          ls -lh installer/wheels.zip
 
       - name: Run constructor
         shell: bash -el {0}
