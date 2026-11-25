@@ -27,9 +27,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: conda-forge/miniforge-setup@v2
+      - uses: conda-incubator/setup-miniconda@v3
         with:
-          conda-version: latest
+          miniforge-variant: Miniforge3
+          miniforge-version: latest
+          auto-activate-base: true
 
       - name: Install constructor & build helpers
         shell: bash -el {0}
@@ -57,7 +59,7 @@ jobs:
         run: |
           mkdir -p installer/wheels
           python -m pip wheel --no-deps . -w installer/wheels
-          python -m pip wheel --no-deps czifile roifile nd2 readlif -w installer/wheels
+          python -m pip wheel --no-deps czifile roifile readlif -w installer/wheels
           ls -la installer/wheels
 
       - name: Run constructor
@@ -95,5 +97,5 @@ jobs:
             - **macOS (Apple Silicon):** `TIKI-*-MacOSX-arm64.pkg` *(if Gatekeeper prompts on first launch, right-click **TIKI.app → Open**)*
             - **Linux:** `TIKI-*-Linux-x86_64.sh` *(run `bash TIKI-*-Linux-x86_64.sh`)*
 
-            Includes Python 3.12, napari (PyQt6), all microscopy readers (`.tif`, `.czi`, `.nd2`, `.lif`, `.zarr`, `.h5`), and built-in MP4/GIF movie export.
+            Includes Python 3.12, napari (PyQt6), all microscopy readers (`.tif`, `.czi`, `.lif`, `.zarr`, `.h5`), and built-in MP4/GIF movie export.
           files: artifacts/*
