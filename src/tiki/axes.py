@@ -390,6 +390,54 @@ def from_czi(
     return info
 
 
+# --------------------------------------------------------------- OME-Zarr
+
+def from_ome_zarr(attrs: dict, data_shape: tuple) -> tuple[AxesInfo, list[str]]:
+    """Parse OME-NGFF ``multiscales`` axes/scale and optional ``omero`` channel hex colors."""
+    multiscales = attrs.get('multiscales') or []
+    ms = multiscales[0] if multiscales and isinstance(multiscales[0], dict) else {}
+    raw_axes = ms.get('axes') or []
+    datasets = ms.get('datasets') or []
+    scale_vals: list[float] | None = None
+    if datasets and isinstance(datasets[0], dict):
+        for tr in datasets[0].get('coordinateTransformations') or []:
+            if isinstance(tr, dict) and tr.get('type') == 'scale' and isinstance(tr.get('scale'), list):
+                scale_vals = [float(s) for s in tr['scale']]
+                break
+
+    if len(raw_axes) != len(data_shape):
+        info = guess(data_shape)
+        info.source = 'OME-Zarr'
+        return info, []
+
+    axes = []
+    for i, (ax_def, size) in enumerate(zip(raw_axes, data_shape)):
+        if isinstance(ax_def, str):
+            name, unit = ax_def.upper(), None
+        else:
+            name = str(ax_def.get('name', '?')).upper()
+            unit = _unit(ax_def.get('unit'))
+        role = TIFF_ROLES.get(name, '?')
+        step = None
+        if scale_vals is not None and i < len(scale_vals) and role in ('T', 'Z', 'Y', 'X'):
+            val = float(scale_vals[i])
+            if val > 0 and not (val == 1.0 and unit is None):
+                step, unit = _normalize_czi_step(role, val, unit) if unit == 'm' else (val, unit or DEFAULT_UNITS.get(role))
+        axes.append(Axis(role, int(size), step, unit if step else None))
+
+    confident = '?' not in ''.join(a.role for a in axes[:-2])
+    info = AxesInfo(axes, 'OME-Zarr metadata', confident)
+    if info.problems(data_shape):
+        info = guess(data_shape)
+
+    colors: list[str] = []
+    omero = attrs.get('omero') or {}
+    for ch in omero.get('channels') or []:
+        if isinstance(ch, dict) and ch.get('color'):
+            colors.append(str(ch['color']))
+    return info, colors
+
+
 # ----------------------------------------------------------- folder memory
 
 def _memory_key(path: Path, shape: tuple) -> str:

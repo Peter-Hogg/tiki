@@ -34,6 +34,7 @@ class ResultsTable(QWidget):
         self.resize(640, 260)
         self.columns: list[str] = []
         self.rows: list[dict] = []
+        self.column_units: dict[str, str] = {}
         self.table = QTableWidget(0, 0)
         self.table.setEditTriggers(QTableWidget.NoEditTriggers)
         self.table.setAlternatingRowColors(True)
@@ -47,12 +48,20 @@ class ResultsTable(QWidget):
         layout.addWidget(self.table)
         layout.addLayout(buttons)
 
+    def _header_labels(self) -> list[str]:
+        return [f'{k} ({self.column_units[k]})' if self.column_units.get(k) else k for k in self.columns]
+
+    def set_units(self, units: dict[str, str]) -> None:
+        self.column_units.update({k: u for k, u in units.items() if u})
+        if self.columns:
+            self.table.setHorizontalHeaderLabels(self._header_labels())
+
     def add_row(self, row: dict) -> None:
         for key in row:
             if key not in self.columns:
                 self.columns.append(key)
                 self.table.setColumnCount(len(self.columns))
-                self.table.setHorizontalHeaderLabels(self.columns)
+                self.table.setHorizontalHeaderLabels(self._header_labels())
                 for r, old in enumerate(self.rows):
                     self._set_cell(r, len(self.columns) - 1, old.get(key, ''))
         self.rows.append(row)
@@ -93,6 +102,7 @@ class ResultsTable(QWidget):
     def clear(self) -> None:
         self.rows.clear()
         self.columns.clear()
+        self.column_units.clear()
         self.table.clear()
         self.table.setRowCount(0)
         self.table.setColumnCount(0)
@@ -239,6 +249,132 @@ class PlotWindow(QWidget):
         self.ax.plot(x, y, lw=1, color='tab:red', label=label)
         self.ax.legend(fontsize=8, frameon=False)
         self.canvas.draw_idle()
+
+
+class LineProfileWindow(QWidget):
+    """Analyze > Plot Profile: live intensity profile along a straight line or polyline."""
+
+    def __init__(self, viewer, image, width: int = 1, parent=None):
+        from qtpy.QtWidgets import QLabel, QSpinBox
+
+        super().__init__(parent, Qt.Window)
+        style.apply(self)
+        self.viewer = viewer
+        self.image = image
+        self.roi = roi_mod.roi_layer(viewer, create=True)
+        self.dist = np.array([])
+        self.values = np.array([])
+        self._signature = None
+        self.setWindowTitle(f'Plot of {image.name}')
+        self.resize(540, 320)
+
+        self.figure = Figure(figsize=(5.4, 2.9), layout='constrained')
+        self.canvas = FigureCanvasQTAgg(self.figure)
+        self.ax = self.figure.add_subplot()
+        (self.line,) = self.ax.plot([], [], lw=1, color='k')
+        self.ax.set_ylabel('gray value')
+
+        self.live = QCheckBox('Live', checked=True)
+        self.live.toggled.connect(lambda on: on and self.schedule())
+        self.width_spin = QSpinBox()
+        self.width_spin.setRange(1, 200)
+        self.width_spin.setValue(max(1, int(width)))
+        self.width_spin.setSuffix(' px')
+        self.width_spin.setToolTip('Average intensity across this many pixels perpendicular to the line')
+        self.width_spin.valueChanged.connect(lambda _: self.update_profile(force=True))
+
+        copy = QPushButton('Copy')
+        copy.clicked.connect(self.copy)
+        save = QPushButton('Save CSV…')
+        save.clicked.connect(self.save_csv)
+        bar = QHBoxLayout()
+        bar.addWidget(self.live)
+        bar.addWidget(QLabel('Width:'))
+        bar.addWidget(self.width_spin)
+        bar.addStretch()
+        bar.addWidget(copy)
+        bar.addWidget(save)
+        layout = QVBoxLayout(self)
+        layout.addWidget(self.canvas)
+        layout.addLayout(bar)
+
+        self._timer = QTimer(self, singleShot=True, interval=50)
+        self._timer.timeout.connect(self.update_profile)
+        self._connections = [
+            (self.roi.events.data, self.schedule),
+            (self.roi.events.set_data, self.schedule),
+            (self.roi.events.highlight, self.schedule),
+            (self.viewer.dims.events.current_step, lambda _=None: self.schedule(force=True)),
+        ]
+        for emitter, cb in self._connections:
+            emitter.connect(cb)
+        self.update_profile(force=True)
+
+    def schedule(self, event=None, force: bool = False) -> None:
+        if self.live.isChecked():
+            if force:
+                self._signature = None
+            self._timer.start()
+
+    def _signature_now(self):
+        current = roi_mod.current_shape(self.roi)
+        if current is None or current[1] not in ('line', 'path'):
+            return None
+        verts, kind = current
+        idx = roi_mod.current_index(self.viewer, self.image)[:-2]
+        return kind, np.round(verts[:, -2:], 2).tobytes(), idx, self.width_spin.value()
+
+    def update_profile(self, force: bool = False) -> None:
+        from . import axes as axes_mod
+
+        if self.image not in self.viewer.layers:
+            return
+        sig = self._signature_now()
+        if sig is None:
+            return
+        if not force and sig == self._signature:
+            return
+        self._signature = sig
+        current = roi_mod.current_shape(self.roi)
+        if current is None or current[1] not in ('line', 'path'):
+            return
+        plane = roi_mod.current_plane(self.viewer, self.image)
+        scale = (float(self.image.scale[-2]), float(self.image.scale[-1]))
+        self.dist, self.values = ops.line_profile(plane, current[0], width=self.width_spin.value(), scale=scale)
+        self.line.set_data(self.dist, self.values)
+        info = axes_mod.get(self.image)
+        y_ax = info.axes[info.index('Y')] if info.index('Y') is not None else None
+        unit = y_ax.unit if (y_ax is not None and y_ax.step and y_ax.unit) else 'px'
+        self.ax.set_xlabel(f'distance ({unit})')
+        w = self.width_spin.value()
+        self.ax.set_title(f'{current[1]} ({len(self.values)} samples, width {w} px)', fontsize=9)
+        self.ax.relim()
+        self.ax.autoscale_view()
+        self.canvas.draw_idle()
+
+    def copy(self) -> None:
+        QApplication.clipboard().setText('\n'.join(f'{d:.6g}\t{v:.6g}' for d, v in zip(self.dist, self.values)))
+
+    def save_csv(self) -> None:
+        path, _ = QFileDialog.getSaveFileName(self, 'Save line profile', f'{self.image.name}_line.csv', 'CSV (*.csv)')
+        if path:
+            np.savetxt(
+                path,
+                np.c_[self.dist, self.values],
+                delimiter=',',
+                header='distance,value',
+                comments='',
+                fmt='%.6g',
+            )
+
+    def closeEvent(self, event):
+        self._timer.stop()
+        for emitter, cb in self._connections:
+            try:
+                emitter.disconnect(cb)
+            except Exception:
+                pass
+        super().closeEvent(event)
 
 
 class TracesWindow(QWidget):

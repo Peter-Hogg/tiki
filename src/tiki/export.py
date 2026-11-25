@@ -27,12 +27,19 @@ def _safe(name: str) -> str:
 
 
 def _loader_line(var: str, path: str) -> str:
-    if path.lower().endswith('.npy'):
+    low = path.lower()
+    if low.endswith('.npy'):
         return f"{var} = np.load(r'{path}', mmap_mode='r')"
-    if path.lower().endswith(('.tif', '.tiff')):
+    if low.endswith(('.tif', '.tiff')):
         return f"{var} = tifffile.imread(r'{path}')  # or tifffile.memmap(...) for uncompressed files"
-    if path.lower().endswith('.czi'):
+    if low.endswith('.czi'):
         return f"import czifile; {var} = czifile.imread(r'{path}')"
+    if low.endswith('.nd2'):
+        return f"import nd2; {var} = nd2.imread(r'{path}')"
+    if low.endswith('.zarr'):
+        return f"import zarr; {var} = zarr.open(r'{path}', mode='r')"
+    if low.endswith(('.h5', '.hdf5', '.mat')):
+        return f"import h5py; {var} = h5py.File(r'{path}', 'r')"
     return f"{var} = skimage.io.imread(r'{path}')"
 
 

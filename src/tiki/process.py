@@ -1105,3 +1105,158 @@ def fill_holes_command(tiki):
         viewer.layers.move(viewer.layers.index(roi), len(viewer.layers))
     tiki.status(f'Filled holes → "{new_layer.name}"')
     return new_layer
+
+
+# ----------------------------------------- selections, transforms, formats
+
+def _require_area_roi(tiki):
+    viewer, image = tiki.require_image()
+    current = tiki.current_roi(viewer)
+    if current is None or current[1] in ('line', 'path'):
+        _error('draw an area selection (rectangle, oval, polygon or freehand) first')
+    return viewer, image, current
+
+
+def enlarge_dialog(tiki):
+    viewer, image, current = _require_area_roi(tiki)
+    dlg, form = _form(tiki, 'Enlarge / Shrink Selection')
+    dist = QDoubleSpinBox(decimals=1, minimum=-500.0, maximum=500.0, singleStep=1.0, value=5.0)
+    dist.setSuffix(' px')
+    dist.setToolTip('Positive values enlarge the selection; negative values shrink it')
+    form.addRow('Enlarge by:', dist)
+    _buttons(dlg, form)
+    if dlg.exec_() != QDialog.Accepted:
+        return None
+    shape2d = roi_mod.spatial_shape(image)
+    mask = roi_mod.shape_mask(*current, shape2d)
+    new_mask = ops.enlarge_mask(mask, dist.value())
+    poly = ops.mask_to_polygon(new_mask)
+    if poly is None:
+        _error('selection vanished after shrinking')
+    tiki._last_roi = (np.asarray(current[0]).copy(), current[1])
+    layer = tiki.roi_layer(viewer)
+    layer.data = []
+    layer.add_polygons([poly])
+    tiki.status(f'Selection enlarged by {dist.value():+g} px ({int(new_mask.sum())} px)')
+    return poly
+
+
+def make_band_dialog(tiki):
+    viewer, image, current = _require_area_roi(tiki)
+    dlg, form = _form(tiki, 'Make Band (Annulus)')
+    width = QDoubleSpinBox(decimals=1, minimum=0.5, maximum=500.0, singleStep=1.0, value=5.0)
+    width.setSuffix(' px')
+    gap = QDoubleSpinBox(decimals=1, minimum=0.0, maximum=200.0, singleStep=1.0, value=0.0)
+    gap.setSuffix(' px')
+    gap.setToolTip('Optional gap between the ROI boundary and the inner edge of the band')
+    form.addRow('Band width:', width)
+    form.addRow('Gap from ROI:', gap)
+    _buttons(dlg, form)
+    if dlg.exec_() != QDialog.Accepted:
+        return None
+    shape2d = roi_mod.spatial_shape(image)
+    mask = roi_mod.shape_mask(*current, shape2d)
+    band = ops.make_band_mask(mask, width.value(), gap.value())
+    if not band.any():
+        _error('band is empty')
+    name = f'band ({width.value():g} px)' if gap.value() == 0 else f'band ({width.value():g} px, gap {gap.value():g})'
+    layer = Labels(band.astype(np.uint8), name=name, opacity=0.6, **axes_mod.geometry(image, ndim=2))
+    viewer.add_layer(layer)
+    tiki.reapply_tool(viewer)
+    tiki.status(f'Created "{name}" Labels layer ({int(band.sum())} px)')
+    return layer
+
+
+def clear_selection(tiki, outside: bool = False):
+    viewer, image, current = _require_area_roi(tiki)
+    shape2d = roi_mod.spatial_shape(image)
+    mask = roi_mod.shape_mask(*current, shape2d)
+    index = roi_mod.current_index(viewer, image)
+    whole = image.ndim > 2
+    if whole and not _confirm_size(tiki, image.data.shape, 'Clear Outside' if outside else 'Clear'):
+        return None
+    total = int(np.prod(image.data.shape[: image.ndim - 2])) if whole else 1
+    with tiki.progress('Clear Outside' if outside else 'Clear', total) as tick:
+        out = ops.clear_mask(
+            image.data,
+            mask,
+            outside=outside,
+            fill_value=0.0,
+            index=index,
+            whole_stack=whole,
+            rgb=bool(image.rgb),
+            progress=tick,
+        )
+    if tick.cancelled:
+        tiki.status('Clear cancelled')
+        return None
+    suffix = 'cleared outside' if outside else 'cleared'
+    layer = _add_result(tiki, viewer, image, out, f'{image.name} {suffix}', image.colormap,
+                        tuple(map(float, image.contrast_limits)) if not image.rgb else None)
+    tiki.status(f'{"Clear Outside" if outside else "Clear"} → "{layer.name}"')
+    return layer
+
+
+def rotate_dialog(tiki):
+    viewer, image = tiki.require_image()
+    dlg, form = _form(tiki, 'Rotate')
+    angle = QDoubleSpinBox(decimals=2, minimum=-360.0, maximum=360.0, singleStep=5.0, value=15.0)
+    angle.setSuffix('°')
+    angle.setToolTip('Clockwise rotation angle in degrees')
+    enlarge = QCheckBox('Enlarge image to fit result', checked=True)
+    form.addRow('Angle:', angle)
+    form.addRow(enlarge)
+    _buttons(dlg, form)
+    if dlg.exec_() != QDialog.Accepted:
+        return None
+    if not _confirm_size(tiki, image.data.shape, 'Rotate'):
+        return None
+    total = int(np.prod(image.data.shape[: image.ndim - 2])) if image.ndim > 2 else 1
+    with tiki.progress('Rotate', total) as tick:
+        out = ops.rotate_angle(image.data, angle.value(), resize=enlarge.isChecked(),
+                               rgb=bool(image.rgb), progress=tick)
+    if tick.cancelled:
+        tiki.status('Rotate cancelled')
+        return None
+    info = axes_mod.fit(axes_mod.get(image), out.shape[:-1] if image.rgb else out.shape)
+    kw: dict = {'axes': info}
+    if not image.rgb:
+        kw['colormap'] = image.colormap
+    v = tiki.open_data(out, f'Rot{angle.value():g}_{image.name}', **kw)
+    tiki.status(f'Rotated {image.name} by {angle.value():g}°')
+    return v
+
+
+def set_measurements_dialog(tiki):
+    from qtpy.QtWidgets import QGridLayout
+
+    dlg = QDialog(tiki)
+    style.apply(dlg)
+    dlg.setWindowTitle('Set Measurements')
+    grid = QGridLayout(dlg)
+    boxes: dict[str, QCheckBox] = {}
+    cols = 2
+    for i, key in enumerate(ops.MEASUREMENT_KEYS):
+        cb = QCheckBox(key, checked=key in tiki.measurements)
+        boxes[key] = cb
+        grid.addWidget(cb, i // cols, i % cols)
+    buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+    buttons.accepted.connect(dlg.accept)
+    buttons.rejected.connect(dlg.reject)
+    grid.addWidget(buttons, (len(ops.MEASUREMENT_KEYS) + cols - 1) // cols, 0, 1, cols)
+    if dlg.exec_() != QDialog.Accepted:
+        return None
+    chosen = {k for k, cb in boxes.items() if cb.isChecked()}
+    if not chosen:
+        chosen = {'Area', 'Mean'}
+    tiki.measurements = chosen
+    tiki.status(f'Set Measurements: {", ".join(k for k in ops.MEASUREMENT_KEYS if k in chosen)}')
+    return chosen
+
+
+def open_zarr_dialog(tiki):
+    folder = QFileDialog.getExistingDirectory(tiki, 'Open OME-Zarr (.zarr)', str(Path.home()))
+    if not folder:
+        return None
+    tiki.open_paths([folder])
+    return tiki.windows.active

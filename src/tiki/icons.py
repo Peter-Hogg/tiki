@@ -47,6 +47,17 @@ def line(p):
     p.drawLine(QPointF(4, 19), QPointF(20, 5))
 
 
+def polyline(p):
+    p.drawPolyline(_poly([(3, 18), (9, 7), (15, 16), (21, 5)]))
+
+
+def wand(p):
+    p.drawLine(QPointF(4, 20), QPointF(15, 9))
+    # star tip at (17, 7)
+    for dx, dy in ((0, -4), (0, 4), (-4, 0), (4, 0), (-3, -3), (3, 3), (-3, 3), (3, -3)):
+        p.drawLine(QPointF(17, 7), QPointF(17 + dx, 7 + dy))
+
+
 def point(p):
     p.drawLine(QPointF(12, 4), QPointF(12, 20))
     p.drawLine(QPointF(4, 12), QPointF(20, 12))
@@ -96,6 +107,8 @@ ICONS = {
     'polygon': polygon,
     'freehand': freehand,
     'line': line,
+    'polyline': polyline,
+    'wand': wand,
     'point': point,
     'select': select,
     'hand': hand,

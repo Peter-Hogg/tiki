@@ -1091,3 +1091,98 @@ def test_open_czi_multi_scene_and_split_channels(tiki, tmp_path, monkeypatch):
     assert tuple(v.dims.axis_labels) == ('c', 'z', 'y', 'x')
     tiki.split_channels()
     assert [ly.name for ly in v.layers if ly.name.startswith('C')] == ['C1-zeiss.czi [S1]', 'C2-zeiss.czi [S1]']
+
+
+def test_live_polyline_plot_profile(tiki, qtbot):
+    img = np.zeros((30, 30), dtype=np.float32)
+    img[9:12, :] = 100.0
+    img[:, 19:22] = 200.0
+    v = _open_with_axes(tiki, img, 'YX', 'lines.tif', {'Y': 0.5, 'X': 0.5})
+    layer = v.layers[roi.ROI_NAME]
+    layer.add_paths(np.array([[[10.0, 2.0], [10.0, 20.0], [25.0, 20.0]]]))
+    win = tiki.plot_line_profile()
+    assert len(win.values) > 20 and win.values[5] == pytest.approx(100.0, abs=1.0)
+    assert 'µm' in win.ax.get_xlabel()
+    win.width_spin.setValue(3)
+    assert win.values[-3] == pytest.approx(200.0, abs=1.0)
+    layer.data = []
+    layer.add_lines(np.array([[20.0, 1.0], [20.0, 28.0]]))
+    qtbot.waitUntil(lambda: win.values[5] < 10.0, timeout=2000)
+
+
+def test_wand_restore_enlarge_band_and_clear(tiki, accept_dialogs):
+    from tiki import process
+
+    img = np.full((48, 48), 10.0, dtype=np.float32)
+    img[16:28, 18:30] = 150.0
+    v = tiki.open_data(img, 'cell.tif')
+    tiki.wand_tolerance = 20.0
+    poly = tiki.wand_select(v, 20, 22)
+    assert poly is not None and v.layers[roi.ROI_NAME].nshapes == 1
+
+    tiki.select_none()
+    assert v.layers[roi.ROI_NAME].nshapes == 0
+    tiki.restore_selection()
+    assert v.layers[roi.ROI_NAME].nshapes == 1
+
+    accept_dialogs['configure'] = None
+    enlarged = process.enlarge_dialog(tiki)
+    assert enlarged is not None
+    band_layer = process.make_band_dialog(tiki)
+    assert band_layer is not None and band_layer.data.sum() > 0
+
+    cleared = process.clear_selection(tiki, outside=True)
+    assert cleared is not None and cleared.data[0, 0] == 0.0 and cleared.data[20, 22] == 150.0
+
+
+def test_transforms_type_conversion_and_rgb_flatten(tiki, hyperstack, accept_dialogs):
+    from tiki import process
+
+    arr = np.arange(20, dtype=np.uint16).reshape(4, 5)
+    v = _open_with_axes(tiki, arr, 'YX', 'rect.tif', {'Y': 0.5, 'X': 1.0})
+    fh = tiki.flip('horizontal')
+    np.testing.assert_array_equal(fh.layers[0].data, arr[:, ::-1])
+
+    tiki.windows.activate(v)
+    r90 = tiki.rotate_90(-1)
+    assert r90.layers[0].data.shape == (5, 4)
+    assert tuple(r90.layers[0].scale) == pytest.approx((1.0, 0.5))
+
+    tiki.windows.activate(v)
+    accept_dialogs['configure'] = None
+    rot_v = process.rotate_dialog(tiki)
+    assert rot_v is not None and rot_v.layers[0].data.dtype == np.float32
+
+    tiki.windows.activate(v)
+    u8_v = tiki.convert_type('uint8')
+    assert u8_v.layers[0].data.dtype == np.uint8
+
+    path, _ = hyperstack
+    tiki.open_paths([str(path)])
+    tiki.split_channels()
+    rgb_v = tiki.flatten_rgb()
+    assert rgb_v.layers[0].rgb and rgb_v.layers[0].data.shape == (6, 4, 24, 20, 3)
+
+
+def test_set_measurements_and_unit_headers(tiki, accept_dialogs):
+    from qtpy.QtWidgets import QCheckBox
+
+    from tiki import process
+
+    img = np.arange(100, dtype=np.float32).reshape(10, 10)
+    v = _open_with_axes(tiki, img, 'YX', 'cal.tif', {'Y': 0.5, 'X': 0.5})
+    _rect(v.layers[roi.ROI_NAME], 1.5, 5.5, 2.5, 7.5)
+
+    def configure(dlg):
+        for cb in dlg.findChildren(QCheckBox):
+            if cb.text() in ('Median', 'Centroid', 'Feret'):
+                cb.setChecked(True)
+
+    accept_dialogs['configure'] = configure
+    process.set_measurements_dialog(tiki)
+    tiki.measure()
+    row = tiki.results.rows[-1]
+    assert row['Area'] == pytest.approx(20 * 0.25)
+    assert 'Median' in row and 'X' in row and 'Feret' in row
+    headers = [tiki.results.table.horizontalHeaderItem(c).text() for c in range(tiki.results.table.columnCount())]
+    assert 'Area (µm²)' in headers and 'X (µm)' in headers

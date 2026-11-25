@@ -49,13 +49,15 @@ TOOLS = [
     ('polygon', 'Polygon (double-click to close)', 'add_polygon', 'shapes'),
     ('freehand', 'Freehand', 'add_polygon_lasso', 'shapes'),
     ('line', 'Straight line', 'add_line', 'shapes'),
+    ('polyline', 'Segmented line (double-click to finish)', 'add_path', 'shapes'),
+    ('wand', 'Magic Wand (click to flood-select; Edit ▸ Selection ▸ Wand Tolerance…)', 'pan_zoom', 'wand'),
     ('point', 'Point', 'add', 'points'),
     ('select', 'Move / edit ROI', 'select', 'shapes'),
     ('hand', 'Scrolling tool (pan & zoom)', 'pan_zoom', None),
     ('brush', 'Paint labels (brush size in the layer controls)', 'paint', 'labels'),
     ('eraser', 'Erase labels', 'erase', 'labels'),
 ]
-DRAW_MODES = {'add_rectangle', 'add_ellipse', 'add_polygon', 'add_polygon_lasso', 'add_line'}
+DRAW_MODES = {'add_rectangle', 'add_ellipse', 'add_polygon', 'add_polygon_lasso', 'add_line', 'add_path'}
 
 STATUS_HOLD_MS = 4000
 
@@ -92,6 +94,9 @@ class Tiki(QMainWindow):
         self.threshold_window = None
         self.roi_manager = None
         self.traces: list = []  # open TracesWindows (exported by Send to Notebook)
+        self._last_roi: tuple[np.ndarray, str] | None = None
+        self.wand_tolerance: float = 10.0
+        self.measurements: set[str] = set(ops.DEFAULT_MEASUREMENTS)
 
         self._build_menus()
         self.windows = WindowManager(
@@ -152,6 +157,7 @@ class Tiki(QMainWindow):
         self.recent_menu.aboutToShow.connect(self._fill_recent_menu)
         imp = m.addMenu('Import')
         self._add(imp, 'Image Sequence…', lambda: self._process('sequence_dialog'), 'Ctrl+Shift+I')
+        self._add(imp, 'OME-Zarr (.zarr)…', lambda: self._process('open_zarr_dialog'))
         samples = m.addMenu('Open Samples')
         self._add(samples, 'Synthetic movie', self.open_sample_movie)
         self._add(samples, 'Blobs', lambda: self._open_skimage('blobs'))
@@ -169,8 +175,21 @@ class Tiki(QMainWindow):
         sel = m.addMenu('Selection')
         self._add(sel, 'Select All', self.select_all, 'Ctrl+A')
         self._add(sel, 'Select None', self.select_none, 'Ctrl+Shift+A')
+        self._add(sel, 'Restore Selection', self.restore_selection, 'Ctrl+Shift+R')
+        sel.addSeparator()
+        self._add(sel, 'Enlarge / Shrink…', lambda: self._process('enlarge_dialog'))
+        self._add(sel, 'Make Band…', lambda: self._process('make_band_dialog'))
+        self._add(sel, 'Wand Tolerance…', self.set_wand_tolerance)
+        m.addSeparator()
+        self._add(m, 'Clear', lambda: self._process('clear_selection', outside=False))
+        self._add(m, 'Clear Outside', lambda: self._process('clear_selection', outside=True))
 
         m = mb.addMenu('&Image')
+        img_type = m.addMenu('Type')
+        self._add(img_type, '8-bit', lambda: self.convert_type('uint8'))
+        self._add(img_type, '16-bit', lambda: self.convert_type('uint16'))
+        self._add(img_type, '32-bit', lambda: self.convert_type('float32'))
+        self._add(img_type, 'RGB Color', self.flatten_rgb)
         adjust = m.addMenu('Adjust')
         self._add(adjust, 'Brightness/Contrast…', self.brightness_contrast, 'Ctrl+Shift+C')
         self._add(adjust, 'Threshold…', self.threshold, 'Ctrl+Shift+T')
@@ -186,6 +205,12 @@ class Tiki(QMainWindow):
         self._add(color, 'Split Channels', self.split_channels)
         self._add(color, 'Merge Channels', self.merge_channels)
         self._add(color, 'Channels Tool…', self.channels_tool, 'Ctrl+Shift+Z')
+        transform = m.addMenu('Transform')
+        self._add(transform, 'Flip Horizontally', lambda: self.flip('horizontal'))
+        self._add(transform, 'Flip Vertically', lambda: self.flip('vertical'))
+        self._add(transform, 'Rotate 90° Right', lambda: self.rotate_90(-1))
+        self._add(transform, 'Rotate 90° Left', lambda: self.rotate_90(1))
+        self._add(transform, 'Rotate…', lambda: self._process('rotate_dialog'))
         self._add(m, 'Crop', self.crop, 'Ctrl+Shift+X')
         self._add(m, 'Duplicate…', lambda: self._process('duplicate_dialog'), 'Ctrl+Shift+D')
         stacks = m.addMenu('Stacks')
@@ -217,6 +242,7 @@ class Tiki(QMainWindow):
         self._add(m, 'Analyze Particles…', self.analyze_particles)
         self._add(m, 'Histogram', self.histogram, 'Ctrl+H')
         self._add(m, 'Set Scale…', lambda: self._process('set_scale_dialog'))
+        self._add(m, 'Set Measurements…', lambda: self._process('set_measurements_dialog'))
         self._add(m, 'Clear Results', self.results.clear)
         self._add(m, 'Show Results', self.show_results)
         m.addSeparator()
@@ -311,7 +337,12 @@ class Tiki(QMainWindow):
         coords = image.world_to_data(position[-ndim:])
         shape = image.data.shape[:ndim]
         idx = tuple(int(np.floor(c + 0.5)) for c in coords)
-        parts = [f'x={idx[-1]}', f'y={idx[-2]}']
+        info = axes_mod.get(image)
+        x_ax = info.axes[-1]
+        y_ax = info.axes[-2]
+        x_str = f'x={idx[-1]} ({idx[-1] * x_ax.step:.4g} {x_ax.unit})' if (x_ax.step and x_ax.unit) else f'x={idx[-1]}'
+        y_str = f'y={idx[-2]} ({idx[-2] * y_ax.step:.4g} {y_ax.unit})' if (y_ax.step and y_ax.unit) else f'y={idx[-2]}'
+        parts = [x_str, y_str]
         for d in range(ndim - 2):
             parts.append(f'{roi_mod.axis_name(viewer, image, d)}={idx[d]}')
         if all(0 <= i < s for i, s in zip(idx, shape)):
@@ -351,6 +382,14 @@ class Tiki(QMainWindow):
             return
         if kind == 'shapes':
             layer = self._roi(viewer)
+        elif kind == 'wand':
+            for name in (roi_mod.ROI_NAME, roi_mod.POINTS_NAME):
+                if name in viewer.layers:
+                    viewer.layers[name].mode = 'pan_zoom'
+            if self._on_wand_click not in viewer.mouse_drag_callbacks:
+                viewer.mouse_drag_callbacks.append(self._on_wand_click)
+            viewer.layers.selection.active = roi_mod.target_image(viewer)
+            return
         elif kind == 'points':
             layer = roi_mod.points_layer(viewer)
         elif kind == 'labels':
@@ -363,6 +402,54 @@ class Tiki(QMainWindow):
             return
         viewer.layers.selection.active = layer
         layer.mode = mode
+
+    def _on_wand_click(self, viewer, event):
+        if self.tool != 'wand' or viewer.dims.ndisplay == 3:
+            return
+        image = roi_mod.target_image(viewer)
+        if image is None:
+            return
+        coords = image.world_to_data(event.position[-image.ndim :])
+        y, x = int(np.floor(coords[-2] + 0.5)), int(np.floor(coords[-1] + 0.5))
+        self._run('Magic Wand', lambda: self.wand_select(viewer, y, x, add='Shift' in event.modifiers))
+
+    def wand_select(self, viewer, y: int, x: int, add: bool = False):
+        image = roi_mod.target_image(viewer)
+        if image is None:
+            raise TikiError('no image open')
+        plane = roi_mod.current_plane(viewer, image)
+        if not (0 <= y < plane.shape[0] and 0 <= x < plane.shape[1]):
+            return None
+        mask = ops.wand_mask(plane, y, x, tolerance=self.wand_tolerance)
+        poly = ops.mask_to_polygon(mask)
+        if poly is None:
+            self.status(f'Magic Wand: region at ({x}, {y}) is too small to outline')
+            return None
+        layer = self._roi(viewer)
+        if not add:
+            prev = roi_mod.current_shape(layer)
+            if prev is not None:
+                self._last_roi = (prev[0].copy(), prev[1])
+            layer.data = []
+        layer.add_polygons([poly])
+        self.status(f'Magic Wand (tol={self.wand_tolerance:g}): {int(mask.sum())} px at ({x}, {y})')
+        return poly
+
+    def set_wand_tolerance(self) -> None:
+        from qtpy.QtWidgets import QInputDialog
+
+        val, ok = QInputDialog.getDouble(
+            self,
+            'Wand Tolerance',
+            'Tolerance (intensity difference from clicked pixel):',
+            self.wand_tolerance,
+            0.0,
+            1e9,
+            2,
+        )
+        if ok:
+            self.wand_tolerance = float(val)
+            self.status(f'Magic Wand tolerance = {self.wand_tolerance:g}')
 
     def _labels_for_painting(self, viewer) -> Labels:
         """The selected Labels layer, else the topmost one, else a new empty one."""
@@ -405,10 +492,11 @@ class Tiki(QMainWindow):
         if not keep_all:
             QTimer.singleShot(0, lambda: self._prune(layer))
 
-    @staticmethod
-    def _prune(layer: Shapes) -> None:
+    def _prune(self, layer: Shapes) -> None:
         if layer._is_creating or layer.nshapes < 2:
             return
+        if layer.nshapes >= 2:
+            self._last_roi = (np.asarray(layer.data[-2]).copy(), layer.shape_type[-2])
         layer.selected_data = set(range(layer.nshapes - 1))
         layer.remove_selected()
 
@@ -455,10 +543,7 @@ class Tiki(QMainWindow):
         for path in paths:
             t0 = time.perf_counter()
             try:
-                if Path(path).suffix.lower() == '.czi':
-                    loaded = io.read_czi_scenes(path)
-                else:
-                    loaded = [io.read_image(path)]
+                loaded = io.read_multi(path)
             except Exception as exc:
                 traceback.print_exc()
                 self.report('Open', f'Could not open {Path(path).name}:\n{exc}')
@@ -470,6 +555,8 @@ class Tiki(QMainWindow):
                 info = meta['axes']
                 open_kw: dict = {'axes': info, 'metadata': metadata}
                 rgb = data.ndim == len(info.axes) + 1 and data.shape[-1] in (3, 4)
+                if meta.get('first_plane') is not None and not rgb:
+                    open_kw['contrast_limits'] = ops.saturated_limits(meta['first_plane'])
                 luts = meta.get('imagej_luts')
                 if info.index('C') is None and not rgb and luts and len(luts) == 1:
                     lut = np.asarray(luts[0], dtype=float)
@@ -673,9 +760,100 @@ class Tiki(QMainWindow):
         viewer = self.windows.active
         layer = roi_mod.roi_layer(viewer, create=False) if viewer else None
         if layer is not None and layer.nshapes:
+            cur = roi_mod.current_shape(layer)
+            if cur is not None:
+                self._last_roi = (cur[0].copy(), cur[1])
             layer.data = []
 
+    def restore_selection(self) -> None:
+        viewer, _ = self.require_image()
+        if self._last_roi is None:
+            raise TikiError('no previous selection to restore')
+        verts, kind = self._last_roi
+        layer = self._roi(viewer)
+        cur = roi_mod.current_shape(layer)
+        if cur is not None:
+            self._last_roi = (cur[0].copy(), cur[1])
+        layer.data = []
+        layer.add(verts, shape_type=kind)
+        self.status(f'Restored {kind} selection')
+
     # ------------------------------------------------------------- Image
+
+    def flip(self, axis: str = 'horizontal'):
+        viewer, image = self.require_image()
+        out = ops.flip_image(image.data, axis=axis, rgb=bool(image.rgb))
+        info = axes_mod.fit(axes_mod.get(image), out.shape[:-1] if image.rgb else out.shape)
+        kw: dict = {'axes': info}
+        if not image.rgb:
+            kw['colormap'] = image.colormap
+        tag = 'FlipH' if axis == 'horizontal' else 'FlipV'
+        v = self.open_data(out, f'{tag}_{image.name}', **kw)
+        self.status(f'Flipped {image.name} ({axis})')
+        return v
+
+    def rotate_90(self, k: int = -1):
+        viewer, image = self.require_image()
+        out = ops.rotate_90(image.data, k=k, rgb=bool(image.rgb))
+        info = axes_mod.get(image)
+        new_axes = [axes_mod.Axis(a.role, a.size, a.step, a.unit) for a in info.axes]
+        # Swapping spatial height/width swaps Y and X sizes and steps
+        y_ax, x_ax = new_axes[-2], new_axes[-1]
+        new_axes[-2] = axes_mod.Axis('Y', out.shape[-3 if image.rgb else -2], x_ax.step, x_ax.unit)
+        new_axes[-1] = axes_mod.Axis('X', out.shape[-2 if image.rgb else -1], y_ax.step, y_ax.unit)
+        new_info = axes_mod.AxesInfo(new_axes, info.source, info.confident, list(info.notes))
+        kw: dict = {'axes': new_info}
+        if not image.rgb:
+            kw['colormap'] = image.colormap
+        tag = 'Rot90R' if k < 0 else 'Rot90L'
+        v = self.open_data(out, f'{tag}_{image.name}', **kw)
+        self.status(f'Rotated {image.name} 90° {"right" if k < 0 else "left"}')
+        return v
+
+    def convert_type(self, target_dtype: str):
+        viewer, image = self.require_image()
+        if image.rgb and target_dtype != 'uint8':
+            raise TikiError('RGB images can only be converted via Image ▸ Type ▸ 8-bit or split first')
+        scale_range = None
+        if not image.rgb and target_dtype in ('uint8', 'uint16'):
+            scale_range = tuple(map(float, image.contrast_limits))
+        total = int(np.prod(image.data.shape[: image.ndim - 2])) if image.ndim > 2 else 1
+        with self.progress(f'Convert to {target_dtype}', total) as tick:
+            out = ops.convert_type(image.data, target_dtype, scale_range=scale_range, progress=tick)
+        if tick.cancelled:
+            self.status('Type conversion cancelled')
+            return None
+        info = axes_mod.fit(axes_mod.get(image), out.shape[:-1] if image.rgb else out.shape)
+        kw: dict = {'axes': info}
+        if not image.rgb:
+            kw['colormap'] = image.colormap
+        v = self.open_data(out, f'{target_dtype}_{image.name}', **kw)
+        self.status(f'Converted {image.name} to {target_dtype}')
+        return v
+
+    def flatten_rgb(self):
+        viewer, image = self.require_image()
+        visible = [
+            ly for ly in viewer.layers
+            if isinstance(ly, Image) and ly.visible and ly.name not in roi_mod.PREVIEW_NAMES and not ly.rgb
+        ]
+        if not visible:
+            raise TikiError('no visible greyscale image layers to flatten into RGB')
+        ref_shape = visible[0].data.shape
+        same = [ly for ly in visible if ly.data.shape == ref_shape]
+        if any(axes_mod.get(ly).index('C') is not None for ly in same):
+            raise TikiError('split channels first before flattening to RGB', fix='split')
+        total = int(np.prod(ref_shape[:-2])) if len(ref_shape) > 2 else 1
+        specs = [(ly.data, ly.colormap, tuple(map(float, ly.contrast_limits))) for ly in same]
+        with self.progress('RGB Color', total) as tick:
+            rgb = ops.composite_rgb(specs, progress=tick)
+        if tick.cancelled:
+            self.status('RGB conversion cancelled')
+            return None
+        info = axes_mod.fit(axes_mod.get(same[0]), rgb.shape[:-1])
+        v = self.open_data(rgb, f'RGB_{viewer.title}', axes=info, rgb=True)
+        self.status(f'Flattened {len(same)} layer(s) to RGB')
+        return v
 
     def _set_dock(self, dock_name: str) -> None:
         viewer = self.windows.active
@@ -952,10 +1130,16 @@ class Tiki(QMainWindow):
 
         current = self.current_roi(viewer)
         mask = None if current is None else roi_mod.shape_mask(*current, plane.shape)
-        row = base | ops.mask_stats(plane, mask, roi_mod.pixel_area(image))
+        scale_yx = (float(image.scale[-2]), float(image.scale[-1]))
+        row = base | ops.mask_stats(plane, mask, roi_mod.pixel_area(image), scale=scale_yx, include=self.measurements)
         if current is not None and current[1] in ('line', 'path'):
             verts = np.asarray(current[0])[:, -2:] * np.asarray(image.scale[-2:])
             row['Length'] = float(np.linalg.norm(np.diff(verts, axis=0), axis=1).sum())
+        info = axes_mod.get(image)
+        y_ax = info.axes[info.index('Y')] if info.index('Y') is not None else None
+        if y_ax is not None and y_ax.step and y_ax.unit:
+            u = y_ax.unit
+            self.results.set_units({'Area': f'{u}²', 'Length': u, 'X': u, 'Y': u, 'Perim.': u, 'Feret': u})
         self.results.add_row(row)
         self.show_results()
 
@@ -963,24 +1147,18 @@ class Tiki(QMainWindow):
         self.results.show()
         self.results.raise_()
 
-    def plot_line_profile(self) -> None:
-        from skimage.measure import profile_line
-
-        from .widgets import PlotWindow
+    def plot_line_profile(self):
+        from .widgets import LineProfileWindow
 
         viewer, image = self.require_image()
         current = self.current_roi(viewer)
-        if current is None or current[1] != 'line':
-            raise TikiError('Plot Profile needs a straight line selection')
-        src, dst = np.asarray(current[0])[:, -2:]
-        plane = roi_mod.current_plane(viewer, image)
-        values = profile_line(plane, src, dst, order=1, mode='constant', reduce_func=None)
-        dist = np.linspace(0, np.linalg.norm((dst - src) * image.scale[-2:]), len(values))
-        win = PlotWindow(f'Plot of {image.name}', dist, values, 'distance', 'gray value')
-        win.setAttribute(Qt.WA_DeleteOnClose)
-        self.profiles.append(win)
-        win.destroyed.connect(lambda _=None, w=win: self.profiles.remove(w) if w in self.profiles else None)
+        if current is None or current[1] not in ('line', 'path'):
+            raise TikiError('Plot Profile needs a straight line or segmented line selection')
+        win = LineProfileWindow(viewer, image)
+        self.keep_window(win)
         win.show()
+        self.windows.activate(viewer)
+        return win
 
     # ----------------------------------------------- ROI Manager & traces
 
@@ -1421,7 +1599,7 @@ class Tiki(QMainWindow):
         opened_sequence = False
         for raw in paths:
             p = Path(raw)
-            if p.is_dir():
+            if p.is_dir() and p.suffix.lower() != '.zarr':
                 seq_files = io.find_sequence_files(p)
                 if len(seq_files) >= self.FOLDER_SEQUENCE_MIN:
                     mode = self._ask_folder_drop(p, len(seq_files))
@@ -1446,8 +1624,8 @@ class Tiki(QMainWindow):
             self._run('Open Macro', lambda p=p: self.new_macro(str(p)))
         if kinds['skipped']:
             names = ', '.join(p.name for p in kinds['skipped'][:5])
-            self.report('Open', f'TIKI cannot open: {names}\n\nSupported: images (.tif, .tiff, .czi, .npy, .png, '
-                        '.jpg), folders of images, ImageJ ROIs (.roi, .zip) and macros (.py).')
+            self.report('Open', f'TIKI cannot open: {names}\n\nSupported: images (.tif, .tiff, .czi, .nd2, .lif, '
+                        '.zarr, .h5, .mat, .npy, .png, .jpg), folders of images, ImageJ ROIs (.roi, .zip) and macros (.py).')
         if not opened_sequence and not any(kinds.values()):
             self.status('Nothing to open')
 

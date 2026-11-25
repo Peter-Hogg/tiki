@@ -15,6 +15,8 @@ and intends to use [Semantic Versioning](https://semver.org/) for releases.
 - Dedicated Brightness/Contrast dialog (`Ctrl+Shift+C`), Lookup Tables menu (`Fire`, `Cyan Hot`, `HiLo`, etc.) and per-channel contrast sliders in the Channels tool.
 - `Duplicate…` / `Make Substack…` slice-range dialog, `Bin…` stack/spatial downsampling, lazy Dask `Image Sequence…` import (`Ctrl+Shift+I`), and calibrated ImageJ hyperstack / Labels TIFF saving.
 - First-class rigid `Motion Correction…` (with dual-channel shift application and drift plot) and `Labels ▸ Watershed…` / `Fill Holes`.
+- Live polyline `Plot Profile` (`Ctrl+K`) with adjustable width, Magic Wand & segmented-line toolbar tools, `Restore Selection` (`Ctrl+Shift+R`), `Enlarge / Shrink…`, `Make Band…`, `Clear / Clear Outside`, `Image ▸ Transform`, `Image ▸ Type` (8/16/32-bit & RGB flatten), `Set Measurements…`, and calibrated units in Results headers and status bar.
+- Optional `[formats]` readers for Nikon `.nd2`, Leica `.lif`, lazy OME-Zarr `.zarr` (`File ▸ Import ▸ OME-Zarr…`), and HDF5 / MATLAB v7.3 `.h5`/`.hdf5`/`.mat`.
 - Sphinx documentation and GitHub Pages deployment.
 
 ## [0.0.1] - 2026-10-27

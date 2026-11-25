@@ -12,8 +12,8 @@ import tifffile
 
 from . import axes as axes_mod
 
-OPEN_FILTER = 'Images (*.tif *.tiff *.czi *.npy *.png *.jpg);;All files (*)'
-IMAGE_SUFFIXES = {'.tif', '.tiff', '.czi', '.npy', '.png', '.jpg', '.jpeg'}
+OPEN_FILTER = 'Images (*.tif *.tiff *.czi *.nd2 *.lif *.h5 *.hdf5 *.mat *.npy *.png *.jpg);;All files (*)'
+IMAGE_SUFFIXES = {'.tif', '.tiff', '.czi', '.nd2', '.lif', '.zarr', '.h5', '.hdf5', '.mat', '.npy', '.png', '.jpg', '.jpeg'}
 ROI_SUFFIXES = {'.roi', '.zip'}
 MACRO_SUFFIXES = {'.py'}
 
@@ -27,16 +27,20 @@ def sort_dropped(paths) -> dict[str, list[Path]]:
     """Sort dropped paths into images, ROI files, macros and anything unsupported.
 
     A folder contributes its image files (not recursive), naturally sorted by
-    name, as ImageJ does when a folder is dropped on its toolbar.
+    name, as ImageJ does when a folder is dropped on its toolbar. ``.zarr``
+    directories are treated as single image stores.
     """
     out: dict[str, list[Path]] = {'images': [], 'rois': [], 'macros': [], 'skipped': []}
     for raw in paths:
         p = Path(raw)
         if p.is_dir():
-            out['images'] += sorted(
-                (f for f in p.iterdir() if f.is_file() and f.suffix.lower() in IMAGE_SUFFIXES),
-                key=_natural_key,
-            )
+            if p.suffix.lower() == '.zarr':
+                out['images'].append(p)
+            else:
+                out['images'] += sorted(
+                    (f for f in p.iterdir() if f.is_file() and f.suffix.lower() in IMAGE_SUFFIXES),
+                    key=_natural_key,
+                )
             continue
         suffix = p.suffix.lower()
         if suffix in IMAGE_SUFFIXES:
@@ -288,6 +292,333 @@ def read_czi(path: str | Path, scene: int | None = None) -> tuple[np.ndarray, di
     return scenes[0]
 
 
+def _rgb_to_lut(r: int, g: int, b: int) -> np.ndarray | None:
+    if r == g == b == 0:
+        return None
+    ramp = np.linspace(0.0, 1.0, 256)
+    return np.vstack([np.round(ramp * r), np.round(ramp * g), np.round(ramp * b)]).astype(np.uint8)
+
+
+def read_nd2_scenes(path: str | Path) -> list[tuple[object, dict]]:
+    """Read a Nikon ``.nd2`` file (lazily via dask when supported), one entry per stage position."""
+    try:
+        import nd2
+    except ImportError as exc:
+        raise RuntimeError(
+            'Opening .nd2 files requires nd2: pip install nd2 (or pip install "napari-tiki[formats]")'
+        ) from exc
+
+    path = Path(path)
+    with nd2.ND2File(path) as f:
+        sizes = dict(getattr(f, 'sizes', {}))
+        try:
+            raw = f.to_dask()
+        except Exception:
+            raw = f.asarray()
+        codes = ''.join(sizes.keys()) if len(sizes) == raw.ndim else ''
+        voxel = None
+        try:
+            voxel = f.voxel_size()
+        except Exception:
+            pass
+
+        luts: list[np.ndarray] = []
+        meta_obj = getattr(f, 'metadata', None)
+        for ch in getattr(meta_obj, 'channels', None) or []:
+            c_info = getattr(ch, 'channel', ch)
+            rgb_int = getattr(c_info, 'colorRGB', None)
+            if isinstance(rgb_int, int):
+                # Nikon stores 0x00BBGGRR
+                lut = _rgb_to_lut(rgb_int & 0xFF, (rgb_int >> 8) & 0xFF, (rgb_int >> 16) & 0xFF)
+                if lut is not None:
+                    luts.append(lut)
+
+        def _build_entry(arr, ax_codes: str, name: str) -> tuple[object, dict]:
+            if len(ax_codes) == arr.ndim:
+                axes_list = []
+                for c, n in zip(ax_codes, arr.shape):
+                    role = axes_mod.TIFF_ROLES.get(c, '?')
+                    step, unit = None, None
+                    if voxel is not None:
+                        v = {'X': getattr(voxel, 'x', None), 'Y': getattr(voxel, 'y', None), 'Z': getattr(voxel, 'z', None)}.get(role)
+                        if v and float(v) > 0:
+                            step, unit = float(v), 'µm'
+                    axes_list.append(axes_mod.Axis(role, int(n), step, unit))
+                info = axes_mod.AxesInfo(axes_list, 'ND2 metadata', '?' not in ''.join(a.role for a in axes_list[:-2]))
+                if info.problems(arr.shape):
+                    info = axes_mod.guess(arr.shape)
+            else:
+                info = _axes_without_metadata(path, arr.shape)
+            meta: dict = {'name': name, 'path': str(path), 'axes': info}
+            c_idx = info.index('C')
+            if c_idx is not None and len(luts) == arr.shape[c_idx]:
+                meta['imagej_luts'] = luts
+            return arr, meta
+
+        if 'P' in codes:
+            p_idx = codes.index('P')
+            n_p = raw.shape[p_idx]
+            rest_codes = codes[:p_idx] + codes[p_idx + 1 :]
+            if n_p > 1:
+                out = []
+                for p in range(n_p):
+                    sl = (slice(None),) * p_idx + (p,) + (slice(None),) * (raw.ndim - p_idx - 1)
+                    out.append(_build_entry(raw[sl], rest_codes, f'{path.name} [P{p}]'))
+                return out
+            sl = (slice(None),) * p_idx + (0,) + (slice(None),) * (raw.ndim - p_idx - 1)
+            return [_build_entry(raw[sl], rest_codes, path.name)]
+        return [_build_entry(raw, codes, path.name)]
+
+
+def read_nd2(path: str | Path, scene: int | None = None) -> tuple[object, dict]:
+    scenes = read_nd2_scenes(path)
+    return scenes[scene or 0]
+
+
+def read_lif_scenes(path: str | Path) -> list[tuple[object, dict]]:
+    """Read all series in a Leica ``.lif`` archive lazily via dask."""
+    try:
+        from readlif.reader import LifFile
+    except ImportError as exc:
+        raise RuntimeError(
+            'Opening .lif files requires readlif: pip install readlif (or pip install "napari-tiki[formats]")'
+        ) from exc
+
+    import dask
+    import dask.array as da
+
+    path = Path(path)
+    lif = LifFile(str(path))
+    images = list(lif.get_iter_image())
+    if not images:
+        raise ValueError(f'{path.name} contains no images')
+    multi = len(images) > 1
+    out: list[tuple[object, dict]] = []
+    for idx, img in enumerate(images):
+        nt = max(1, int(getattr(img.dims, 't', 1)))
+        nz = max(1, int(getattr(img.dims, 'z', 1)))
+        nc = max(1, int(getattr(img, 'channels', 1)))
+        first = np.asarray(img.get_frame(z=0, t=0, c=0))
+        plane_shape, dtype = first.shape, first.dtype
+
+        def _get(z, t, c, _im=img):
+            return np.asarray(_im.get_frame(z=z, t=t, c=c), dtype=dtype)
+
+        t_blocks = []
+        for t in range(nt):
+            z_blocks = []
+            for z in range(nz):
+                c_blocks = [
+                    da.from_delayed(dask.delayed(_get)(z, t, c), shape=plane_shape, dtype=dtype)
+                    for c in range(nc)
+                ]
+                z_blocks.append(da.stack(c_blocks, axis=0))
+            t_blocks.append(da.stack(z_blocks, axis=0))
+        stack = da.stack(t_blocks, axis=0)  # (T, Z, C, Y, X)
+
+        roles = ['T', 'Z', 'C', 'Y', 'X']
+        sl = []
+        kept_roles = []
+        for d, (r, n) in enumerate(zip(roles[:3], (nt, nz, nc))):
+            if n == 1:
+                sl.append(0)
+            else:
+                sl.append(slice(None))
+                kept_roles.append(r)
+        kept_roles.extend(['Y', 'X'])
+        arr = stack[tuple(sl)] if any(isinstance(x, int) for x in sl) else stack
+
+        # readlif scale is (px/um_x, px/um_y, px/um_z, frames/s_t)
+        raw_scale = getattr(img, 'scale', (None, None, None, None)) or (None, None, None, None)
+        step_map = {}
+        for role, raw_s, unit in (
+            ('X', raw_scale[0] if len(raw_scale) > 0 else None, 'µm'),
+            ('Y', raw_scale[1] if len(raw_scale) > 1 else None, 'µm'),
+            ('Z', raw_scale[2] if len(raw_scale) > 2 else None, 'µm'),
+            ('T', raw_scale[3] if len(raw_scale) > 3 else None, 's'),
+        ):
+            if raw_s and float(raw_s) > 0:
+                step_map[role] = (1.0 / float(raw_s), unit)
+
+        axes_list = []
+        for r, n in zip(kept_roles, arr.shape[: len(kept_roles)]):
+            step, unit = step_map.get(r, (None, None))
+            axes_list.append(axes_mod.Axis(r, int(n), step, unit))
+        info = axes_mod.AxesInfo(axes_list, 'LIF metadata', True)
+        series_name = getattr(img, 'name', '') or f'S{idx}'
+        title = f'{path.name} [{series_name}]' if multi else path.name
+        out.append((arr, {'name': title, 'path': str(path), 'axes': info, 'first_plane': first}))
+    return out
+
+
+def read_lif(path: str | Path, scene: int | None = None) -> tuple[object, dict]:
+    scenes = read_lif_scenes(path)
+    return scenes[scene or 0]
+
+
+def read_zarr(path: str | Path) -> tuple[object, dict]:
+    """Open an OME-Zarr or plain Zarr array lazily via dask."""
+    try:
+        import zarr
+    except ImportError as exc:
+        raise RuntimeError(
+            'Opening .zarr stores requires zarr: pip install zarr (or pip install "napari-tiki[formats]")'
+        ) from exc
+
+    import dask.array as da
+
+    path = Path(path)
+    root = zarr.open(str(path), mode='r')
+    attrs = dict(getattr(root, 'attrs', {}))
+    target = root
+    info = None
+    luts = None
+
+    if hasattr(root, 'keys') and 'multiscales' in attrs:
+        ms = attrs['multiscales'][0]
+        ds_path = ms['datasets'][0]['path']
+        target = root[ds_path]
+        arr = da.from_zarr(target)
+        info, hex_colors = axes_mod.from_ome_zarr(attrs, arr.shape)
+        c_idx = info.index('C')
+        if c_idx is not None and len(hex_colors) == arr.shape[c_idx]:
+            parsed = [_czi_color_to_lut(c) for c in hex_colors]
+            if all(p is not None for p in parsed):
+                luts = parsed
+    else:
+        if hasattr(root, 'keys'):
+            def _find_array(grp):
+                for key in sorted(grp.keys()):
+                    item = grp[key]
+                    if hasattr(item, 'shape') and hasattr(item, 'dtype'):
+                        return item
+                    if hasattr(item, 'keys'):
+                        found = _find_array(item)
+                        if found is not None:
+                            return found
+                return None
+
+            target = _find_array(root)
+            if target is None:
+                raise ValueError(f'No array found inside Zarr group {path.name}')
+        arr = da.from_zarr(target)
+        info = _axes_without_metadata(path, arr.shape)
+
+    first_plane = np.asarray(arr[(0,) * max(0, arr.ndim - 2)])
+    meta: dict = {'name': path.name, 'path': str(path), 'axes': info, 'first_plane': first_plane}
+    if luts is not None:
+        meta['imagej_luts'] = luts
+    return arr, meta
+
+
+def list_hdf5_datasets(path: str | Path) -> list[tuple[str, tuple[int, ...], np.dtype]]:
+    """Return ``[(dataset_path, shape, dtype), ...]`` for 2D+ numeric datasets in an HDF5/.mat file."""
+    try:
+        import h5py
+    except ImportError as exc:
+        raise RuntimeError(
+            'Opening HDF5/.mat files requires h5py: pip install h5py (or pip install "napari-tiki[formats]")'
+        ) from exc
+
+    found: list[tuple[str, tuple[int, ...], np.dtype]] = []
+    with h5py.File(path, 'r') as f:
+        def _visit(name, obj):
+            if isinstance(obj, h5py.Dataset) and obj.ndim >= 2 and (
+                np.issubdtype(obj.dtype, np.number) or obj.dtype == np.bool_
+            ):
+                found.append((name, tuple(int(s) for s in obj.shape), obj.dtype))
+
+        f.visititems(_visit)
+    return found
+
+
+def read_hdf5(path: str | Path, dataset: str | None = None) -> tuple[object, dict]:
+    """Read an HDF5 (``.h5``, ``.hdf5``) or MATLAB v7.3 (``.mat``) dataset."""
+    try:
+        import h5py
+    except ImportError as exc:
+        raise RuntimeError(
+            'Opening HDF5/.mat files requires h5py: pip install h5py (or pip install "napari-tiki[formats]")'
+        ) from exc
+
+    path = Path(path)
+    datasets = list_hdf5_datasets(path)
+    if not datasets:
+        raise ValueError(f'No 2D+ numeric datasets found in {path.name}')
+    if dataset is not None:
+        match = [d for d in datasets if d[0] == dataset]
+        if not match:
+            raise KeyError(f'Dataset {dataset!r} not found in {path.name}; available: {[d[0] for d in datasets]}')
+        key, shape, dtype = match[0]
+    else:
+        key, shape, dtype = max(datasets, key=lambda d: int(np.prod(d[1])))
+
+    nbytes = int(np.prod(shape)) * int(np.dtype(dtype).itemsize)
+    with h5py.File(path, 'r') as f:
+        ds = f[key]
+        ds_attrs = dict(ds.attrs)
+        if nbytes <= 256 * 2**20:
+            data: object = np.asarray(ds)
+            first_plane = data[(0,) * max(0, len(shape) - 2)]
+        else:
+            import dask
+            import dask.array as da
+
+            first_plane = np.asarray(ds[(0,) * max(0, len(shape) - 2)])
+            p_str = str(path)
+
+            def _read_slice(idx_tuple):
+                with h5py.File(p_str, 'r') as hf:
+                    return np.asarray(hf[key][idx_tuple], dtype=dtype)
+
+            lead = shape[:-2]
+            if len(lead) == 1:
+                blocks = [
+                    da.from_delayed(dask.delayed(_read_slice)((i,)), shape=shape[-2:], dtype=dtype)
+                    for i in range(lead[0])
+                ]
+                data = da.stack(blocks, axis=0)
+            else:
+                # General nD lazy wrapper along axis 0
+                blocks = [
+                    da.from_delayed(dask.delayed(_read_slice)((i,)), shape=shape[1:], dtype=dtype)
+                    for i in range(shape[0])
+                ]
+                data = da.stack(blocks, axis=0)
+
+    info = _axes_without_metadata(path, shape)
+    raw_axes = ds_attrs.get('axes')
+    if isinstance(raw_axes, (bytes, bytearray)):
+        raw_axes = raw_axes.decode('utf-8', errors='ignore')
+    if isinstance(raw_axes, str) and len(raw_axes) == len(shape):
+        cand = axes_mod.AxesInfo(
+            [axes_mod.Axis(axes_mod.TIFF_ROLES.get(c.upper(), '?'), int(n)) for c, n in zip(raw_axes, shape)],
+            'HDF5 metadata',
+            '?' not in raw_axes[:-2],
+        )
+        if not cand.problems(shape):
+            info = cand
+    if len(datasets) > 1:
+        others = [d[0] for d in datasets if d[0] != key][:4]
+        info.notes.append(f'opened dataset "{key}" (others: {", ".join(others)})')
+    meta: dict = {'name': f'{path.name}:{key}' if len(datasets) > 1 else path.name, 'path': str(path), 'axes': info}
+    if hasattr(data, 'compute'):
+        meta['first_plane'] = first_plane
+    return data, meta
+
+
+def read_multi(path: str | Path) -> list[tuple[object, dict]]:
+    """Open ``path`` and return one or more ``(data, meta)`` pairs (multi-scene formats)."""
+    suffix = Path(path).suffix.lower()
+    if suffix == '.czi':
+        return read_czi_scenes(path)
+    if suffix == '.nd2':
+        return read_nd2_scenes(path)
+    if suffix == '.lif':
+        return read_lif_scenes(path)
+    return [read_image(path)]
+
+
 def read_image(path: str | Path) -> tuple[np.ndarray, dict]:
     """Return ``(data, meta)``; meta has ``name``, ``path`` and ``axes`` (AxesInfo).
 
@@ -303,6 +634,14 @@ def read_image(path: str | Path) -> tuple[np.ndarray, dict]:
         return data, meta
     if suffix == '.czi':
         return read_czi(path)
+    if suffix == '.nd2':
+        return read_nd2(path)
+    if suffix == '.lif':
+        return read_lif(path)
+    if suffix == '.zarr':
+        return read_zarr(path)
+    if suffix in ('.h5', '.hdf5', '.mat'):
+        return read_hdf5(path)
     if suffix in ('.tif', '.tiff'):
         # tifffile logs (rather than raises) when the header promises more
         # frames than the file holds; report that ourselves instead.

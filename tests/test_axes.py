@@ -266,3 +266,136 @@ def test_czi_axes_metadata_and_read_scenes(tmp_path, monkeypatch):
     assert len(meta0['imagej_luts']) == 2
     assert meta0['imagej_luts'][0][1, -1] == 255 and meta0['imagej_luts'][0][0, -1] == 0
     assert meta0['imagej_luts'][1][0, -1] == 255 and meta0['imagej_luts'][1][1, -1] == 0
+
+
+def test_ome_zarr_nd2_lif_and_hdf5_readers(tmp_path, monkeypatch):
+    import sys
+    import types
+
+    # 1. OME-Zarr metadata + folder drop recognition
+    zdir = tmp_path / 'sample.zarr'
+    zdir.mkdir()
+    assert io.sort_dropped([zdir])['images'] == [zdir]
+
+    z_attrs = {
+        'multiscales': [{
+            'axes': [
+                {'name': 't', 'unit': 'second'},
+                {'name': 'c'},
+                {'name': 'z', 'unit': 'micrometer'},
+                {'name': 'y', 'unit': 'micrometer'},
+                {'name': 'x', 'unit': 'micrometer'},
+            ],
+            'datasets': [{
+                'path': '0',
+                'coordinateTransformations': [{'type': 'scale', 'scale': [0.5, 1.0, 2.0, 0.25, 0.25]}],
+            }],
+        }],
+        'omero': {'channels': [{'color': '00FF00'}, {'color': 'FF00FF'}]},
+    }
+    z_info, z_colors = axes.from_ome_zarr(z_attrs, (3, 2, 4, 16, 16))
+    assert z_info.roles == 'TCZYX' and z_info.scale == pytest.approx([0.5, 1.0, 2.0, 0.25, 0.25])
+    assert z_colors == ['00FF00', 'FF00FF']
+
+    # 2. Nikon ND2 (multi-position)
+    class FakeND2:
+        def __init__(self, _p):
+            self.sizes = {'P': 2, 'C': 2, 'Y': 8, 'X': 8}
+            self.metadata = types.SimpleNamespace(
+                channels=[
+                    types.SimpleNamespace(channel=types.SimpleNamespace(colorRGB=0x00FF00)),
+                    types.SimpleNamespace(channel=types.SimpleNamespace(colorRGB=0x0000FF)),
+                ]
+            )
+
+        def voxel_size(self):
+            return types.SimpleNamespace(x=0.3, y=0.3, z=1.0)
+
+        def to_dask(self):
+            return np.zeros((2, 2, 8, 8), dtype=np.uint16)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    monkeypatch.setitem(sys.modules, 'nd2', types.SimpleNamespace(ND2File=FakeND2))
+    nd2_path = tmp_path / 'test.nd2'
+    nd2_path.write_bytes(b'dummy')
+    nd2_scenes = io.read_nd2_scenes(nd2_path)
+    assert len(nd2_scenes) == 2
+    assert nd2_scenes[0][0].shape == (2, 8, 8) and nd2_scenes[0][1]['axes'].roles == 'CYX'
+    assert nd2_scenes[0][1]['axes'].scale == pytest.approx([1.0, 0.3, 0.3])
+    assert len(nd2_scenes[0][1]['imagej_luts']) == 2
+
+    # 3. Leica LIF (lazy dask)
+    class FakeLifImg:
+        def __init__(self, name, val):
+            self.name = name
+            self.dims = types.SimpleNamespace(t=2, z=1, y=6, x=6)
+            self.channels = 1
+            self.scale = (4.0, 4.0, None, 2.0)  # 4 px/um -> 0.25 um, 2 fps -> 0.5 s
+            self._val = val
+
+        def get_frame(self, z=0, t=0, c=0):
+            return np.full((6, 6), self._val + t, dtype=np.uint16)
+
+    class FakeLifFile:
+        def __init__(self, _p):
+            pass
+
+        def get_iter_image(self):
+            return iter([FakeLifImg('SeriesA', 10), FakeLifImg('SeriesB', 20)])
+
+    monkeypatch.setitem(sys.modules, 'readlif', types.SimpleNamespace())
+    monkeypatch.setitem(sys.modules, 'readlif.reader', types.SimpleNamespace(LifFile=FakeLifFile))
+    lif_path = tmp_path / 'exp.lif'
+    lif_path.write_bytes(b'dummy')
+    lif_scenes = io.read_lif_scenes(lif_path)
+    assert len(lif_scenes) == 2
+    arr_a, meta_a = lif_scenes[0]
+    assert hasattr(arr_a, 'compute') and arr_a.shape == (2, 6, 6)
+    assert meta_a['axes'].roles == 'TYX' and meta_a['axes'].scale == pytest.approx([0.5, 0.25, 0.25])
+    assert int(np.asarray(arr_a[1])[0, 0]) == 11
+
+    # 4. HDF5 (picks largest dataset and reads axes attr)
+    class FakeDataset:
+        def __init__(self, arr, attrs=None):
+            self._arr = arr
+            self.shape = arr.shape
+            self.ndim = arr.ndim
+            self.dtype = arr.dtype
+            self.attrs = attrs or {}
+
+        def __array__(self, dtype=None):
+            return np.asarray(self._arr, dtype=dtype)
+
+        def __getitem__(self, item):
+            return self._arr[item]
+
+    class FakeH5File:
+        def __init__(self, _p, _m='r'):
+            self._items = {
+                'meta/small': FakeDataset(np.zeros((2, 2), np.float32)),
+                'mov': FakeDataset(np.ones((5, 8, 8), np.float32), {'axes': 'TYX'}),
+            }
+
+        def visititems(self, fn):
+            for k, v in self._items.items():
+                fn(k, v)
+
+        def __getitem__(self, k):
+            return self._items[k]
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    monkeypatch.setitem(sys.modules, 'h5py', types.SimpleNamespace(File=FakeH5File, Dataset=FakeDataset))
+    h5_path = tmp_path / 'movie.h5'
+    h5_path.write_bytes(b'dummy')
+    h5_data, h5_meta = io.read_hdf5(h5_path)
+    assert h5_data.shape == (5, 8, 8) and h5_meta['axes'].roles == 'TYX'

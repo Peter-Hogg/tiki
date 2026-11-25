@@ -60,24 +60,107 @@ def z_project(data: np.ndarray, method: str = 'max', axis: int = 0) -> np.ndarra
     return out
 
 
-def mask_stats(plane: np.ndarray, mask: np.ndarray | None, pixel_area: float = 1.0) -> dict:
+MEASUREMENT_KEYS = [
+    'Area',
+    'Mean',
+    'StdDev',
+    'Min',
+    'Max',
+    'IntDen',
+    'RawIntDen',
+    'Median',
+    'Centroid',
+    'Perimeter',
+    'Circularity',
+    'Feret',
+    'AR',
+    'Solidity',
+]
+DEFAULT_MEASUREMENTS = {'Area', 'Mean', 'StdDev', 'Min', 'Max', 'IntDen', 'RawIntDen'}
+
+
+def mask_stats(
+    plane: np.ndarray,
+    mask: np.ndarray | None,
+    pixel_area: float = 1.0,
+    scale: tuple[float, float] | None = None,
+    include: set[str] | list[str] | None = None,
+) -> dict:
     """ImageJ-style measurements of ``plane`` inside ``mask`` (whole plane if None)."""
+    wanted = DEFAULT_MEASUREMENTS if include is None else set(include)
     values = plane[mask] if mask is not None else plane.ravel()
     values = np.asarray(values, dtype=np.float64)
+    sy, sx = (float(scale[0]), float(scale[1])) if scale is not None else (float(np.sqrt(pixel_area)), float(np.sqrt(pixel_area)))
+
     if values.size == 0:
         nan = float('nan')
-        return dict(Area=0.0, Mean=nan, StdDev=nan, Min=nan, Max=nan, IntDen=nan, RawIntDen=nan)
+        row: dict = {}
+        if 'Area' in wanted:
+            row['Area'] = 0.0
+        for key in ('Mean', 'StdDev', 'Min', 'Max', 'Median', 'IntDen', 'RawIntDen'):
+            if key in wanted:
+                row[key] = nan
+        if 'Centroid' in wanted:
+            row['X'] = nan
+            row['Y'] = nan
+        if 'Perimeter' in wanted:
+            row['Perim.'] = nan
+        if 'Circularity' in wanted:
+            row['Circ.'] = nan
+        if 'Feret' in wanted:
+            row['Feret'] = nan
+        if 'AR' in wanted:
+            row['AR'] = nan
+        if 'Solidity' in wanted:
+            row['Solidity'] = nan
+        return row
+
     area = values.size * pixel_area
     mean = float(values.mean())
-    return dict(
-        Area=area,
-        Mean=mean,
-        StdDev=float(values.std(ddof=1)) if values.size > 1 else 0.0,
-        Min=float(values.min()),
-        Max=float(values.max()),
-        IntDen=area * mean,
-        RawIntDen=float(values.sum()),
-    )
+    row = {}
+    if 'Area' in wanted:
+        row['Area'] = area
+    if 'Mean' in wanted:
+        row['Mean'] = mean
+    if 'StdDev' in wanted:
+        row['StdDev'] = float(values.std(ddof=1)) if values.size > 1 else 0.0
+    if 'Min' in wanted:
+        row['Min'] = float(values.min())
+    if 'Max' in wanted:
+        row['Max'] = float(values.max())
+    if 'Median' in wanted:
+        row['Median'] = float(np.median(values))
+    if 'IntDen' in wanted:
+        row['IntDen'] = area * mean
+    if 'RawIntDen' in wanted:
+        row['RawIntDen'] = float(values.sum())
+
+    shape_keys = {'Centroid', 'Perimeter', 'Circularity', 'Feret', 'AR', 'Solidity'}
+    if wanted & shape_keys:
+        from skimage.measure import regionprops
+
+        bin_mask = np.ones(plane.shape[:2], dtype=np.uint8) if mask is None else mask.astype(np.uint8)
+        props = regionprops(bin_mask)
+        if props:
+            reg = props[0]
+            area_px = float(reg.area)
+            perim_px = float(reg.perimeter)
+            cy, cx = reg.centroid
+            if 'Centroid' in wanted:
+                row['X'] = float(cx * sx)
+                row['Y'] = float(cy * sy)
+            if 'Perimeter' in wanted:
+                row['Perim.'] = float(perim_px * sx)
+            if 'Circularity' in wanted:
+                row['Circ.'] = float(min(1.0, 4 * np.pi * area_px / perim_px**2)) if perim_px > 0 else 1.0
+            if 'Feret' in wanted:
+                row['Feret'] = float(reg.feret_diameter_max * sx)
+            if 'AR' in wanted:
+                major, minor = reg.axis_major_length, reg.axis_minor_length
+                row['AR'] = float(major / minor) if minor > 0 else float('nan')
+            if 'Solidity' in wanted:
+                row['Solidity'] = float(reg.solidity)
+    return row
 
 
 def axis_profile(
@@ -218,7 +301,6 @@ def threshold_blocks(data, lower: float, upper: float, blocks: list[tuple], spli
         if progress is not None and progress(n + 1, len(blocks)) is False:
             break
     return out
-
 
 def threshold_stack(
     data: np.ndarray, lower: float, upper: float, split: bool = False, min_size: int = 0
@@ -1286,5 +1368,240 @@ def watershed_blocks(
             next_id = int(result.max())
         out[b] = result
         if progress is not None and progress(n + 1, len(blocks)) is False:
+            break
+    return out
+
+
+# -------------------------------------------- line profiles, selections, wand
+
+def line_profile(
+    plane: np.ndarray,
+    verts: np.ndarray,
+    width: int = 1,
+    scale: tuple[float, float] = (1.0, 1.0),
+) -> tuple[np.ndarray, np.ndarray]:
+    """Intensity profile along a straight line or polyline, averaged across ``width`` px.
+
+    Returns ``(distances, values)`` where ``distances`` uses ``scale = (sy, sx)``.
+    """
+    from scipy.ndimage import map_coordinates
+
+    width = max(1, int(width))
+    samples = line_samples(verts, width)  # (width, n, 2)
+    coords = samples.reshape(-1, 2).T
+    vals = map_coordinates(np.asarray(plane, dtype=np.float32), coords, order=1, mode='nearest')
+    profile = vals.reshape(samples.shape[:2]).mean(axis=0)
+    center = samples[width // 2] if width % 2 == 1 else samples.mean(axis=0)
+    diffs = np.diff(center, axis=0) * np.asarray(scale, dtype=float)
+    dist = np.concatenate([[0.0], np.cumsum(np.linalg.norm(diffs, axis=1))])
+    return dist, profile
+
+
+def wand_mask(plane: np.ndarray, y: int, x: int, tolerance: float = 0.0) -> np.ndarray:
+    """8-connected flood selection starting at ``(y, x)`` within ``tolerance``."""
+    from skimage.segmentation import flood
+
+    arr = np.asarray(plane, dtype=np.float64)
+    h, w = arr.shape[:2]
+    if not (0 <= y < h and 0 <= x < w):
+        return np.zeros((h, w), dtype=bool)
+    return flood(arr, (int(y), int(x)), tolerance=max(0.0, float(tolerance)), connectivity=2)
+
+
+def mask_to_polygon(mask: np.ndarray, tolerance: float = 0.5) -> np.ndarray | None:
+    """Outer boundary polygon ``(N, 2)`` in ``(y, x)`` coordinates of the largest component."""
+    from skimage.measure import approximate_polygon, find_contours
+
+    m = np.asarray(mask, dtype=bool)
+    if not m.any():
+        return None
+    contours = find_contours(np.pad(m, 1).astype(np.uint8), 0.5)
+    if not contours:
+        return None
+    contour = max(contours, key=len) - 1.0
+    if tolerance > 0 and len(contour) > 8:
+        contour = approximate_polygon(contour, tolerance)
+    if contour.shape[0] > 1 and np.allclose(contour[0], contour[-1]):
+        contour = contour[:-1]
+    return contour if len(contour) >= 3 else None
+
+
+def enlarge_mask(mask: np.ndarray, pixels: float) -> np.ndarray:
+    """Dilate (``pixels > 0``) or erode (``pixels < 0``) a 2D boolean mask by Euclidean distance."""
+    from scipy.ndimage import distance_transform_edt
+
+    m = np.asarray(mask, dtype=bool)
+    pixels = float(pixels)
+    if pixels == 0 or not m.any():
+        return m.copy()
+    if pixels > 0:
+        return distance_transform_edt(~m) <= pixels
+    # Pad with False so objects touching the image border also erode inward
+    dist = distance_transform_edt(np.pad(m, 1, constant_values=False))[1:-1, 1:-1]
+    return dist > abs(pixels)
+
+
+def make_band_mask(mask: np.ndarray, width: float, gap: float = 0.0) -> np.ndarray:
+    """Annulus ring around ``mask`` of ``width`` px, separated by ``gap`` px."""
+    m = np.asarray(mask, dtype=bool)
+    width = max(0.0, float(width))
+    gap = max(0.0, float(gap))
+    if width == 0 or not m.any():
+        return np.zeros_like(m, dtype=bool)
+    inner = enlarge_mask(m, gap) if gap > 0 else m
+    outer = enlarge_mask(m, gap + width)
+    return outer & ~inner
+
+
+def clear_mask(
+    data,
+    mask: np.ndarray,
+    outside: bool = False,
+    fill_value: float = 0.0,
+    index: tuple | None = None,
+    whole_stack: bool = False,
+    rgb: bool = False,
+    progress=None,
+) -> np.ndarray:
+    """Return a copy of ``data`` (or one plane) with pixels inside/outside ``mask`` set to ``fill_value``."""
+    target = ~np.asarray(mask, dtype=bool) if outside else np.asarray(mask, dtype=bool)
+    fill = np.asarray(fill_value, dtype=data.dtype)
+    spatial_end = data.ndim - 1 if rgb and data.ndim >= 3 else data.ndim
+    lead_ndim = spatial_end - 2
+
+    if lead_ndim == 0 or not whole_stack:
+        sl = tuple(int(index[d]) for d in range(lead_ndim)) if (index is not None and lead_ndim > 0) else ()
+        plane = np.asarray(data[sl]).copy()
+        plane[target] = fill
+        return plane
+
+    out = np.empty(data.shape, dtype=data.dtype)
+    lead_shape = data.shape[:lead_ndim]
+    combos = list(np.ndindex(*lead_shape))
+    for n, idx in enumerate(combos):
+        plane = np.asarray(data[idx]).copy()
+        plane[target] = fill
+        out[idx] = plane
+        if progress is not None and progress(n + 1, len(combos)) is False:
+            break
+    return out
+
+
+# -------------------------------------------- transforms & type conversion
+
+def flip_image(data, axis: str = 'horizontal', rgb: bool = False) -> np.ndarray:
+    """Flip spatial X (``'horizontal'``) or Y (``'vertical'``), returning an array."""
+    spatial_end = data.ndim - 1 if rgb and data.ndim >= 3 else data.ndim
+    ax = spatial_end - 1 if axis == 'horizontal' else spatial_end - 2
+    if axis not in ('horizontal', 'vertical'):
+        raise ValueError(f'unknown flip axis {axis!r}')
+    return np.ascontiguousarray(np.flip(np.asarray(data), axis=ax))
+
+
+def rotate_90(data, k: int = 1, rgb: bool = False) -> np.ndarray:
+    """Rotate 90° counterclockwise ``k`` times (``k=-1`` = 90° right / clockwise)."""
+    spatial_end = data.ndim - 1 if rgb and data.ndim >= 3 else data.ndim
+    axes = (spatial_end - 2, spatial_end - 1)
+    return np.ascontiguousarray(np.rot90(np.asarray(data), k=k, axes=axes))
+
+
+def rotate_angle(
+    data,
+    angle: float,
+    resize: bool = False,
+    rgb: bool = False,
+    progress=None,
+) -> np.ndarray:
+    """Rotate every 2D spatial plane by ``angle`` degrees (positive = clockwise like ImageJ)."""
+    from scipy.ndimage import rotate as nd_rotate
+
+    spatial_end = data.ndim - 1 if rgb and data.ndim >= 3 else data.ndim
+    lead_ndim = spatial_end - 2
+    # scipy.ndimage.rotate uses CCW for positive angle on (y, x); negate for ImageJ CW convention
+    scipy_angle = -float(angle)
+
+    def _rot_plane(plane: np.ndarray) -> np.ndarray:
+        if rgb and plane.ndim == 3:
+            chans = [nd_rotate(plane[..., c].astype(np.float32), scipy_angle, reshape=resize, order=1)
+                     for c in range(plane.shape[-1])]
+            return np.stack(chans, axis=-1)
+        return nd_rotate(plane.astype(np.float32), scipy_angle, reshape=resize, order=1)
+
+    if lead_ndim == 0:
+        return _rot_plane(np.asarray(data))
+
+    lead_shape = data.shape[:lead_ndim]
+    combos = list(np.ndindex(*lead_shape))
+    first = _rot_plane(np.asarray(data[combos[0]]))
+    out = np.empty(lead_shape + first.shape, dtype=np.float32)
+    out[combos[0]] = first
+    for n, idx in enumerate(combos[1:], start=2):
+        out[idx] = _rot_plane(np.asarray(data[idx]))
+        if progress is not None and progress(n, len(combos)) is False:
+            break
+    return out
+
+
+def convert_type(
+    data,
+    target_dtype: str,
+    scale_range: tuple[float, float] | None = None,
+    progress=None,
+) -> np.ndarray:
+    """Convert ``data`` to ``'uint8'``, ``'uint16'``, or ``'float32'``, plane by plane."""
+    dtype_map = {'uint8': np.uint8, 'uint16': np.uint16, 'float32': np.float32}
+    if target_dtype not in dtype_map:
+        raise ValueError(f'unsupported target dtype {target_dtype!r}')
+    dst = np.dtype(dtype_map[target_dtype])
+
+    def _conv(plane: np.ndarray) -> np.ndarray:
+        if dst == np.float32:
+            return np.asarray(plane, dtype=np.float32)
+        hi_dst = float(np.iinfo(dst).max)
+        arr = np.asarray(plane, dtype=np.float64)
+        if scale_range is not None:
+            lo, hi = float(scale_range[0]), float(scale_range[1])
+            span = hi - lo if hi > lo else 1.0
+            arr = (arr - lo) / span * hi_dst
+        return np.clip(np.round(arr), 0.0, hi_dst).astype(dst)
+
+    if data.ndim <= 2:
+        return _conv(np.asarray(data))
+
+    lead = data.shape[:-2]
+    combos = list(np.ndindex(*lead))
+    out = np.empty(data.shape, dtype=dst)
+    for n, idx in enumerate(combos):
+        out[idx] = _conv(np.asarray(data[idx]))
+        if progress is not None and progress(n + 1, len(combos)) is False:
+            break
+    return out
+
+
+def composite_rgb(
+    layers: list[tuple[object, object, tuple[float, float]]],
+    progress=None,
+) -> np.ndarray:
+    """Flatten ``[(data, colormap, (lo, hi)), ...]`` additively into uint8 RGB ``(..., Y, X, 3)``."""
+    if not layers:
+        raise ValueError('no layers to composite')
+    ref_shape = layers[0][0].shape
+    for data, _, _ in layers:
+        if data.shape != ref_shape:
+            raise ValueError(f'layer shape {data.shape} does not match {ref_shape}')
+
+    lead = ref_shape[:-2]
+    combos = list(np.ndindex(*lead)) if lead else [()]
+    out = np.empty(ref_shape + (3,), dtype=np.uint8)
+    for n, idx in enumerate(combos):
+        acc = np.zeros(ref_shape[-2:] + (3,), dtype=np.float32)
+        for data, cmap, (lo, hi) in layers:
+            plane = np.asarray(data[idx], dtype=np.float32)
+            span = float(hi - lo) if hi > lo else 1.0
+            norm = np.clip((plane - float(lo)) / span, 0.0, 1.0)
+            rgb = np.asarray(cmap.map(norm.ravel()), dtype=np.float32)[:, :3].reshape(ref_shape[-2:] + (3,))
+            acc += rgb
+        out[idx] = np.clip(np.round(acc * 255.0), 0, 255).astype(np.uint8)
+        if progress is not None and progress(n + 1, len(combos)) is False:
             break
     return out

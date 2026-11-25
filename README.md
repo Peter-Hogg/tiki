@@ -115,10 +115,16 @@ pixel value.
 
 ### ImageJ-like toolbar
 
-- Rectangle, oval, polygon, freehand, straight-line and point selections
+- Rectangle, oval, polygon, freehand, straight-line, segmented-line (polyline),
+  magic wand and point selections
 - Move/edit and pan tools
 - New selections replace the previous selection; hold <kbd>Shift</kbd> to keep
-  multiple selections
+  multiple selections, or press <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>R</kbd> to
+  restore the previous selection
+- **Edit ▸ Selection**: Enlarge / Shrink, Make Band (annulus/neuropil ring),
+  Wand Tolerance, plus non-destructive **Edit ▸ Clear / Clear Outside**
+- **Image ▸ Transform** (Flip, Rotate 90°, Rotate…) and **Image ▸ Type**
+  (8-bit, 16-bit, 32-bit, RGB Color composite flatten)
 - Application-wide shortcuts that continue to work when a napari image window
   has focus
 
@@ -137,10 +143,12 @@ pixel value.
 
 ### Measurement and plotting
 
-- Results table with area, mean, standard deviation, minimum, maximum and
-  integrated density
+- Results table with configurable **Analyze ▸ Set Measurements…** (Area, Mean,
+  StdDev, Min, Max, Median, IntDen, RawIntDen, Centroid, Perimeter, Circularity,
+  Feret, AR, Solidity) and unit-labelled headers for calibrated images
 - Copy results or save them as CSV
-- Straight-line intensity profiles
+- Live straight-line and polyline intensity profiles (<kbd>Ctrl</kbd>+<kbd>K</kbd>)
+  with adjustable line width
 - Live ROI intensity profile through a stack, with current-frame indicator
 - Copy profiles or save them as CSV
 
@@ -264,6 +272,9 @@ pixel value.
 
 - TIFF/OME-TIFF via `tifffile`
 - Zeiss `.czi` files via `czifile` (axes, physical scaling, channel colors and multi-scene support)
+- Optional `[formats]` extra (`pip install "napari-tiki[formats]"`): Nikon `.nd2`
+  (`nd2`), Leica `.lif` (`readlif`), lazy OME-Zarr `.zarr` (`zarr`), and HDF5 /
+  MATLAB v7.3 `.h5`/`.hdf5`/`.mat` (`h5py`)
 - **File ▸ Save As TIFF…**: writes calibrated ImageJ hyperstacks (including
   reordered `TZCYX`, merged split-channel composites with LUTs, and `Labels`
   layers) or OME-TIFF when required

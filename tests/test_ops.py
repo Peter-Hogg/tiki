@@ -395,3 +395,73 @@ def test_fill_holes_and_watershed_2d_and_3d():
     stack = np.stack([mask, mask])
     blk = ops.watershed_blocks(stack, [(0, slice(None), slice(None)), (1, slice(None), slice(None))], min_distance=5.0)
     assert blk[0].max() == 4 and blk[1].min() == 0 and set(np.unique(blk[1])) - {0} == {5, 6, 7, 8}
+
+
+def test_line_profile_polyline_and_width():
+    plane = np.zeros((30, 30), dtype=np.float32)
+    plane[9:12, :] = 100.0
+    plane[:, 19:22] = 200.0
+    verts = np.array([[10.0, 2.0], [10.0, 20.0], [25.0, 20.0]])
+    dist, vals = ops.line_profile(plane, verts, width=3, scale=(0.5, 0.5))
+    assert len(dist) == len(vals) and dist[0] == 0.0
+    assert dist[-1] == pytest.approx((18.0 + 15.0) * 0.5, rel=0.05)
+    assert vals[5] == pytest.approx(100.0, abs=1.0)
+    assert vals[-3] == pytest.approx(200.0, abs=1.0)
+
+
+def test_wand_enlarge_band_and_clear():
+    plane = np.full((40, 40), 10.0, dtype=np.float32)
+    plane[12:22, 14:24] = 100.0
+    plane[15, 16] = 105.0
+    m = ops.wand_mask(plane, 15, 16, tolerance=10.0)
+    assert m.sum() == 100
+    poly = ops.mask_to_polygon(m)
+    assert poly is not None and len(poly) >= 4
+
+    big = ops.enlarge_mask(m, 3.0)
+    small = ops.enlarge_mask(m, -2.0)
+    assert big.sum() > m.sum() > small.sum() > 0
+
+    band = ops.make_band_mask(m, width=3.0, gap=1.0)
+    assert band.any() and not (band & m).any()
+
+    stack = np.ones((3, 40, 40), dtype=np.uint16) * 50
+    cleared_in = ops.clear_mask(stack, m, outside=False, whole_stack=True)
+    cleared_out = ops.clear_mask(stack, m, outside=True, whole_stack=True)
+    assert cleared_in[:, m].max() == 0 and cleared_in[:, ~m].min() == 50
+    assert cleared_out[:, m].min() == 50 and cleared_out[:, ~m].max() == 0
+
+
+def test_transforms_type_conversion_and_composite_rgb():
+    from napari.utils.colormaps import Colormap
+
+    arr = np.arange(12, dtype=np.uint16).reshape(3, 4)
+    np.testing.assert_array_equal(ops.flip_image(arr, 'horizontal'), arr[:, ::-1])
+    np.testing.assert_array_equal(ops.flip_image(arr, 'vertical'), arr[::-1, :])
+    rot_r = ops.rotate_90(arr, -1)
+    assert rot_r.shape == (4, 3)
+    np.testing.assert_array_equal(ops.rotate_90(rot_r, 1), arr)
+
+    rot_a = ops.rotate_angle(arr.astype(np.float32), 90.0, resize=True)
+    assert rot_a.shape == (4, 3) and rot_a.dtype == np.float32
+
+    u8 = ops.convert_type(np.array([[0, 500], [1000, 2000]], dtype=np.uint16), 'uint8', scale_range=(0, 1000))
+    assert u8.dtype == np.uint8 and u8[0, 1] == 128 and u8[1, 0] == 255 and u8[1, 1] == 255
+
+    g_map = Colormap([[0, 0, 0, 1], [0, 1, 0, 1]], name='g')
+    r_map = Colormap([[0, 0, 0, 1], [1, 0, 0, 1]], name='r')
+    c1 = np.array([[0.0, 1.0], [1.0, 0.0]], dtype=np.float32)
+    c2 = np.array([[0.0, 0.0], [1.0, 1.0]], dtype=np.float32)
+    rgb = ops.composite_rgb([(c1, g_map, (0.0, 1.0)), (c2, r_map, (0.0, 1.0))])
+    assert rgb.shape == (2, 2, 3) and rgb.dtype == np.uint8
+    assert tuple(rgb[1, 0]) == (255, 255, 0)  # green + red = yellow
+
+
+def test_mask_stats_extended_measurements():
+    plane = np.arange(100, dtype=np.float32).reshape(10, 10)
+    mask = np.zeros((10, 10), dtype=bool)
+    mask[2:6, 3:8] = True
+    row = ops.mask_stats(plane, mask, pixel_area=0.25, scale=(0.5, 0.5), include=ops.MEASUREMENT_KEYS)
+    assert row['Area'] == pytest.approx(20 * 0.25)
+    assert row['Median'] == pytest.approx(np.median(plane[mask]))
+    assert 'X' in row and 'Y' in row and 'Perim.' in row and 'Circ.' in row and 'Feret' in row and 'Solidity' in row
