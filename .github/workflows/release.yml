@@ -19,7 +19,7 @@ jobs:
         include:
           - os: ubuntu-latest
             installer_ext: sh
-          - os: macos-14
+          - os: macos-latest
             installer_ext: pkg
           - os: windows-latest
             installer_ext: exe
