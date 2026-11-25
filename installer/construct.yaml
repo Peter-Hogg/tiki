@@ -13,7 +13,7 @@ specs:
   - pip
   - menuinst >=2.1
   - napari >=0.9
-  - pyqt >=6
+  - pyside6
   - numpy
   - scipy
   - scikit-image
