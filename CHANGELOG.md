@@ -18,6 +18,7 @@ and intends to use [Semantic Versioning](https://semver.org/) for releases.
 - Live polyline `Plot Profile` (`Ctrl+K`) with adjustable width, Magic Wand & segmented-line toolbar tools, `Restore Selection` (`Ctrl+Shift+R`), `Enlarge / Shrink…`, `Make Band…`, `Clear / Clear Outside`, `Image ▸ Transform`, `Image ▸ Type` (8/16/32-bit & RGB flatten), `Set Measurements…`, and calibrated units in Results headers and status bar.
 - Optional `[formats]` readers for Nikon `.nd2`, Leica `.lif`, lazy OME-Zarr `.zarr` (`File ▸ Import ▸ OME-Zarr…`), and HDF5 / MATLAB v7.3 `.h5`/`.hdf5`/`.mat`.
 - Publication & talk exports: `File ▸ Export ▸ Snapshot (PNG / SVG)…` & `Analyze ▸ Tools ▸ Scale Bar…` (composite channels + ROI overlays + calibrated burned-in scale bar), `File ▸ Export ▸ Export Movie (MP4 / GIF / AVI)…` (with FPS, scale bar & timestamps), `Image ▸ Stacks ▸ Make Montage…`, and linked `Image ▸ Stacks ▸ Orthogonal Views` (`Ctrl+Shift+H`).
+- Standalone app polish: lightweight startup splash screen (`--no-splash` to skip), `Help ▸ Check for Updates…`, GUI error dialogs with collapsible tracebacks & "Copy Error Details" button, `[all]` / `[video]` extras (`imageio-ffmpeg` + microscopy formats), and `Plugins ▸ Python Console…` (`Ctrl+Shift+J`).
 - Sphinx documentation and GitHub Pages deployment.
 
 ## [0.0.1] - 2026-10-27

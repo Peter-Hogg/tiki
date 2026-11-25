@@ -32,6 +32,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument('--install-desktop', action='store_true',
                         help='add TIKI to the application menu (Linux): pin it to the dock, drop files on it')
     parser.add_argument('--uninstall-desktop', action='store_true', help='remove the application-menu launcher')
+    parser.add_argument('--no-splash', action='store_true', help='skip the startup splash screen')
     args = parser.parse_args(sys.argv[1:] if argv is None else argv)
 
     if args.install_desktop or args.uninstall_desktop:
@@ -49,10 +50,26 @@ def main(argv: list[str] | None = None) -> int:
             print('TIKI is now in your applications menu (it may take a moment to appear).')
         return 0
 
+    import os
+
     from . import instance
 
     if not args.new_instance and instance.send_to_running(args.files, sample=args.sample):
         return 0
+
+    # Show a lightweight splash screen before importing napari/scipy so
+    # double-clicking the app icon gives immediate visual feedback.
+    splash = None
+    if not args.no_splash and os.environ.get('QT_QPA_PLATFORM') != 'offscreen':
+        try:
+            from qtpy.QtWidgets import QApplication
+
+            from . import splash as splash_mod
+
+            qapp = QApplication.instance() or QApplication(sys.argv)
+            splash = splash_mod.show_splash(qapp, _version(), 'Loading napari…')
+        except Exception:
+            splash = None
 
     from napari.qt import get_qapp
     from qtpy.QtGui import QIcon
@@ -71,6 +88,8 @@ def main(argv: list[str] | None = None) -> int:
     if not args.new_instance:
         tiki._instance_server = instance.listen(tiki)
     tiki.show()
+    if splash is not None:
+        splash.finish(tiki)
     if args.files:
         tiki.open_dropped(args.files)
     if args.sample:

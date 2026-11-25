@@ -138,6 +138,11 @@ def test_command_errors_are_reported_not_raised(tiki, monkeypatch):
     shown = []
     monkeypatch.setattr(QMessageBox, 'warning', lambda *a: shown.append(('warning', a[1], a[2])))
     monkeypatch.setattr(QMessageBox, 'critical', lambda *a: shown.append(('critical', a[1], a[2])))
+    monkeypatch.setattr(
+        QMessageBox,
+        'exec_',
+        lambda box: shown.append(('critical' if box.icon() == QMessageBox.Critical else 'warning', box.windowTitle(), box.text())) or QMessageBox.Close,
+    )
     tiki.open_data(np.zeros((16, 16)), 'img')
     tiki._actions['Image>Crop'].trigger()  # no ROI drawn
     tiki._actions['Analyze>Plot Profile'].trigger()
@@ -1248,3 +1253,81 @@ def test_make_montage_dialog_and_orthogonal_views(tiki, accept_dialogs):
     assert v.dims.current_step[0] == 5
     assert 'Z=5' in ortho.coord_label.text() and 'µm' in ortho.coord_label.text()
     ortho.close()
+
+
+def test_splash_updates_and_error_report(tiki, monkeypatch):
+    from qtpy.QtWidgets import QApplication, QMessageBox
+
+    from tiki import app as app_mod
+    from tiki import splash, updates
+
+    # 1. Splash pixmap builds cleanly with bundled icon
+    pm = splash.build_pixmap('0.1.0')
+    assert not pm.isNull() and pm.width() == 380 and pm.height() == 150
+
+    # 2. Version comparison & update dialog (mocked network)
+    assert updates.compare_versions('0.0.1', '0.1.0') == -1
+    assert updates.compare_versions('0.1.0', 'v0.1.0') == 0
+    assert updates.compare_versions('0.2.0', '0.1.9') == 1
+
+    seen = {}
+
+    def fake_exec(box):
+        seen['title'] = box.windowTitle()
+        seen['text'] = box.text()
+        seen['details'] = box.detailedText()
+        seen['clicked'] = None
+        for btn in box.buttons():
+            if btn.text() == 'Copy Error Details':
+                seen['clicked'] = btn
+                break
+        return QMessageBox.Close
+
+    monkeypatch.setattr(QMessageBox, 'exec_', fake_exec)
+    monkeypatch.setattr(QMessageBox, 'clickedButton', lambda _self: seen.get('clicked'))
+    updates.check_for_updates_dialog(
+        tiki,
+        fetcher=lambda: {'version': '9.9.9', 'url': 'https://example.com', 'notes': 'New features', 'none_published': False},
+    )
+    assert seen['title'] == 'Update Available' and '9.9.9' in seen['text']
+
+    # 3. Unexpected error dialog includes formatted details and copies to clipboard
+    def boom():
+        raise RuntimeError('kaboom')
+
+    tiki._run('Explode', boom)
+    assert 'kaboom' in seen['text']
+    assert 'TIKI:' in seen['details'] and 'RuntimeError: kaboom' in seen['details']
+    assert 'RuntimeError: kaboom' in QApplication.clipboard().text()
+    assert app_mod.format_error_report('Test', ValueError('x'), 'tb').startswith('Command: Test')
+
+
+def test_python_console(tiki):
+    arr = np.arange(20, dtype=np.uint16).reshape(4, 5)
+    tiki.open_data(arr, 'cells.tif')
+    con = tiki.show_console()
+    assert 'cells.tif' in con.active_label.text()
+
+    # Single-line eval against live `data`
+    assert con.run_line('data.shape') is False
+    assert '(4, 5)' in con.output.toPlainText()
+
+    # Multi-line block + show() helper
+    assert con.run_line('def scale2(x):') is True
+    assert con.run_line('    return x * 2') is True
+    assert con.run_line('') is False
+    assert con.run_line('show(scale2(data), "doubled")') is False
+    assert 'doubled' in tiki.windows.active.title
+
+    # History stepping + error capture without crash
+    con._step_history(-1)
+    assert 'scale2(data)' in con.input.text()
+    assert con.run_line('1 / 0') is False
+    assert 'ZeroDivisionError' in con.output.toPlainText()
+
+    # Tab completion
+    con.input.setText('ops.make_mon')
+    con.input.setCursorPosition(len('ops.make_mon'))
+    con._complete()
+    assert con.input.text().startswith('ops.make_montage')
+    con.close()

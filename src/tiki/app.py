@@ -93,6 +93,7 @@ class Tiki(QMainWindow):
         self.contrast_window = None
         self.threshold_window = None
         self.roi_manager = None
+        self.console_window = None
         self.traces: list = []  # open TracesWindows (exported by Send to Notebook)
         self._last_roi: tuple[np.ndarray, str] | None = None
         self.wand_tolerance: float = 10.0
@@ -262,6 +263,8 @@ class Tiki(QMainWindow):
         self._add(tools, 'Scale Bar…', lambda: self._publish('snapshot_dialog', focus_scale_bar=True))
 
         m = mb.addMenu('&Plugins')
+        self._add(m, 'Python Console…', self.show_console, 'Ctrl+Shift+J')
+        m.addSeparator()
         macros = m.addMenu('Macros')
         self.macros_menu = macros
         self._add(macros, 'New Macro…', self.new_macro, 'Ctrl+Shift+M')
@@ -276,6 +279,7 @@ class Tiki(QMainWindow):
 
         m = mb.addMenu('&Help')
         self._add(m, 'Find Commands…', self.find_commands, 'Ctrl+L')
+        self._add(m, 'Check for Updates…', self.check_for_updates)
         self._add(m, 'About TIKI', self.about)
 
     def _fill_window_menu(self) -> None:
@@ -314,13 +318,29 @@ class Tiki(QMainWindow):
         except TikiError as exc:
             self.report(name, str(exc), fix=exc.fix)
         except Exception as exc:
+            tb = traceback.format_exc()
             traceback.print_exc()
-            self.report(name, f'{type(exc).__name__}: {exc}\n\n(full traceback in the terminal)', error=True)
+            details = format_error_report(name, exc, tb)
+            self.report(
+                name,
+                f'{type(exc).__name__}: {exc}\n\nClick "Show Details" or "Copy Error Details" to share this error.',
+                error=True,
+                details=details,
+            )
 
-    def report(self, title: str, message: str, error: bool = False, fix: str | None = None) -> None:
+    def report(
+        self,
+        title: str,
+        message: str,
+        error: bool = False,
+        fix: str | None = None,
+        details: str | None = None,
+    ) -> None:
         """Show a problem the way ImageJ does: a small dialog plus the status bar.
 
         With ``fix`` the dialog gets a button that runs the fixing command.
+        With ``details`` the dialog shows a collapsible traceback and a
+        "Copy Error Details" button (useful when launched without a terminal).
         """
         self.status(f'{title}: {message.splitlines()[0]}')
         if fix in FIXES:
@@ -330,6 +350,15 @@ class Tiki(QMainWindow):
             box.exec_()
             if box.clickedButton() is button:
                 self._run(label, getattr(self, method))
+            return
+        if details:
+            box = QMessageBox(QMessageBox.Critical if error else QMessageBox.Warning, title, message, QMessageBox.Close, self)
+            box.setDetailedText(details)
+            copy_btn = box.addButton('Copy Error Details', QMessageBox.ActionRole)
+            box.exec_()
+            if box.clickedButton() is copy_btn:
+                QApplication.clipboard().setText(details)
+                self.status('Copied error details to clipboard')
             return
         box = QMessageBox.critical if error else QMessageBox.warning
         box(self, title, message)
@@ -1467,6 +1496,17 @@ class Tiki(QMainWindow):
         self.log_window.append(text)
         self.log_window.show()
 
+    def show_console(self):
+        from .console import PythonConsoleWindow
+
+        if self.console_window is None:
+            self.console_window = PythonConsoleWindow(self)
+        self.console_window.show()
+        self.console_window.raise_()
+        self.console_window.activateWindow()
+        self.console_window.input.setFocus()
+        return self.console_window
+
     def show_macros_folder(self) -> None:
         from qtpy.QtCore import QUrl
         from qtpy.QtGui import QDesktopServices
@@ -1555,11 +1595,19 @@ class Tiki(QMainWindow):
         dlg = CommandFinder(self._actions, self)
         dlg.exec_()
 
+    def check_for_updates(self) -> None:
+        from . import updates
+
+        updates.check_for_updates_dialog(self)
+
     def about(self) -> None:
+        from . import updates
+
         QMessageBox.about(
             self,
             'About TIKI',
-            'TIKI Is Kinda ImageJ\n\nAn ImageJ-style toolbar for napari image windows.',
+            f'TIKI Is Kinda ImageJ (v{updates.current_version()})\n\n'
+            'An ImageJ-style toolbar for napari image windows.',
         )
 
     # ------------------------------------------------------------ Qt events
@@ -1647,7 +1695,7 @@ class Tiki(QMainWindow):
             srv.close()
         self.windows.close_all()
         self.results.close()
-        for w in (self.contrast_window, self.threshold_window, self.roi_manager,
+        for w in (self.contrast_window, self.threshold_window, self.roi_manager, self.console_window,
                   getattr(self, 'channels_window', None), getattr(self, 'log_window', None)):
             if w is not None:
                 w.close()
@@ -1657,18 +1705,57 @@ class Tiki(QMainWindow):
         QApplication.instance().quit()
 
 
+def format_error_report(context: str, exc: BaseException, tb_text: str) -> str:
+    """Format an unexpected error with environment info for easy copy/paste."""
+    import platform
+
+    from . import updates
+
+    try:
+        import napari
+
+        napari_ver = getattr(napari, '__version__', 'unknown')
+    except Exception:
+        napari_ver = 'unknown'
+    header = '\n'.join([
+        f'Command: {context}',
+        f'TIKI: {updates.current_version()}',
+        f'napari: {napari_ver}',
+        f'Python: {platform.python_version()} ({platform.platform()})',
+        f'Error: {type(exc).__name__}: {exc}',
+        '',
+    ])
+    return header + tb_text.strip() + '\n'
+
+
 def install_excepthook(tiki: Tiki) -> None:
     """Catch errors outside menu commands (mouse callbacks, timers, live plots).
 
     Without this PyQt6 calls abort() on any exception raised inside Qt.
     """
+    in_hook = {'active': False}
 
     def hook(exc_type, exc, tb):
+        tb_text = ''.join(traceback.format_exception(exc_type, exc, tb))
         traceback.print_exception(exc_type, exc, tb)
+        if in_hook['active']:
+            return
+        in_hook['active'] = True
         try:
-            tiki.status(f'Error: {exc_type.__name__}: {exc} (see terminal)')
+            details = format_error_report('Unexpected error', exc, tb_text)
+            tiki.report(
+                'Unexpected Error',
+                f'{exc_type.__name__}: {exc}\n\nClick "Show Details" or "Copy Error Details" to share this error.',
+                error=True,
+                details=details,
+            )
         except Exception:
-            pass
+            try:
+                tiki.status(f'Error: {exc_type.__name__}: {exc}')
+            except Exception:
+                pass
+        finally:
+            in_hook['active'] = False
 
     sys.excepthook = hook
 

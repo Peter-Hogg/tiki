@@ -35,6 +35,8 @@ dependencies = [
 [project.optional-dependencies]
 test = ["pytest", "pytest-qt"]
 formats = ["nd2", "readlif", "zarr", "h5py"]
+video = ["imageio-ffmpeg"]
+all = ["nd2", "readlif", "zarr", "h5py", "imageio-ffmpeg"]
 docs = [
     "sphinx>=7",
     "furo",
