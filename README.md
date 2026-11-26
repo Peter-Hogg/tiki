@@ -15,6 +15,11 @@
 </p>
 
 <p align="center">
+  <img src="assets/demo-3d-volume.gif" alt="Using TIKI 3D Volume View on Cells 3D with live Brightness/Contrast" width="760"><br>
+  <sub><b>3D Volume View:</b> one click switches any calibrated Z-stack to interactive 3D rendering while adjusting <b>Brightness/Contrast</b> (<code>Ctrl+Shift+C</code>) live.</sub>
+</p>
+
+<p align="center">
   <img src="assets/demo-cells3d.gif" alt="Using TIKI on Cells 3D: Orthogonal Views and calibrated ROI measurements" width="760"><br>
   <sub><b>Cells 3D workflow:</b> open a calibrated 2-channel Z-stack, inspect in <b>Orthogonal Views</b> (<code>Ctrl+Shift+H</code>), draw ROIs, and <b>Measure</b> (<code>Ctrl+M</code>) in µm².</sub>
 </p>

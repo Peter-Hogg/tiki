@@ -16,6 +16,15 @@ image without assembling a collection of unrelated widgets.
 ::::{grid} 1 1 1 1
 :gutter: 2
 
+:::{grid-item-card} 3D Volume View — One-Click Interactive 3D & Live B&C
+:text-align: center
+```{image} _static/demo-3d-volume.gif
+:alt: Using TIKI 3D Volume View on Cells 3D with live Brightness/Contrast
+:width: 720px
+```
+Switch any calibrated Z-stack to interactive 3D volume rendering in one click while adjusting **Brightness/Contrast** (`Ctrl+Shift+C`) live.
+:::
+
 :::{grid-item-card} Cells 3D — Orthogonal Views & Calibrated ROI Measurement
 :text-align: center
 ```{image} _static/demo-cells3d.gif
