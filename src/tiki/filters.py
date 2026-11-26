@@ -87,6 +87,19 @@ FILTERS = {
         lambda plane, radius: ops.maximum_filter(plane, radius),
         lambda vol, z_ratio, radius: ops.maximum_3d(vol, radius, z_ratio),
     ),
+    'variance': FilterSpec(
+        'Variance', 'var',
+        [Param('radius', 'Radius:', 2.0, 0.5, 50, 0.5, 1, ' px')], [],
+        lambda plane, radius: ops.variance_filter(plane, radius),
+        lambda vol, z_ratio, radius: ops.variance_3d(vol, radius, z_ratio),
+    ),
+    'tophat': FilterSpec(
+        'Top Hat', 'tophat',
+        [Param('radius', 'Radius:', 5.0, 0.5, 100, 1.0, 1, ' px')],
+        [('light', 'Light background (dark spots)', False)],
+        lambda plane, radius, light=False: ops.top_hat_filter(plane, radius, light),
+        lambda vol, z_ratio, radius, light=False: ops.top_hat_3d(vol, radius, z_ratio, light),
+    ),
     'unsharp': FilterSpec(
         'Unsharp Mask', 'unsharp',
         [

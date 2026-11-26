@@ -1711,3 +1711,190 @@ def test_new_image_stack_and_process_commands(tiki, accept_dialogs):
     v_comp = tiki.merge_channels()
     assert v_comp.layers[0].data.shape == (2, 8, 8)
 
+
+def test_fiji_process_commands_smooth_sharpen_variance_tophat_convolve_maxima(tiki, accept_dialogs):
+    from qtpy.QtWidgets import QCheckBox, QComboBox, QDoubleSpinBox, QPlainTextEdit
+    from tiki import axes, filters, process
+
+    # Menu actions match Fiji Process layout
+    for key in (
+        'Process>Smooth',
+        'Process>Sharpen',
+        'Process>Find Edges',
+        'Process>Find Maxima…',
+        'Filters>Convolve…',
+        'Filters>Variance…',
+        'Filters>Top Hat…',
+    ):
+        assert key in tiki._actions
+
+    # 1. Smooth & Sharpen on a stack
+    mov = np.zeros((3, 12, 12), dtype=np.float32)
+    mov[:, 6, 6] = 90.0
+    info = axes.AxesInfo(
+        [axes.Axis('Z', 3, 1.0, 'µm'), axes.Axis('Y', 12, 0.5, 'µm'), axes.Axis('X', 12, 0.5, 'µm')],
+        'test', True,
+    )
+    v = tiki.open_data(mov, 'spots.tif', axes=info)
+    sm_ly = process.smooth_command(tiki)
+    assert 'smooth' in sm_ly.name and sm_ly.data[0, 6, 6] == pytest.approx(10.0)
+    sh_ly = process.sharpen_command(tiki)
+    assert 'sharpen' in sh_ly.name and sh_ly.data.shape == mov.shape
+
+    # 2. Variance & Top Hat live filters (2D & 3D)
+    v.layers.selection.active = v.layers['spots.tif']
+    var_ly = filters.run_filter(tiki, 'variance', v, v.layers['spots.tif'], {'radius': 1.0}, whole_stack=True, three_d=True)
+    assert 'var' in var_ly.name and '3D' in var_ly.name and float(var_ly.data[0, 6, 6]) > 0.0
+    th_ly = filters.run_filter(tiki, 'tophat', v, v.layers['spots.tif'], {'radius': 2.0, 'light': False}, whole_stack=True)
+    assert 'tophat' in th_ly.name and float(th_ly.data[1, 6, 6]) == pytest.approx(90.0)
+
+    # 3. Convolve… dialog validation & preview cleanup
+    cdlg = process.ConvolveDialog(tiki, v, v.layers['spots.tif'])
+    cdlg.kernel_edit.setPlainText('1 2\n3')
+    assert not cdlg.buttons.button(cdlg.buttons.Ok).isEnabled()
+    cdlg.reject()
+    assert 'filter preview' not in v.layers
+
+    def cfg_conv(dlg):
+        dlg.findChild(QPlainTextEdit).setPlainText('1 1 1\n1 1 1\n1 1 1')
+
+    accept_dialogs['configure'] = cfg_conv
+    conv_ly = process.convolve_dialog(tiki)
+    assert 'filter preview' not in v.layers
+    assert 'convolve 3×3' in conv_ly.name and conv_ly.data[0, 6, 6] == pytest.approx(10.0)
+
+    # 4. Find Maxima…: preview cleanup + all 5 output modes
+    peaks = np.zeros((2, 16, 16), dtype=np.float32)
+    peaks[0, 4, 5] = 100.0
+    peaks[0, 11, 12] = 60.0
+    peaks[1, 8, 8] = 80.0
+    vp = tiki.open_data(peaks, 'peaks.tif', axes=axes.AxesInfo(
+        [axes.Axis('T', 2, 0.5, 's'), axes.Axis('Y', 16, 0.25, 'µm'), axes.Axis('X', 16, 0.25, 'µm')],
+        'test', True,
+    ))
+
+    # Live preview appears while open and removes cleanly on cancel
+    fdlg = process.FindMaximaDialog(tiki, vp, vp.layers['peaks.tif'])
+    assert 'maxima preview' in vp.layers
+    assert '2 maxima' in fdlg.count_label.text()
+    fdlg.reject()
+    assert 'maxima preview' not in vp.layers
+
+    # 4a. Point Selection
+    def cfg_pts(dlg):
+        dlg.findChild(QDoubleSpinBox).setValue(10.0)
+        dlg.output_box.setCurrentText('Point Selection')
+
+    accept_dialogs['configure'] = cfg_pts
+    pts_ly = process.find_maxima_dialog(tiki)
+    assert 'maxima preview' not in vp.layers
+    assert len(pts_ly.data) == 2
+
+    # 4b. List (calibrated µm coordinates in Results)
+    tiki.results.clear()
+
+    def cfg_list(dlg):
+        dlg.findChild(QDoubleSpinBox).setValue(10.0)
+        dlg.output_box.setCurrentText('List')
+        dlg.whole_stack.setChecked(False)
+
+    accept_dialogs['configure'] = cfg_list
+    n_rows = process.find_maxima_dialog(tiki)
+    assert n_rows == 2 and tiki.results.column_units.get('X') == 'µm'
+    assert tiki.results.rows[0]['X'] == pytest.approx(5 * 0.25)
+    assert tiki.results.rows[0]['Y'] == pytest.approx(4 * 0.25)
+
+    # 4c. Count over whole stack
+    tiki.results.clear()
+
+    def cfg_count(dlg):
+        dlg.findChild(QDoubleSpinBox).setValue(10.0)
+        dlg.output_box.setCurrentText('Count')
+        dlg.whole_stack.setChecked(True)
+
+    accept_dialogs['configure'] = cfg_count
+    n_count_rows = process.find_maxima_dialog(tiki)
+    assert n_count_rows == 2
+    assert [r['Count'] for r in tiki.results.rows] == [2, 1]
+
+    # 4d. Single Points + Segmented Particles
+    def cfg_single(dlg):
+        dlg.findChild(QDoubleSpinBox).setValue(10.0)
+        dlg.output_box.setCurrentText('Single Points')
+        dlg.whole_stack.setChecked(False)
+
+    accept_dialogs['configure'] = cfg_single
+    sp_ly = process.find_maxima_dialog(tiki)
+    assert int(sp_ly.data[4, 5]) >= 1 and int((sp_ly.data > 0).sum()) == 2
+
+    def cfg_seg(dlg):
+        dlg.findChild(QDoubleSpinBox).setValue(10.0)
+        dlg.output_box.setCurrentText('Segmented Particles')
+        dlg.whole_stack.setChecked(False)
+
+    accept_dialogs['configure'] = cfg_seg
+    seg_ly = process.find_maxima_dialog(tiki)
+    assert seg_ly.data.dtype == np.int32 and int(seg_ly.data.max()) == 2
+
+
+def test_edge_detection_dialog_methods_and_3d(tiki, accept_dialogs):
+    from napari.layers import Image, Labels
+    from tiki import axes, process
+
+    assert 'Process>Edge Detection…' in tiki._actions
+
+    vol = np.zeros((6, 20, 20), dtype=np.float32)
+    vol[1:5, 5:15, 5:15] = 100.0
+    info = axes.AxesInfo(
+        [axes.Axis('Z', 6, 1.0, 'µm'), axes.Axis('Y', 20, 0.5, 'µm'), axes.Axis('X', 20, 0.5, 'µm')],
+        'test', True,
+    )
+    v = tiki.open_data(vol, 'edge3d.tif', axes=info)
+    v.dims.set_current_step(0, 2)  # slice with square object
+
+    # Preview appears while open, physical sigma readout updates, and preview cleans up on cancel
+    edlg = process.EdgeDetectionDialog(tiki, v, v.layers['edge3d.tif'])
+    assert 'filter preview' in v.layers
+    assert 'µm' in edlg.phys_label.text()
+    edlg.reject()
+    assert 'filter preview' not in v.layers
+
+    # Canny on current plane -> uint8 Image
+    def cfg_canny_img(dlg):
+        dlg.method_box.setCurrentIndex(dlg.method_box.findData('canny'))
+        dlg.whole_stack.setChecked(False)
+        dlg.as_labels.setChecked(False)
+
+    accept_dialogs['configure'] = cfg_canny_img
+    canny_ly = process.edge_detection_dialog(tiki)
+    assert isinstance(canny_ly, Image) and canny_ly.data.dtype == np.uint8
+    assert 'edges (canny)' in canny_ly.name and canny_ly.data.max() == 255
+    assert 'filter preview' not in v.layers
+
+    # Canny Output as Labels layer
+    v.layers.selection.active = v.layers['edge3d.tif']
+
+    def cfg_canny_lab(dlg):
+        dlg.method_box.setCurrentIndex(dlg.method_box.findData('canny'))
+        dlg.whole_stack.setChecked(False)
+        dlg.as_labels.setChecked(True)
+
+    accept_dialogs['configure'] = cfg_canny_lab
+    canny_lab = process.edge_detection_dialog(tiki)
+    assert isinstance(canny_lab, Labels) and canny_lab.data.max() == 1
+
+    # Anisotropic 3D Scharr across Z-stack
+    v.layers.selection.active = v.layers['edge3d.tif']
+
+    def cfg_3d_scharr(dlg):
+        dlg.method_box.setCurrentIndex(dlg.method_box.findData('scharr'))
+        assert dlg.has_z
+        dlg.three_d.setChecked(True)
+        dlg.whole_stack.setChecked(True)
+
+    accept_dialogs['configure'] = cfg_3d_scharr
+    scharr_ly = process.edge_detection_dialog(tiki)
+    assert isinstance(scharr_ly, Image) and scharr_ly.data.shape == vol.shape
+    assert 'scharr 3D' in scharr_ly.name and float(scharr_ly.data.max()) > 0.0
+
+

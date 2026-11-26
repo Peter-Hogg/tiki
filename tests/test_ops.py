@@ -632,3 +632,131 @@ def test_morphology_and_stack_manipulation_ops():
     np.testing.assert_array_equal(flat[0], hs[0, 0])
     np.testing.assert_array_equal(flat[5], hs[1, 2])
 
+
+def test_smooth_sharpen_variance_tophat_and_convolve():
+    # Smooth & Sharpen
+    spot = np.zeros((7, 7), dtype=np.float32)
+    spot[3, 3] = 90.0
+    sm = ops.smooth_plane(spot)
+    assert sm.dtype == np.float32 and sm[3, 3] == pytest.approx(10.0) and sm[2, 2] == pytest.approx(10.0)
+    sh = ops.sharpen_plane(spot)
+    assert sh[3, 3] == pytest.approx(90.0 * 12.0 / 4.0) and sh[2, 2] < 0.0
+
+    # Variance 2D & 3D (handles large constant offset accurately in float64)
+    flat_high = np.full((11, 11), 30000.0, dtype=np.float32)
+    np.testing.assert_allclose(ops.variance_filter(flat_high, 2.0), 0.0, atol=1e-4)
+    checker = np.full((11, 11), 30000.0, dtype=np.float32)
+    checker[5, 5] = 30010.0
+    var_c = ops.variance_filter(checker, 1.0)
+    assert var_c[5, 5] > 10.0 and var_c[0, 0] == pytest.approx(0.0, abs=1e-4)
+
+    vol = np.zeros((5, 9, 9), dtype=np.float32)
+    vol[2, 4, 4] = 20.0
+    assert ops.variance_3d(vol, 1.0, z_ratio=2.0)[2, 4, 4] > 0.0
+
+    # Top Hat (white & black) 2D & 3D
+    bg = np.arange(15, dtype=np.float32)[None, :] * np.ones((15, 1), dtype=np.float32) + 50.0
+    bright = bg.copy()
+    bright[7, 7] += 40.0
+    wth = ops.top_hat_filter(bright, 2.0, light_background=False)
+    assert wth[7, 7] == pytest.approx(40.0, abs=2.0) and wth[2, 2] < 3.0
+    dark = bg.copy()
+    dark[7, 7] -= 30.0
+    bth = ops.top_hat_filter(dark, 2.0, light_background=True)
+    assert bth[7, 7] == pytest.approx(30.0, abs=2.0)
+
+    vol_th = np.zeros((5, 11, 11), dtype=np.float32)
+    vol_th[2, 5, 5] = 25.0
+    assert ops.top_hat_3d(vol_th, 2.0, z_ratio=1.0)[2, 5, 5] == pytest.approx(25.0)
+
+    # Convolve & parse_kernel
+    k_box = ops.parse_kernel('1, 1, 1\n1 1 1\n1 1 1')
+    np.testing.assert_allclose(ops.convolve_plane(spot, k_box, normalize=True), sm, atol=1e-5)
+    k_zero = ops.parse_kernel(ops.KERNEL_PRESETS['Laplacian (3×3)'])
+    conv_zero = ops.convolve_plane(spot, k_zero, normalize=True)
+    assert conv_zero[3, 3] == pytest.approx(360.0)
+    with pytest.raises(ValueError):
+        ops.parse_kernel('1 2\n3')
+    with pytest.raises(ValueError):
+        ops.parse_kernel('   \n  ')
+
+
+def test_find_maxima_and_segment_maxima():
+    img = np.zeros((20, 20), dtype=np.float64)
+    img[5, 5] = 100.0
+    img[5, 6] = 100.0  # 2-px plateau collapses to 1 maximum
+    img[14, 14] = 40.0
+    img[14, 15] = 25.0  # small shoulder < prominence 25 -> suppressed
+    img[0, 12] = 80.0   # edge peak
+
+    coords, vals = ops.find_maxima(img, prominence=25.0, exclude_edges=False)
+    assert len(coords) == 3
+    assert vals[0] == pytest.approx(100.0) and vals[-1] == pytest.approx(40.0)
+
+    coords_no_edge, _ = ops.find_maxima(img, prominence=25.0, exclude_edges=True)
+    assert len(coords_no_edge) == 2
+    assert all(0 < y < 19 and 0 < x < 19 for y, x in coords_no_edge)
+
+    # Prominence above all peaks: strict=True -> 0, strict=False -> 1 global peak
+    assert len(ops.find_maxima(img, prominence=200.0, strict=True)[0]) == 0
+    assert len(ops.find_maxima(img, prominence=200.0, strict=False, exclude_edges=True)[0]) == 1
+
+    # Light background (dark wells), ROI mask, and NaN safety
+    dark_img = 200.0 - img
+    dark_img[2, 2] = np.nan
+    d_coords, d_vals = ops.find_maxima(dark_img, prominence=25.0, light_background=True, exclude_edges=True)
+    assert len(d_coords) == 2 and d_vals[0] == pytest.approx(100.0)
+
+    mask = np.zeros((20, 20), dtype=bool)
+    mask[10:, 10:] = True
+    m_coords, _ = ops.find_maxima(img, prominence=25.0, exclude_edges=True, mask=mask)
+    assert len(m_coords) == 1 and tuple(m_coords[0]) == (14, 14)
+
+    # Segmented Particles produces distinct regions seeded by maxima
+    blob_img = np.zeros((20, 20), dtype=np.float32)
+    yy, xx = np.ogrid[:20, :20]
+    blob_img += 100.0 * np.exp(-((yy - 5) ** 2 + (xx - 5) ** 2) / 8.0)
+    blob_img += 80.0 * np.exp(-((yy - 14) ** 2 + (xx - 14) ** 2) / 8.0)
+    b_coords, _ = ops.find_maxima(blob_img, prominence=10.0)
+    seg = ops.segment_maxima(blob_img, b_coords)
+    assert seg.dtype == np.int32 and len(np.unique(seg[seg > 0])) == 2
+    assert seg[5, 5] != seg[14, 14]
+
+
+def test_detect_edges_2d_and_3d():
+    plane = np.zeros((24, 24), dtype=np.float32)
+    plane[6:18, 6:18] = 100.0
+
+    # Canny binary edge map (uint8 0/255) on step edge + NaN resilience + flat plane
+    canny_out = ops.detect_edges(plane, method='canny', sigma=1.0, low_threshold=0.1, high_threshold=0.2)
+    assert canny_out.dtype == np.uint8 and set(np.unique(canny_out).tolist()) == {0, 255}
+    assert canny_out[12, 12] == 0 and canny_out[6:18, 6:18].max() == 255
+
+    assert ops.detect_edges(np.zeros((12, 12), np.float32), method='canny').max() == 0
+
+    with_nan = plane.copy()
+    with_nan[0, 0] = np.nan
+    canny_nan = ops.detect_edges(with_nan, method='canny', sigma=1.0)
+    assert canny_nan[0, 0] == 0 and canny_nan.max() == 255
+
+    # Continuous 2D methods: Sobel, Scharr, Prewitt, Roberts, LoG, DoG
+    for m in ('sobel', 'scharr', 'prewitt', 'roberts', 'log', 'dog'):
+        res = ops.detect_edges(plane, method=m, sigma=1.0, sigma_ratio=1.6)
+        assert res.dtype == np.float32 and res.shape == plane.shape
+        assert float(res.max()) > 0.0 and float(res[0, 0]) == pytest.approx(0.0, abs=1e-4)
+        assert float(res[6, 12]) > float(res[12, 12])
+
+    # Anisotropic 3D edge detection
+    vol = np.zeros((8, 20, 20), dtype=np.float32)
+    vol[2:6, 6:14, 6:14] = 100.0
+    for m in ('sobel', 'scharr', 'prewitt', 'log', 'dog'):
+        res3 = ops.detect_edges_3d(vol, z_ratio=0.5, method=m, sigma=1.0)
+        assert res3.dtype == np.float32 and res3.shape == vol.shape
+        assert float(res3.max()) > 0.0 and float(res3[4, 10, 10]) < float(res3[2, 10, 10])
+
+    with pytest.raises(ValueError):
+        ops.detect_edges(plane, method='bogus')
+    with pytest.raises(ValueError):
+        ops.detect_edges_3d(vol, method='canny')
+
+

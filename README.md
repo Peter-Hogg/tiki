@@ -160,9 +160,15 @@ pixel value.
   **Stack to Hyperstack…**, **Hyperstack to Stack**, **Concatenate…**,
   **Images to Stack…**, **Reverse**, **Remove Slices…**, and **Bin…** with
   updated physical calibration
-- **Process ▸ Filters**: Gaussian Blur, Mean, Median, Minimum, Maximum, Unsharp
-  Mask (with live preview and physical kernel readout), Sobel **Find Edges**,
-  and rolling-ball **Subtract Background…**
+- **Process**: **Smooth** (<kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>S</kbd>), **Sharpen**,
+  Sobel **Find Edges**, configurable **Edge Detection…** (Canny, Sobel, Scharr,
+  Prewitt, Roberts, LoG, DoG — 2D & anisotropic 3D with live preview), and
+  **Find Maxima…** (prominence detection with live preview and Point Selection,
+  Single Points, Segmented Particles, List, and Count outputs)
+- **Process ▸ Filters**: **Convolve…** (editable kernels + presets), Gaussian
+  Blur, Mean, Median, Minimum, Maximum, Variance, Top Hat, Unsharp Mask (all
+  with live preview and physical kernel readout), and rolling-ball **Subtract
+  Background…**
 - **Process ▸ Math…**: non-destructive scalar/unary math (`Add`, `Subtract`,
   `Multiply`, `Divide`, `Min`, `Max`, `Gamma`, `Log`, `Exp`, `Square`, `Sqrt`,
   `Abs`) on the current plane or whole stack
@@ -276,10 +282,15 @@ pixel value.
 
 ### Filters
 
-- Gaussian Blur, Median and rolling-ball Subtract Background with a live
-  preview of the current slice and an Image dropdown
-- Gaussian and Median can work **in 3D** (through Z), with the kernel scaled
-  by the voxel size so an anisotropic z-step is handled
+- Convolve (custom kernels & presets), Gaussian Blur, Mean, Median, Minimum,
+  Maximum, Variance, Top Hat, Unsharp Mask, and rolling-ball Subtract Background
+  with a live preview of the current slice and an Image dropdown
+- Smooth (<kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>S</kbd>), Sharpen, Find Edges,
+  Edge Detection… (Canny, Sobel, Scharr, Prewitt, Roberts, LoG, DoG), and Find
+  Maxima… directly in **Process**
+- Gaussian, Mean, Median, Minimum, Maximum, Variance, Top Hat, and Unsharp Mask
+  can work **in 3D** (through Z), with the kernel scaled by the voxel size so
+  an anisotropic z-step is handled
 - Non-destructive: the result is added as a new layer above the original
 
 ### Movies: ΔF/F, bleaching, kymographs
@@ -365,7 +376,8 @@ pixel value.
 | Image | Crop | <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>X</kbd> |
 | Image | Duplicate… | <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>D</kbd> |
 | Image → Stacks | Z Project… / Make Substack… / Bin… / Hyperstack to Stack / Concatenate… / Images to Stack… / Reverse / Remove Slices… | |
-| Process → Filters | Gaussian Blur…, Mean…, Median…, Minimum…, Maximum…, Unsharp Mask…, Find Edges | |
+| Process | Smooth / Sharpen / Find Edges / Edge Detection… / Find Maxima… | <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>S</kbd> / — / — / — / — |
+| Process → Filters | Convolve…, Gaussian Blur…, Mean…, Median…, Minimum…, Maximum…, Variance…, Top Hat…, Unsharp Mask… | |
 | Process | Subtract Background… / Math… | |
 | Image → Stacks | Plot Z-axis Profile | <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>Y</kbd> |
 | Analyze | Measure | <kbd>Ctrl</kbd>+<kbd>M</kbd> |
@@ -430,7 +442,7 @@ src/tiki/
 
 - [x] **Better OME and acquisition metadata handling** — namespace-agnostic OME-XML parser (`μm`, `<Plane DeltaT>` timestamps, channel names/colors/wavelengths, `<Instrument>`/`<Objective>`/`<Detector>`/`<StageLabel>`), multi-series OME-TIFF loading, ScanImage & Micro-Manager tags, CZI/ND2/LIF/OME-Zarr acquisition metadata, OME channel roundtrip on save, and scrollable `Image ▸ Show Info…` with raw metadata drawer
 - [x] **Calibration-aware measurements in physical units** — shared unit normalization (`convert_unit`, `physical_scale_3d`), anisotropic contour perimeter & `Feret` diameter, unit column headers + `Summarize` in Results, calibrated point/ROI Manager/2D & 3D Analyze Particles (with physical Min/Max size filters), calibrated profile/traces/bleach/drift axes, physical radius readouts in filters/labels/selections, and aspect/Global/Remove Scale in `Set Scale…`
-- [x] **More everyday ImageJ stack and image commands** — `Edit ▸ Invert`, `Image ▸ Adjust ▸ Size…`, `Process ▸ Math…`, `Mean` / `Minimum` / `Maximum` / `Unsharp Mask` (2D & 3D) / `Find Edges`, `Labels ▸ Morphology…`, `Concatenate…`, `Images to Stack…`, `Hyperstack to Stack`, `Reverse`, `Remove Slices…`, and multi-window `Merge Channels`
+- [x] **More everyday ImageJ stack and image commands** — `Edit ▸ Invert`, `Image ▸ Adjust ▸ Size…`, `Process` (`Smooth`, `Sharpen`, `Find Edges`, `Edge Detection…`, `Find Maxima…`, `Math…`), `Process ▸ Filters` (`Convolve…`, `Mean…`, `Minimum…`, `Maximum…`, `Variance…`, `Top Hat…`, `Unsharp Mask…`), `Labels ▸ Morphology…`, `Concatenate…`, `Images to Stack…`, `Hyperstack to Stack`, `Reverse`, `Remove Slices…`, and multi-window `Merge Channels`
 - [x] **Packaging and installation documentation for non-developers** — Windows SmartScreen / macOS Gatekeeper / Linux standalone installer walkthrough in [Getting Started](docs/getting-started.md), method comparison & troubleshooting guides, `installer/README.md` recipe documentation, and dynamic docs release versioning
 
 ## Name

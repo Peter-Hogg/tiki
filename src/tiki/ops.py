@@ -2252,3 +2252,352 @@ def hyperstack_to_stack(data, rgb: bool = False):
         return data
     n_total = int(np.prod(data.shape[:-spatial_ndim]))
     return data.reshape((n_total,) + data.shape[-spatial_ndim:])
+
+
+# --------------------------------------------------------- Core Fiji Process ops
+
+
+def smooth_plane(plane: np.ndarray) -> np.ndarray:
+    """ImageJ ``Process ▸ Smooth``: 3×3 unweighted box mean."""
+    from scipy.ndimage import uniform_filter
+
+    return uniform_filter(np.asarray(plane, dtype=np.float32), size=3, mode='nearest').astype(np.float32)
+
+
+def sharpen_plane(plane: np.ndarray) -> np.ndarray:
+    """ImageJ ``Process ▸ Sharpen``: 3×3 weighted Laplacian sharpening kernel."""
+    from scipy.ndimage import convolve
+
+    kernel = np.array([[-1.0, -1.0, -1.0], [-1.0, 12.0, -1.0], [-1.0, -1.0, -1.0]], dtype=np.float32) / 4.0
+    return convolve(np.asarray(plane, dtype=np.float32), kernel, mode='nearest').astype(np.float32)
+
+
+def _local_variance(arr: np.ndarray, fp: np.ndarray | None) -> np.ndarray:
+    from scipy.ndimage import correlate
+
+    img = np.asarray(arr, dtype=np.float64)
+    if fp is None:
+        return np.zeros(img.shape, dtype=np.float32)
+    finite = np.isfinite(img)
+    offset = float(img[finite].mean()) if finite.any() else 0.0
+    shifted = np.where(finite, img - offset, 0.0)
+    kernel = fp.astype(np.float64) / float(fp.sum())
+    mean = correlate(shifted, kernel, mode='nearest')
+    mean_sq = correlate(shifted * shifted, kernel, mode='nearest')
+    return np.maximum(mean_sq - mean * mean, 0.0).astype(np.float32)
+
+
+def variance_filter(plane: np.ndarray, radius: float) -> np.ndarray:
+    """Local intensity variance over a circular disk of ``radius`` pixels."""
+    return _local_variance(plane, _disk_footprint(radius))
+
+
+def variance_3d(volume: np.ndarray, radius: float, z_ratio: float) -> np.ndarray:
+    """Local intensity variance over an anisotropic 3D ellipsoid."""
+    return _local_variance(volume, _ellipsoid_footprint(radius, z_ratio))
+
+
+def top_hat_filter(plane: np.ndarray, radius: float, light_background: bool = False) -> np.ndarray:
+    """Morphological white (or black) top-hat over a circular disk."""
+    from skimage.morphology import black_tophat, white_tophat
+
+    arr = np.asarray(plane)
+    fp = _disk_footprint(radius)
+    if fp is None:
+        return np.zeros_like(arr)
+    fn = black_tophat if light_background else white_tophat
+    return fn(arr, footprint=fp)
+
+
+def top_hat_3d(volume: np.ndarray, radius: float, z_ratio: float, light_background: bool = False) -> np.ndarray:
+    """Morphological white (or black) top-hat over an anisotropic 3D ellipsoid."""
+    from skimage.morphology import black_tophat, white_tophat
+
+    arr = np.asarray(volume)
+    fp = _ellipsoid_footprint(radius, z_ratio)
+    if fp is None:
+        return np.zeros_like(arr)
+    fn = black_tophat if light_background else white_tophat
+    return fn(arr, footprint=fp)
+
+
+KERNEL_PRESETS: dict[str, str] = {
+    'Laplacian of Gaussian (5×5)': (
+        '-1 -1 -1 -1 -1\n'
+        '-1 -1 -1 -1 -1\n'
+        '-1 -1 24 -1 -1\n'
+        '-1 -1 -1 -1 -1\n'
+        '-1 -1 -1 -1 -1'
+    ),
+    'Sharpen (3×3)': '-1 -1 -1\n-1 12 -1\n-1 -1 -1',
+    'Box Smooth (3×3)': '1 1 1\n1 1 1\n1 1 1',
+    'Laplacian (3×3)': '0 -1 0\n-1 4 -1\n0 -1 0',
+    'Sobel X (3×3)': '-1 0 1\n-2 0 2\n-1 0 1',
+    'Sobel Y (3×3)': '-1 -2 -1\n0 0 0\n1 2 1',
+    'Emboss (3×3)': '-2 -1 0\n-1 1 1\n0 1 2',
+}
+
+
+def parse_kernel(text: str) -> np.ndarray:
+    """Parse a rectangular convolution kernel matrix from multiline text."""
+    rows: list[list[float]] = []
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        tokens = [t for t in line.replace(',', ' ').split() if t]
+        row = [float(t) for t in tokens]
+        rows.append(row)
+    if not rows:
+        raise ValueError('kernel cannot be empty')
+    widths = {len(r) for r in rows}
+    if len(widths) != 1 or 0 in widths:
+        raise ValueError('every row in the kernel must have the same number of entries')
+    arr = np.asarray(rows, dtype=np.float32)
+    if not np.all(np.isfinite(arr)):
+        raise ValueError('kernel values must be finite numbers')
+    return arr
+
+
+def convolve_plane(plane: np.ndarray, kernel: np.ndarray, normalize: bool = True) -> np.ndarray:
+    """Convolve a 2D ``plane`` with an arbitrary 2D ``kernel``."""
+    from scipy.ndimage import convolve
+
+    k = np.asarray(kernel, dtype=np.float32)
+    if k.ndim != 2 or k.size == 0:
+        raise ValueError('kernel must be a non-empty 2D array')
+    if normalize:
+        s = float(k.sum())
+        if abs(s) > 1e-12:
+            k = (k / s).astype(np.float32)
+    return convolve(np.asarray(plane, dtype=np.float32), k, mode='nearest').astype(np.float32)
+
+
+def find_maxima(
+    plane: np.ndarray,
+    prominence: float = 10.0,
+    exclude_edges: bool = False,
+    light_background: bool = False,
+    strict: bool = False,
+    mask: np.ndarray | None = None,
+) -> tuple[np.ndarray, np.ndarray]:
+    """ImageJ ``Process ▸ Find Maxima…`` using morphological h-maxima prominence.
+
+    Returns ``(coords, values)`` where ``coords`` has shape ``(N, 2)`` of integer
+    ``(y, x)`` coordinates sorted by descending peak height in ``plane``
+    (or ascending for ``light_background``) and ``values`` holds the raw pixel
+    values at those coordinates.
+    """
+    from skimage.measure import label
+    from skimage.morphology import h_maxima, local_maxima
+
+    src = np.asarray(plane, dtype=np.float64)
+    if src.ndim != 2 or src.size == 0:
+        return np.empty((0, 2), dtype=int), np.empty((0,), dtype=np.float64)
+    finite = np.isfinite(src)
+    if not finite.any():
+        return np.empty((0, 2), dtype=int), np.empty((0,), dtype=np.float64)
+
+    work = -src if light_background else src.copy()
+    min_fin = float(work[finite].min())
+    fill_val = min_fin - max(float(prominence), 1.0) - 1.0
+    if not finite.all():
+        work = np.where(finite, work, fill_val)
+
+    prom = float(prominence)
+    if prom > 0:
+        hmax = h_maxima(work, prom, footprint=np.ones((3, 3), dtype=bool)) & finite
+    else:
+        hmax = local_maxima(work, connectivity=2) & finite
+
+    h, w = src.shape
+    pts: list[tuple[int, int]] = []
+    comp = label(hmax, connectivity=2)
+    n_comp = int(comp.max())
+    if n_comp > 0:
+        # Group coordinates in one pass via argsort on nonzero component labels
+        ys, xs = np.nonzero(comp)
+        ids = comp[ys, xs]
+        order = np.argsort(ids, kind='mergesort')
+        ys, xs, ids = ys[order], xs[order], ids[order]
+        splits = np.flatnonzero(np.diff(ids)) + 1
+        groups_y = np.split(ys, splits)
+        groups_x = np.split(xs, splits)
+        for gy, gx in zip(groups_y, groups_x):
+            if exclude_edges and (gy.min() == 0 or gy.max() == h - 1 or gx.min() == 0 or gx.max() == w - 1):
+                continue
+            if len(gy) == 1:
+                pts.append((int(gy[0]), int(gx[0])))
+            else:
+                cy, cx = float(gy.mean()), float(gx.mean())
+                d2 = (gy - cy) ** 2 + (gx - cx) ** 2
+                best = int(np.argmin(d2))
+                pts.append((int(gy[best]), int(gx[best])))
+
+    if not strict and not pts and float(work[finite].max()) > min_fin:
+        cand = finite.copy()
+        if exclude_edges and h >= 3 and w >= 3:
+            cand[0, :] = cand[-1, :] = False
+            cand[:, 0] = cand[:, -1] = False
+        elif exclude_edges:
+            cand[:] = False
+        if cand.any():
+            masked_work = np.where(cand, work, -np.inf)
+            best_idx = int(np.argmax(masked_work))
+            pts.append((best_idx // w, best_idx % w))
+
+    if mask is not None and pts:
+        m = np.asarray(mask, dtype=bool)
+        pts = [(y, x) for y, x in pts if m[y, x]]
+
+    if not pts:
+        return np.empty((0, 2), dtype=int), np.empty((0,), dtype=np.float64)
+
+    pts.sort(key=lambda p: float(work[p[0], p[1]]), reverse=True)
+    coords = np.asarray(pts, dtype=int)
+    vals = src[coords[:, 0], coords[:, 1]].astype(np.float64)
+    return coords, vals
+
+
+def segment_maxima(
+    plane: np.ndarray,
+    coords: np.ndarray,
+    light_background: bool = False,
+    mask: np.ndarray | None = None,
+) -> np.ndarray:
+    """Watershed-basin segmentation seeded by Find Maxima coordinates."""
+    from skimage.segmentation import watershed
+
+    src = np.asarray(plane, dtype=np.float64)
+    markers = np.zeros(src.shape, dtype=np.int32)
+    coords_arr = np.asarray(coords, dtype=int).reshape(-1, 2) if len(coords) else np.empty((0, 2), dtype=int)
+    h, w = src.shape
+    kept = 0
+    for y, x in coords_arr:
+        if 0 <= y < h and 0 <= x < w:
+            kept += 1
+            markers[y, x] = kept
+    if kept == 0:
+        return markers
+    finite = np.isfinite(src)
+    work_neg = np.where(finite, src, 0.0) if light_background else np.where(finite, -src, 0.0)
+    ws_mask = finite if mask is None else (finite & np.asarray(mask, dtype=bool))
+    return watershed(work_neg, markers=markers, mask=ws_mask).astype(np.int32)
+
+
+EDGE_METHODS: dict[str, str] = {
+    'Canny': 'canny',
+    'Sobel': 'sobel',
+    'Scharr': 'scharr',
+    'Prewitt': 'prewitt',
+    'Roberts': 'roberts',
+    'Laplacian of Gaussian (LoG)': 'log',
+    'Difference of Gaussians (DoG)': 'dog',
+}
+EDGE_3D_METHODS = {'sobel', 'scharr', 'prewitt', 'log', 'dog'}
+
+
+def _fill_nonfinite(arr: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    src = np.asarray(arr, dtype=np.float64)
+    finite = np.isfinite(src)
+    if not finite.any():
+        return np.zeros_like(src), finite
+    if finite.all():
+        return src, finite
+    med = float(np.median(src[finite]))
+    return np.where(finite, src, med), finite
+
+
+def detect_edges(
+    plane: np.ndarray,
+    method: str = 'canny',
+    sigma: float = 1.0,
+    low_threshold: float = 0.1,
+    high_threshold: float = 0.2,
+    sigma_ratio: float = 1.6,
+    use_quantiles: bool = True,
+) -> np.ndarray:
+    """Detect edges on a 2D plane using Canny, Sobel, Scharr, Prewitt, Roberts, LoG, or DoG."""
+    from scipy.ndimage import gaussian_filter, gaussian_laplace
+    from skimage.feature import canny
+    from skimage.filters import prewitt, roberts, scharr, sobel
+
+    m = method.lower()
+    if m not in EDGE_METHODS.values():
+        raise ValueError(f'unknown edge detection method {method!r}')
+
+    img, finite = _fill_nonfinite(plane)
+    if not finite.any():
+        return np.zeros(img.shape, dtype=np.uint8 if m == 'canny' else np.float32)
+
+    sig = max(float(sigma), 0.0)
+    if m == 'canny':
+        lo, hi = float(low_threshold), float(high_threshold)
+        if use_quantiles:
+            lo = float(np.clip(lo, 0.0, 1.0))
+            hi = float(np.clip(hi, 0.0, 1.0))
+        if lo > hi:
+            lo, hi = hi, lo
+        if float(img.max() - img.min()) <= 0.0:
+            return np.zeros(img.shape, dtype=np.uint8)
+        edges = canny(img, sigma=sig, low_threshold=lo, high_threshold=hi, use_quantiles=use_quantiles)
+        out = np.where(finite & edges, 255, 0).astype(np.uint8)
+        return out
+
+    if m in ('sobel', 'scharr', 'prewitt', 'roberts'):
+        work = gaussian_filter(img, sigma=sig) if sig > 0 else img
+        fn = {'sobel': sobel, 'scharr': scharr, 'prewitt': prewitt, 'roberts': roberts}[m]
+        res = np.asarray(fn(work), dtype=np.float32)
+    elif m == 'log':
+        res = np.abs(gaussian_laplace(img, sigma=max(sig, 0.1))).astype(np.float32)
+    else:  # 'dog'
+        s1 = max(sig, 0.1)
+        s2 = s1 * max(float(sigma_ratio), 1.05)
+        res = (gaussian_filter(img, s1) - gaussian_filter(img, s2)).astype(np.float32)
+
+    if not finite.all():
+        res = np.where(finite, res, np.float32(0.0)).astype(np.float32)
+    return res
+
+
+def detect_edges_3d(
+    volume: np.ndarray,
+    z_ratio: float = 1.0,
+    method: str = 'sobel',
+    sigma: float = 1.0,
+    sigma_ratio: float = 1.6,
+) -> np.ndarray:
+    """Anisotropic 3D edge detection using Sobel, Scharr, Prewitt, LoG, or DoG."""
+    from scipy.ndimage import gaussian_filter, gaussian_laplace
+    from skimage.filters import prewitt, scharr, sobel
+
+    m = method.lower()
+    if m not in EDGE_3D_METHODS:
+        raise ValueError(f'edge detection method {method!r} does not support 3D')
+
+    img, finite = _fill_nonfinite(volume)
+    if not finite.any():
+        return np.zeros(img.shape, dtype=np.float32)
+
+    sig = max(float(sigma), 0.0)
+    zr = max(float(z_ratio), 1e-6)
+    sigmas = (sig * zr, sig, sig)
+
+    if m in ('sobel', 'scharr', 'prewitt'):
+        work = gaussian_filter(img, sigma=sigmas) if sig > 0 else img
+        fn = {'sobel': sobel, 'scharr': scharr, 'prewitt': prewitt}[m]
+        res = np.asarray(fn(work), dtype=np.float32)
+    elif m == 'log':
+        s_log = max(sig, 0.1)
+        res = np.abs(gaussian_laplace(img, sigma=(s_log * zr, s_log, s_log))).astype(np.float32)
+    else:  # 'dog'
+        s1 = max(sig, 0.1)
+        r = max(float(sigma_ratio), 1.05)
+        res = (
+            gaussian_filter(img, (s1 * zr, s1, s1))
+            - gaussian_filter(img, (s1 * r * zr, s1 * r, s1 * r))
+        ).astype(np.float32)
+
+    if not finite.all():
+        res = np.where(finite, res, np.float32(0.0)).astype(np.float32)
+    return res

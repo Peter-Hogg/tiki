@@ -45,17 +45,23 @@ Use **Process → Labels → Watershed…**, **Fill Holes**, or **Morphology…*
 (`Erode`, `Dilate`, `Open`, `Close` on binary or multi-label 2D/3D masks) to
 clean up segmented labels before measuring.
 
-## Filter, resize, and math
+## Filter, maxima, resize, and math
 
-Gaussian blur, Mean, Median, Minimum, Maximum, Unsharp Mask, and rolling-ball
-Subtract Background show a live preview and display kernel sizes in physical
-units alongside pixels when calibrated. **Process → Filters → Find Edges**
-runs a Sobel gradient filter, **Edit → Invert** inverts intensity non-destructively,
-**Process → Math…** applies scalar/unary math (`Add`, `Subtract`, `Multiply`,
-`Divide`, `Gamma`, `Log`, `Sqrt`, etc.), and **Image → Adjust → Size…**
-resizes stacks/planes while updating physical pixel spacing. Applying adds a
-new image layer or window. For a calibrated Z stack, 3D Gaussian, Mean, Median,
-Minimum, Maximum, and Unsharp kernels account for anisotropic voxel dimensions.
+Gaussian blur, Mean, Median, Minimum, Maximum, Variance, Top Hat, Unsharp Mask,
+Convolve (with custom 2D kernels and presets), and rolling-ball Subtract
+Background show a live preview and display kernel sizes in physical units
+alongside pixels when calibrated. Top-level **Process** commands include
+**Smooth** ({kbd}`Ctrl+Shift+S`), **Sharpen**, **Find Edges** (one-click Sobel),
+**Edge Detection…** (Canny, Sobel, Scharr, Prewitt, Roberts, LoG, and DoG with
+live preview and anisotropic 3D support), and **Find Maxima…** (h-maxima
+prominence detection with live point preview and Point Selection, Single Points,
+Segmented Particles, List, and Count outputs).
+**Edit → Invert** inverts intensity non-destructively, **Process → Math…**
+applies scalar/unary math (`Add`, `Subtract`, `Multiply`, `Divide`, `Gamma`,
+`Log`, `Sqrt`, etc.), and **Image → Adjust → Size…** resizes stacks/planes
+while updating physical pixel spacing. Applying adds a new image layer or
+window. For a calibrated Z stack, 3D Gaussian, Mean, Median, Minimum, Maximum,
+Variance, Top Hat, and Unsharp kernels account for anisotropic voxel dimensions.
 
 ## Send a session to a notebook
 

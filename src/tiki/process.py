@@ -10,8 +10,9 @@ from __future__ import annotations
 from pathlib import Path
 
 import numpy as np
-from napari.layers import Image, Labels
+from napari.layers import Image, Labels, Points
 from qtpy.QtCore import Qt, QTimer
+from qtpy.QtGui import QFont
 from qtpy.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -26,6 +27,7 @@ from qtpy.QtWidgets import (
     QListWidget,
     QListWidgetItem,
     QMessageBox,
+    QPlainTextEdit,
     QPushButton,
     QSpinBox,
     QWidget,
@@ -1829,25 +1831,520 @@ def morphology_dialog(tiki):
     return new_ly
 
 
-def find_edges_command(tiki):
-    """``Process ▸ Filters ▸ Find Edges``: Sobel edge magnitude."""
+def _plane_filter_command(tiki, title: str, suffix: str, func):
+    """Apply a parameterless 2D filter across the current plane or whole stack."""
     viewer, image = tiki.require_image()
     if image.rgb:
-        _error('Find Edges works on greyscale images (split channels or convert first)')
+        _error(f'{title} works on greyscale images (split channels or convert first)')
     if image.ndim > 2:
-        if not _confirm_size(tiki, image.data.shape, 'Find Edges'):
+        if not _confirm_size(tiki, image.data.shape, title):
             return None
         total = int(np.prod(image.data.shape[: image.ndim - 2]))
-        with tiki.progress('Find Edges', total) as tick:
-            out = ops.map_planes(ops.find_edges, image.data, out_dtype=np.float32, progress=tick)
+        with tiki.progress(title, total) as tick:
+            out = ops.map_planes(func, image.data, out_dtype=np.float32, progress=tick)
         if tick.cancelled:
             return None
     else:
-        out = ops.find_edges(image.data)
+        out = func(image.data)
     lo, hi = ops.saturated_limits(out if out.ndim == 2 else out[(0,) * (out.ndim - 2)])
-    layer = _add_result(tiki, viewer, image, out, f'{image.name} edges', image.colormap, (lo, hi))
-    tiki.status(f'Find Edges → "{layer.name}"')
+    layer = _add_result(tiki, viewer, image, out, f'{image.name} {suffix}', image.colormap, (lo, hi))
+    tiki.status(f'{title} → "{layer.name}"')
     return layer
+
+
+def smooth_command(tiki):
+    """``Process ▸ Smooth``: 3×3 unweighted mean filter."""
+    return _plane_filter_command(tiki, 'Smooth', 'smooth', ops.smooth_plane)
+
+
+def sharpen_command(tiki):
+    """``Process ▸ Sharpen``: 3×3 Laplacian sharpening filter."""
+    return _plane_filter_command(tiki, 'Sharpen', 'sharpen', ops.sharpen_plane)
+
+
+def find_edges_command(tiki):
+    """``Process ▸ Find Edges``: Sobel edge magnitude."""
+    return _plane_filter_command(tiki, 'Find Edges', 'edges', ops.find_edges)
+
+
+class ConvolveDialog(QDialog):
+    """Custom 2D convolution kernel editor with presets and live slice preview."""
+
+    def __init__(self, tiki, viewer, image: Image):
+        from .layer_select import LayerCombo
+
+        super().__init__(tiki)
+        style.apply(self)
+        self.tiki = tiki
+        self.viewer = viewer
+        self.image = image
+        self.preview: Image | None = None
+        self.kernel: np.ndarray | None = None
+        self.has_stack = False
+        self.setWindowTitle('Convolve')
+
+        form = QFormLayout(self)
+        self.image_box = LayerCombo(viewer, Image, current=image)
+        self.preset_box = QComboBox()
+        self.preset_box.addItems(list(ops.KERNEL_PRESETS))
+        self.kernel_edit = QPlainTextEdit(ops.KERNEL_PRESETS[self.preset_box.currentText()])
+        mono = QFont('Monospace')
+        mono.setStyleHint(QFont.TypeWriter)
+        self.kernel_edit.setFont(mono)
+        self.kernel_edit.setFixedHeight(110)
+        self.norm_box = QCheckBox('Normalize kernel', checked=True)
+        self.whole_stack = QCheckBox('Process whole stack', checked=True)
+        self.show_preview = QCheckBox('Preview', checked=True)
+        self.note = QLabel('')
+
+        form.addRow('Image:', self.image_box)
+        form.addRow('Preset:', self.preset_box)
+        form.addRow('Kernel:', self.kernel_edit)
+        form.addRow(self.norm_box)
+        form.addRow(self.whole_stack)
+        form.addRow(self.show_preview)
+        form.addRow(self.note)
+        self.buttons = _buttons(self, form)
+
+        self._timer = QTimer(self, singleShot=True, interval=150)
+        self._timer.timeout.connect(self.update_preview)
+        self.image_box.layer_changed.connect(self._set_image)
+        self.preset_box.currentTextChanged.connect(
+            lambda name: self.kernel_edit.setPlainText(ops.KERNEL_PRESETS[name])
+        )
+        self.kernel_edit.textChanged.connect(self._on_change)
+        self.norm_box.toggled.connect(lambda _: self._on_change())
+        self.show_preview.toggled.connect(
+            lambda on: self.update_preview() if on else self._remove_preview()
+        )
+        viewer.dims.events.current_step.connect(self.schedule)
+        self._update_stack_option()
+        self._on_change(immediate=True)
+
+    def _update_stack_option(self) -> None:
+        n = int(np.prod(self.image.data.shape[: self.image.ndim - 2])) if self.image.ndim > 2 else 0
+        self.has_stack = n > 0
+        self.whole_stack.setVisible(self.has_stack)
+        self.whole_stack.setText(f'Process whole stack ({n} planes)')
+
+    def _set_image(self, image) -> None:
+        if image is None or image is self.image:
+            return
+        self._remove_preview()
+        self.image = image
+        self._update_stack_option()
+        self._on_change()
+
+    def _on_change(self, immediate: bool = False) -> None:
+        try:
+            k = ops.parse_kernel(self.kernel_edit.toPlainText())
+            self.kernel = k
+            k_sum = float(k.sum())
+            self.note.setText(f'{k.shape[0]}×{k.shape[1]} kernel (sum = {k_sum:g})')
+            self.note.setStyleSheet('')
+            self.buttons.button(QDialogButtonBox.Ok).setEnabled(True)
+        except ValueError as exc:
+            self.kernel = None
+            self.note.setText(str(exc))
+            self.note.setStyleSheet('color: #b00020;')
+            self.buttons.button(QDialogButtonBox.Ok).setEnabled(False)
+            self._remove_preview()
+            return
+        if immediate:
+            self.update_preview()
+        else:
+            self.schedule()
+
+    def schedule(self, _event=None) -> None:
+        if self.show_preview.isChecked() and self.kernel is not None:
+            self._timer.start()
+
+    def update_preview(self) -> None:
+        if not self.show_preview.isChecked() or self.kernel is None:
+            return
+        if self.image is None or self.image not in self.viewer.layers or self.image.rgb:
+            return
+        plane = roi_mod.current_plane(self.viewer, self.image)
+        result = ops.convolve_plane(plane, self.kernel, normalize=self.norm_box.isChecked())
+        lo, hi = ops.saturated_limits(result)
+        if self.preview is None or self.preview not in self.viewer.layers:
+            self.preview = Image(
+                result,
+                name='filter preview',
+                colormap=self.image.colormap,
+                contrast_limits=(lo, hi),
+                **axes_mod.geometry(self.image, ndim=2),
+            )
+            self.viewer.add_layer(self.preview)
+            self.tiki.reapply_tool(self.viewer)
+        else:
+            self.preview.data = result
+            self.preview.contrast_limits = (lo, hi)
+
+    def _remove_preview(self) -> None:
+        if self.preview is not None and self.preview in self.viewer.layers:
+            self.viewer.layers.remove(self.preview)
+        self.preview = None
+
+    def cleanup(self) -> None:
+        self._timer.stop()
+        try:
+            self.viewer.dims.events.current_step.disconnect(self.schedule)
+        except Exception:
+            pass
+        self._remove_preview()
+        self.image_box.blockSignals(True)
+        self.image_box.set_viewer(None)
+        self.image_box.blockSignals(False)
+
+    def done(self, result: int) -> None:
+        self.cleanup()
+        super().done(result)
+
+
+def convolve_dialog(tiki):
+    """``Process ▸ Filters ▸ Convolve…``: custom 2D spatial kernel convolution."""
+    viewer, image = tiki.require_image()
+    if image.rgb:
+        _error('Convolve works on greyscale images (split channels or convert first)')
+    dlg = ConvolveDialog(tiki, viewer, image)
+    try:
+        accepted = dlg.exec_() == QDialog.Accepted
+    finally:
+        dlg.cleanup()
+    if not accepted or dlg.image is None or dlg.kernel is None:
+        return None
+    img = dlg.image
+    if img.rgb:
+        _error('Convolve works on greyscale images (split channels or convert first)')
+    kernel = dlg.kernel
+    normalize = dlg.norm_box.isChecked()
+    use_stack = dlg.has_stack and dlg.whole_stack.isChecked()
+    fn = lambda plane: ops.convolve_plane(plane, kernel, normalize=normalize)  # noqa: E731
+    if use_stack:
+        if not _confirm_size(tiki, img.data.shape, 'Convolve'):
+            return None
+        total = int(np.prod(img.data.shape[: img.ndim - 2]))
+        with tiki.progress('Convolve', total) as tick:
+            out = ops.map_planes(fn, img.data, out_dtype=np.float32, progress=tick)
+        if tick.cancelled:
+            return None
+    else:
+        out = fn(roi_mod.current_plane(viewer, img))
+    lo, hi = ops.saturated_limits(out if out.ndim == 2 else out[(0,) * (out.ndim - 2)])
+    name = f'{img.name} convolve {kernel.shape[0]}×{kernel.shape[1]}'
+    if out.ndim == img.ndim:
+        layer = _add_result(tiki, viewer, img, out, name, img.colormap, (lo, hi))
+    else:
+        info2 = axes_mod.AxesInfo(axes_mod.get(img).axes[-2:], axes_mod.get(img).source, True)
+        layer = Image(
+            out,
+            name=name,
+            colormap=img.colormap,
+            contrast_limits=(lo, hi),
+            metadata={'axes': info2.to_dict()},
+            **axes_mod.geometry(img, ndim=2),
+        )
+        viewer.add_layer(layer)
+        tiki.reapply_tool(viewer)
+    tiki.status(f'Convolve ({kernel.shape[0]}×{kernel.shape[1]}) → "{layer.name}"')
+    return layer
+
+
+class FindMaximaDialog(QDialog):
+    """``Process ▸ Find Maxima…`` with live point-selection preview."""
+
+    OUTPUT_TYPES = ('Point Selection', 'Single Points', 'Segmented Particles', 'List', 'Count')
+
+    def __init__(self, tiki, viewer, image: Image):
+        from .layer_select import LayerCombo
+
+        super().__init__(tiki)
+        style.apply(self)
+        self.tiki = tiki
+        self.viewer = viewer
+        self.image = image
+        self.preview: Points | None = None
+        self.has_stack = False
+        self.has_roi = False
+        self.setWindowTitle('Find Maxima')
+
+        plane = roi_mod.current_plane(viewer, image)
+        vals = np.asarray(plane, dtype=np.float64)
+        vals = vals[np.isfinite(vals)]
+        default_prom = 10.0
+        if vals.size:
+            span = float(np.percentile(vals, 99) - np.percentile(vals, 1))
+            if span > 0:
+                default_prom = max(0.01, round(0.1 * span, 4))
+
+        form = QFormLayout(self)
+        self.image_box = LayerCombo(viewer, Image, current=image)
+        self.prom_spin = QDoubleSpinBox(decimals=4, minimum=0.0, maximum=1e9, singleStep=1.0, value=default_prom)
+        self.strict_box = QCheckBox('Strict (require positive prominence)')
+        self.edge_box = QCheckBox('Exclude edge maxima')
+        self.light_box = QCheckBox('Light background (find minima)')
+        self.roi_box = QCheckBox('Restrict to selection', checked=True)
+        self.output_box = QComboBox()
+        self.output_box.addItems(list(self.OUTPUT_TYPES))
+        self.whole_stack = QCheckBox('Process whole stack', checked=False)
+        self.preview_box = QCheckBox('Preview point selection', checked=True)
+        self.count_label = QLabel('')
+
+        form.addRow('Image:', self.image_box)
+        form.addRow('Prominence:', self.prom_spin)
+        form.addRow(self.strict_box)
+        form.addRow(self.edge_box)
+        form.addRow(self.light_box)
+        form.addRow(self.roi_box)
+        form.addRow('Output type:', self.output_box)
+        form.addRow(self.whole_stack)
+        form.addRow(self.preview_box)
+        form.addRow(self.count_label)
+        _buttons(self, form)
+
+        self._timer = QTimer(self, singleShot=True, interval=120)
+        self._timer.timeout.connect(self.update_preview)
+        self.image_box.layer_changed.connect(self._set_image)
+        self.prom_spin.valueChanged.connect(lambda _: self.schedule())
+        for box in (self.strict_box, self.edge_box, self.light_box, self.roi_box):
+            box.toggled.connect(lambda _: self.schedule())
+        self.output_box.currentTextChanged.connect(lambda _: self._sync_stack_option())
+        self.preview_box.toggled.connect(
+            lambda on: self.update_preview() if on else self._clear_preview_and_count()
+        )
+        viewer.dims.events.current_step.connect(self.schedule)
+        self._sync_options()
+        self.update_preview()
+
+    def _sync_stack_option(self) -> None:
+        out_mode = self.output_box.currentText()
+        n = int(np.prod(self.image.data.shape[: self.image.ndim - 2])) if self.image.ndim > 2 else 0
+        self.has_stack = n > 0 and out_mode != 'Point Selection'
+        self.whole_stack.setVisible(self.has_stack)
+        if n > 0:
+            self.whole_stack.setText(f'Process whole stack ({n} planes)')
+
+    def _sync_options(self) -> None:
+        current = self.tiki.current_roi(self.viewer)
+        self.has_roi = current is not None and current[1] not in ('line', 'path')
+        self.roi_box.setVisible(self.has_roi)
+        if not self.has_roi:
+            self.roi_box.setChecked(False)
+        else:
+            self.roi_box.setChecked(True)
+        self._sync_stack_option()
+
+    def _set_image(self, image) -> None:
+        if image is None or image is self.image:
+            return
+        self._remove_preview()
+        self.image = image
+        self._sync_stack_option()
+        self.schedule()
+
+    def roi_mask_for(self, img: Image) -> np.ndarray | None:
+        if not self.has_roi or not self.roi_box.isChecked():
+            return None
+        current = self.tiki.current_roi(self.viewer)
+        if current is None or current[1] in ('line', 'path'):
+            return None
+        return roi_mod.shape_mask(*current, roi_mod.spatial_shape(img))
+
+    def options(self) -> dict:
+        return {
+            'prominence': self.prom_spin.value(),
+            'exclude_edges': self.edge_box.isChecked(),
+            'light_background': self.light_box.isChecked(),
+            'strict': self.strict_box.isChecked(),
+        }
+
+    def schedule(self, _event=None) -> None:
+        if self.preview_box.isChecked():
+            self._timer.start()
+
+    def _clear_preview_and_count(self) -> None:
+        self._remove_preview()
+        self.count_label.setText('')
+
+    def update_preview(self) -> None:
+        if not self.preview_box.isChecked():
+            return
+        if self.image is None or self.image not in self.viewer.layers or self.image.rgb:
+            return
+        plane = roi_mod.current_plane(self.viewer, self.image)
+        coords, _ = ops.find_maxima(plane, mask=self.roi_mask_for(self.image), **self.options())
+        self.count_label.setText(f'{len(coords)} maxima found')
+        pts_data = coords.astype(float) if len(coords) else np.empty((0, 2), dtype=float)
+        if self.preview is None or self.preview not in self.viewer.layers:
+            kwargs = roi_mod.plane_kwargs(self.image)
+            self.preview = Points(
+                pts_data,
+                name='maxima preview',
+                face_color='cyan',
+                size=6,
+                **kwargs,
+            )
+            self.viewer.add_layer(self.preview)
+            self.tiki.reapply_tool(self.viewer)
+        else:
+            self.preview.data = pts_data
+
+    def _remove_preview(self) -> None:
+        if self.preview is not None and self.preview in self.viewer.layers:
+            self.viewer.layers.remove(self.preview)
+        self.preview = None
+
+    def cleanup(self) -> None:
+        self._timer.stop()
+        try:
+            self.viewer.dims.events.current_step.disconnect(self.schedule)
+        except Exception:
+            pass
+        self._remove_preview()
+        self.image_box.blockSignals(True)
+        self.image_box.set_viewer(None)
+        self.image_box.blockSignals(False)
+
+    def done(self, result: int) -> None:
+        self.cleanup()
+        super().done(result)
+
+
+def find_maxima_dialog(tiki):
+    """``Process ▸ Find Maxima…``: local maxima detection with preview and 5 Fiji output modes."""
+    viewer, image = tiki.require_image()
+    if image.rgb:
+        _error('Find Maxima works on greyscale images (split channels or convert first)')
+    dlg = FindMaximaDialog(tiki, viewer, image)
+    try:
+        accepted = dlg.exec_() == QDialog.Accepted
+    finally:
+        dlg.cleanup()
+    if not accepted or dlg.image is None:
+        return None
+    img = dlg.image
+    if img.rgb:
+        _error('Find Maxima works on greyscale images (split channels or convert first)')
+    opts = dlg.options()
+    out_mode = dlg.output_box.currentText()
+    roi_mask = dlg.roi_mask_for(img)
+    use_stack = dlg.has_stack and dlg.whole_stack.isChecked()
+    info = axes_mod.get(img)
+    shape = tuple(img.data.shape[: img.ndim])
+    index = roi_mod.current_index(viewer, img)
+
+    if out_mode == 'Point Selection':
+        plane = roi_mod.current_plane(viewer, img)
+        coords, _ = ops.find_maxima(plane, mask=roi_mask, **opts)
+        layer = roi_mod.points_layer(viewer)
+        layer.data = coords.astype(float) if len(coords) else np.empty((0, 2), dtype=float)
+        tiki.status(f'Find Maxima: {len(coords)} points selected')
+        return layer
+
+    if out_mode == 'Single Points':
+        if use_stack:
+            blocks = nd.blocks(info, shape, index, nd.WHOLE, False)
+            out = np.zeros(shape, dtype=np.int32)
+            total_pts = 0
+            with tiki.progress('Find Maxima', len(blocks)) as tick:
+                for n, block in enumerate(blocks, 1):
+                    coords, _ = ops.find_maxima(np.asarray(img.data[block]), mask=roi_mask, **opts)
+                    if len(coords):
+                        out[block][coords[:, 0], coords[:, 1]] = np.arange(1, len(coords) + 1, dtype=np.int32)
+                        total_pts += len(coords)
+                    if tick(n, len(blocks)) is False:
+                        return None
+            geom = axes_mod.geometry(img)
+            meta = {'axes': info.to_dict()}
+        else:
+            plane = roi_mod.current_plane(viewer, img)
+            coords, _ = ops.find_maxima(plane, mask=roi_mask, **opts)
+            out = np.zeros(plane.shape, dtype=np.int32)
+            if len(coords):
+                out[coords[:, 0], coords[:, 1]] = np.arange(1, len(coords) + 1, dtype=np.int32)
+            total_pts = len(coords)
+            geom = axes_mod.geometry(img, ndim=2)
+            meta = {}
+        layer = Labels(out, name=f'{img.name} maxima', opacity=0.8, metadata=meta, **geom)
+        viewer.add_layer(layer)
+        tiki.reapply_tool(viewer)
+        tiki.status(f'Find Maxima (Single Points): {total_pts} points → "{layer.name}"')
+        return layer
+
+    if out_mode == 'Segmented Particles':
+        if use_stack:
+            blocks = nd.blocks(info, shape, index, nd.WHOLE, False)
+            out = np.zeros(shape, dtype=np.int32)
+            total_pts = 0
+            with tiki.progress('Find Maxima (Segmented)', len(blocks)) as tick:
+                for n, block in enumerate(blocks, 1):
+                    pl = np.asarray(img.data[block])
+                    coords, _ = ops.find_maxima(pl, mask=roi_mask, **opts)
+                    out[block] = ops.segment_maxima(
+                        pl, coords, light_background=opts['light_background'], mask=roi_mask
+                    )
+                    total_pts += len(coords)
+                    if tick(n, len(blocks)) is False:
+                        return None
+            geom = axes_mod.geometry(img)
+            meta = {'axes': info.to_dict()}
+        else:
+            plane = roi_mod.current_plane(viewer, img)
+            coords, _ = ops.find_maxima(plane, mask=roi_mask, **opts)
+            out = ops.segment_maxima(
+                plane, coords, light_background=opts['light_background'], mask=roi_mask
+            )
+            total_pts = len(coords)
+            geom = axes_mod.geometry(img, ndim=2)
+            meta = {}
+        layer = Labels(out, name=f'{img.name} maxima segmented', opacity=0.6, metadata=meta, **geom)
+        viewer.add_layer(layer)
+        tiki.reapply_tool(viewer)
+        tiki.status(f'Find Maxima (Segmented): {total_pts} regions → "{layer.name}"')
+        return layer
+
+    if out_mode == 'List':
+        u = axes_mod.spatial_unit(info)
+        tiki._sync_result_units({'X': u, 'Y': u} if u else {})
+        sy, sx = float(img.scale[-2]), float(img.scale[-1])
+        blocks = nd.blocks(info, shape, index, nd.WHOLE, False) if use_stack else [
+            tuple(index[:-2]) + (slice(None), slice(None))
+        ]
+        total_pts = 0
+        for block in blocks:
+            coords, values = ops.find_maxima(np.asarray(img.data[block]), mask=roi_mask, **opts)
+            base = {'Label': img.name}
+            where = nd.block_label(info, block)
+            if where:
+                base['Slice'] = where
+            for (y, x), val in zip(coords.tolist(), values.tolist()):
+                x_val = int(x) if (u is None and sx == 1.0) else float(x * sx)
+                y_val = int(y) if (u is None and sy == 1.0) else float(y * sy)
+                tiki.results.add_row(base | {'X': x_val, 'Y': y_val, 'Value': float(val)})
+                total_pts += 1
+        tiki.show_results()
+        tiki.status(f'Find Maxima (List): {total_pts} rows')
+        return total_pts
+
+    # Count
+    tiki._sync_result_units({})
+    blocks = nd.blocks(info, shape, index, nd.WHOLE, False) if use_stack else [
+        tuple(index[:-2]) + (slice(None), slice(None))
+    ]
+    total_rows = 0
+    for block in blocks:
+        coords, _ = ops.find_maxima(np.asarray(img.data[block]), mask=roi_mask, **opts)
+        row = {'Label': img.name}
+        where = nd.block_label(info, block)
+        if where:
+            row['Slice'] = where
+        row['Count'] = int(len(coords))
+        tiki.results.add_row(row)
+        total_rows += 1
+    tiki.show_results()
+    tiki.status(f'Find Maxima (Count): {total_rows} row(s)')
+    return total_rows
 
 
 def concatenate_dialog(tiki):
@@ -2271,3 +2768,293 @@ def merge_channels_dialog(tiki):
         tiki.split_channels()
     tiki.status(f'Merged {len(layers_sel)} channel(s) → "{v.title}"')
     return v
+
+
+# ------------------------------------------------------------ Edge Detection
+
+
+class EdgeDetectionDialog(QDialog):
+    """``Process ▸ Edge Detection…``: configurable 2D/3D edge detectors with preview."""
+
+    def __init__(self, tiki, viewer, image: Image):
+        from .layer_select import LayerCombo
+
+        super().__init__(tiki)
+        style.apply(self)
+        self.tiki = tiki
+        self.viewer = viewer
+        self.image = image
+        self.preview: Image | None = None
+        self.has_z = False
+        self.has_stack = False
+        self.setWindowTitle('Edge Detection')
+
+        self.form = QFormLayout(self)
+        self.image_box = LayerCombo(viewer, Image, current=image)
+        self.method_box = QComboBox()
+        for label, key in ops.EDGE_METHODS.items():
+            self.method_box.addItem(label, key)
+
+        self.sigma_spin = QDoubleSpinBox(decimals=2, minimum=0.0, maximum=50.0, singleStep=0.25, value=1.0)
+        self.sigma_spin.setSuffix(' px')
+        self.phys_label = QLabel('')
+
+        self.low_spin = QDoubleSpinBox(decimals=3, minimum=0.0, maximum=1.0, singleStep=0.05, value=0.10)
+        self.high_spin = QDoubleSpinBox(decimals=3, minimum=0.0, maximum=1.0, singleStep=0.05, value=0.20)
+        self.as_labels = QCheckBox('Output as Labels layer')
+        self.ratio_spin = QDoubleSpinBox(decimals=2, minimum=1.1, maximum=10.0, singleStep=0.1, value=1.6)
+        self.three_d = QCheckBox('3D (through Z, scaled by voxel size)', checked=True)
+        self.whole_stack = QCheckBox('Process whole stack', checked=True)
+        self.show_preview = QCheckBox('Preview', checked=True)
+
+        self.form.addRow('Image:', self.image_box)
+        self.form.addRow('Method:', self.method_box)
+        self.form.addRow('Sigma (smoothing):', self.sigma_spin)
+        self.form.addRow('', self.phys_label)
+        self.form.addRow('Low threshold (quantile):', self.low_spin)
+        self.form.addRow('High threshold (quantile):', self.high_spin)
+        self.form.addRow(self.as_labels)
+        self.form.addRow('Sigma ratio (σ₂ / σ₁):', self.ratio_spin)
+        self.form.addRow(self.three_d)
+        self.form.addRow(self.whole_stack)
+        self.form.addRow(self.show_preview)
+        _buttons(self, self.form)
+
+        self._timer = QTimer(self, singleShot=True, interval=150)
+        self._timer.timeout.connect(self.update_preview)
+        self.image_box.layer_changed.connect(self._set_image)
+        self.method_box.currentIndexChanged.connect(lambda _: self._sync_and_schedule())
+        self.sigma_spin.valueChanged.connect(lambda _: self._sync_phys_and_schedule())
+        for w in (self.low_spin, self.high_spin, self.ratio_spin):
+            w.valueChanged.connect(lambda _: self.schedule())
+        self.three_d.toggled.connect(lambda _: self.schedule())
+        self.show_preview.toggled.connect(
+            lambda on: self.update_preview() if on else self._remove_preview()
+        )
+        viewer.dims.events.current_step.connect(self.schedule)
+        self._sync_options()
+        self.update_preview()
+
+    def _set_row_visible(self, field: QWidget, visible: bool) -> None:
+        field.setVisible(visible)
+        lbl = self.form.labelForField(field)
+        if lbl is not None:
+            lbl.setVisible(visible)
+
+    def _sync_phys(self) -> None:
+        info = axes_mod.get(self.image)
+        u = axes_mod.spatial_unit(info)
+        if not u:
+            self.phys_label.setText('')
+            return
+        sy = float(info.axes[-2].step or 1.0)
+        sx = float(info.axes[-1].step or sy)
+        self.phys_label.setText(f'≈ {self.sigma_spin.value() * 0.5 * (sy + sx):.4g} {u}')
+
+    def _sync_options(self) -> None:
+        m = self.method_box.currentData()
+        info = axes_mod.get(self.image)
+        is_canny = m == 'canny'
+        is_dog = m == 'dog'
+        self._set_row_visible(self.low_spin, is_canny)
+        self._set_row_visible(self.high_spin, is_canny)
+        self.as_labels.setVisible(is_canny)
+        self._set_row_visible(self.ratio_spin, is_dog)
+
+        self.has_z = info.index('Z') is not None and m in ops.EDGE_3D_METHODS
+        self.three_d.setVisible(self.has_z)
+        n = int(np.prod(self.image.data.shape[: self.image.ndim - 2])) if self.image.ndim > 2 else 0
+        self.has_stack = n > 0
+        self.whole_stack.setVisible(self.has_stack)
+        self.whole_stack.setText(f'Process whole stack ({n} planes)')
+        self._sync_phys()
+
+    def _sync_and_schedule(self) -> None:
+        self._sync_options()
+        self.schedule()
+
+    def _sync_phys_and_schedule(self) -> None:
+        self._sync_phys()
+        self.schedule()
+
+    def _set_image(self, image) -> None:
+        if image is None or image is self.image:
+            return
+        self._remove_preview()
+        self.image = image
+        self._sync_options()
+        self.schedule()
+
+    def use_3d(self) -> bool:
+        return self.has_z and self.three_d.isChecked()
+
+    def use_whole_stack(self) -> bool:
+        return self.has_stack and self.whole_stack.isChecked()
+
+    def options(self) -> dict:
+        return {
+            'method': self.method_box.currentData(),
+            'sigma': self.sigma_spin.value(),
+            'low_threshold': self.low_spin.value(),
+            'high_threshold': self.high_spin.value(),
+            'sigma_ratio': self.ratio_spin.value(),
+        }
+
+    def schedule(self, _event=None) -> None:
+        if self.show_preview.isChecked():
+            self._timer.start()
+
+    def update_preview(self) -> None:
+        if not self.show_preview.isChecked():
+            return
+        if self.image is None or self.image not in self.viewer.layers or self.image.rgb:
+            return
+        from . import filters
+
+        opts = self.options()
+        if self.use_3d():
+            info = axes_mod.get(self.image)
+            shape = self.image.data.shape[: self.image.ndim]
+            index = roi_mod.current_index(self.viewer, self.image)
+            (block,) = (
+                nd.blocks(info, shape, index, nd.VOLUME, True)
+                if len(info.axes) > 3
+                else [(slice(None), slice(None), slice(None))]
+            )
+            vol = ops.detect_edges_3d(
+                np.asarray(self.image.data[block]),
+                filters.z_ratio(self.image),
+                method=opts['method'],
+                sigma=opts['sigma'],
+                sigma_ratio=opts['sigma_ratio'],
+            )
+            result = vol[index[info.index('Z')]]
+        else:
+            result = ops.detect_edges(roi_mod.current_plane(self.viewer, self.image), **opts)
+        lo, hi = (0.0, 255.0) if opts['method'] == 'canny' else ops.saturated_limits(result)
+        cmap = 'gray' if opts['method'] == 'canny' else self.image.colormap
+        if self.preview is None or self.preview not in self.viewer.layers:
+            self.preview = Image(
+                result,
+                name='filter preview',
+                colormap=cmap,
+                contrast_limits=(lo, hi),
+                **axes_mod.geometry(self.image, ndim=2),
+            )
+            self.viewer.add_layer(self.preview)
+            self.tiki.reapply_tool(self.viewer)
+        else:
+            self.preview.data = result
+            self.preview.colormap = cmap
+            self.preview.contrast_limits = (lo, hi)
+
+    def _remove_preview(self) -> None:
+        if self.preview is not None and self.preview in self.viewer.layers:
+            self.viewer.layers.remove(self.preview)
+        self.preview = None
+
+    def cleanup(self) -> None:
+        self._timer.stop()
+        try:
+            self.viewer.dims.events.current_step.disconnect(self.schedule)
+        except Exception:
+            pass
+        self._remove_preview()
+        self.image_box.blockSignals(True)
+        self.image_box.set_viewer(None)
+        self.image_box.blockSignals(False)
+
+    def done(self, result: int) -> None:
+        self.cleanup()
+        super().done(result)
+
+
+def edge_detection_dialog(tiki):
+    """``Process ▸ Edge Detection…``: Canny, Sobel, Scharr, Prewitt, Roberts, LoG, or DoG."""
+    from . import filters
+
+    viewer, image = tiki.require_image()
+    if image.rgb:
+        _error('Edge Detection works on greyscale images (split channels or convert first)')
+    dlg = EdgeDetectionDialog(tiki, viewer, image)
+    try:
+        accepted = dlg.exec_() == QDialog.Accepted
+    finally:
+        dlg.cleanup()
+    if not accepted or dlg.image is None:
+        return None
+    img = dlg.image
+    if img.rgb:
+        _error('Edge Detection works on greyscale images (split channels or convert first)')
+    opts = dlg.options()
+    method = opts['method']
+    use_stack = dlg.use_whole_stack()
+    use_3d = dlg.use_3d()
+    as_labels = method == 'canny' and dlg.as_labels.isChecked()
+    info = axes_mod.get(img)
+    shape = tuple(img.data.shape[: img.ndim])
+    index = roi_mod.current_index(viewer, img)
+
+    if img.ndim > 2 and (use_stack or use_3d):
+        if use_3d:
+            zr = filters.z_ratio(img)
+            fn = lambda vol: ops.detect_edges_3d(  # noqa: E731
+                vol, zr, method=method, sigma=opts['sigma'], sigma_ratio=opts['sigma_ratio']
+            )
+            blocks = nd.blocks(info, shape, index, nd.WHOLE if use_stack else nd.VOLUME, True)
+        else:
+            fn = lambda pl: ops.detect_edges(pl, **opts)  # noqa: E731
+            blocks = nd.blocks(info, shape, index, nd.WHOLE, False)
+        if not _confirm_size(tiki, shape, f'Edge Detection ({method})'):
+            return None
+        with tiki.progress(f'Edge Detection ({method})', len(blocks)) as tick:
+            out = ops.map_blocks(
+                fn,
+                img.data,
+                blocks,
+                out_dtype=np.uint8 if method == 'canny' else np.float32,
+                progress=tick,
+            )
+        if tick.cancelled:
+            return None
+        if not use_stack:
+            out = out[blocks[0]]
+    else:
+        out = ops.detect_edges(roi_mod.current_plane(viewer, img), **opts)
+
+    suffix = f'edges ({method}' + (' 3D' if use_3d else '') + ')'
+    name = f'{img.name} {suffix}'
+    out_info = info if out.ndim == img.ndim else axes_mod.fit(
+        axes_mod.AxesInfo(info.axes[-out.ndim :], info.source, info.confident), out.shape
+    )
+    geom = axes_mod.geometry(img) if out.ndim == img.ndim else axes_mod.geometry(img, ndim=out.ndim)
+    if as_labels:
+        layer = Labels(
+            (out > 0).astype(np.uint8),
+            name=name,
+            opacity=0.8,
+            metadata={'axes': out_info.to_dict()} if out.ndim > 2 else {},
+            **geom,
+        )
+        viewer.add_layer(layer)
+        tiki.reapply_tool(viewer)
+    else:
+        lo, hi = (0.0, 255.0) if method == 'canny' else ops.saturated_limits(
+            out if out.ndim == 2 else out[(0,) * (out.ndim - 2)]
+        )
+        cmap = 'gray' if method == 'canny' else img.colormap
+        if out.ndim == img.ndim:
+            layer = _add_result(tiki, viewer, img, out, name, cmap, (lo, hi), axes=out_info)
+        else:
+            layer = Image(
+                out,
+                name=name,
+                colormap=cmap,
+                contrast_limits=(lo, hi),
+                metadata={'axes': out_info.to_dict()},
+                **geom,
+            )
+            viewer.add_layer(layer)
+            tiki.reapply_tool(viewer)
+    tiki.status(f'Edge Detection ({method}) → "{layer.name}"')
+    return layer
