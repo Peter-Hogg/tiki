@@ -13,6 +13,29 @@ TIKI brings the familiar *current image* workflow to Python: open a TIFF, draw
 an ROI, measure it, inspect a trace, make a projection, and move to the next
 image without assembling a collection of unrelated widgets.
 
+::::{grid} 1 2 2 2
+:gutter: 2
+
+:::{grid-item-card} Cells 3D (2-channel Z-stack)
+:text-align: center
+```{image} _static/demo-cells3d.gif
+:alt: Cells 3D two-channel Z-stack exported from TIKI with calibrated scale bar
+:width: 280px
+```
+Exported directly from TIKI (`File ▸ Export ▸ Export Movie…`) with calibrated scale bar and Z depth.
+:::
+
+:::{grid-item-card} Mouse Kidney (3-channel Z-stack)
+:text-align: center
+```{image} _static/demo-kidney.gif
+:alt: Mouse Kidney three-channel Z-stack exported from TIKI
+:width: 280px
+```
+Multi-channel LUTs and overlays (`File ▸ Open Samples ▸ Mouse Kidney`).
+:::
+
+::::
+
 ```{admonition} Project status
 :class: caution
 TIKI is an early prototype. It is useful today, but interfaces and shortcuts

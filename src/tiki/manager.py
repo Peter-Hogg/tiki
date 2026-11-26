@@ -256,6 +256,10 @@ class WindowManager(QObject):
         for v in viewers:
             try:
                 v.close()
+            except RuntimeError as exc:
+                # Already-deleted C++/Qt widgets (e.g. stale napari.Viewer._instances) are already closed.
+                if 'deleted' not in str(exc).lower() and first_err is None:
+                    first_err = exc
             except Exception as exc:
                 if first_err is None:
                     first_err = exc

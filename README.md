@@ -8,10 +8,24 @@
 </p>
 
 <p align="center">
+  <a href="https://github.com/Peter-Hogg/tiki/releases"><img alt="Download Release" src="https://img.shields.io/github/v/release/Peter-Hogg/tiki?label=Download&color=blue"></a>
   <a href="https://github.com/Peter-Hogg/tiki/actions/workflows/tests.yml"><img alt="Tests" src="https://github.com/Peter-Hogg/tiki/actions/workflows/tests.yml/badge.svg"></a>
   <a href="https://peter-hogg.github.io/tiki/"><img alt="Documentation" src="https://img.shields.io/badge/docs-GitHub%20Pages-2ea44f"></a>
   <a href="LICENSE"><img alt="License: BSD-3-Clause" src="https://img.shields.io/badge/license-BSD--3--Clause-blue"></a>
 </p>
+
+<table align="center">
+  <tr>
+    <td align="center">
+      <img src="assets/demo-cells3d.gif" alt="Cells 3D two-channel Z-stack exported from TIKI with scale bar" width="300"><br>
+      <sub><b>Cells 3D</b> (2-ch Z-stack, calibrated scale bar &amp; Z label — exported via <code>Export Movie…</code>)</sub>
+    </td>
+    <td align="center">
+      <img src="assets/demo-kidney.gif" alt="Mouse Kidney three-channel Z-stack exported from TIKI" width="300"><br>
+      <sub><b>Mouse Kidney</b> (3-ch Z-stack, split channels &amp; LUTs — <code>File ▸ Open Samples</code>)</sub>
+    </td>
+  </tr>
+</table>
 
 > [!NOTE]
 > TIKI is an early prototype. The core workflow works, but interfaces and
@@ -28,7 +42,17 @@ TIKI is not intended to reproduce every Fiji plugin. Its goal is to make the
 everyday microscopy loop—open, inspect, draw, measure, project and plot—fast
 and approachable in Python.
 
-## Install
+## Download & Install
+
+### Option 1: Standalone Installer (No Terminal Needed)
+
+Download the installer for your OS from the [**GitHub Releases**](https://github.com/Peter-Hogg/tiki/releases) page and double-click to install—Python, napari, Qt 6, microscopy readers (`.tif`, `.czi`, `.lif`, `.zarr`, `.h5`), and MP4/GIF export are all bundled:
+
+- **Windows:** `TIKI-*-Windows-x86_64.exe` *(if SmartScreen prompts, click **More info → Run anyway**)*
+- **macOS (Apple Silicon):** `TIKI-*-MacOSX-arm64.pkg` *(if Gatekeeper prompts on first launch, right-click **TIKI.app → Open**)*
+- **Linux:** `TIKI-*-Linux-x86_64.sh` *(run `bash TIKI-*-Linux-x86_64.sh`)*
+
+### Option 2: Command-line install with `uv`
 
 One command, using [uv](https://docs.astral.sh/uv/) (it installs TIKI and its
 own Python, napari and Qt in an isolated environment, and puts `tiki` on your
