@@ -106,6 +106,22 @@ def add_noise_command(tiki):
     )
 
 
+def run_add_noise(tiki, viewer, image: Image, sigma: float = 25.0, whole_stack: bool = True):
+    """Add zero-mean Gaussian noise with standard deviation ``sigma``."""
+    sig = float(sigma)
+    use_stack = image.ndim > 2 and bool(whole_stack)
+    return _apply_plane_op(
+        tiki,
+        'Add Specified Noise',
+        f'noise σ={sig:g}',
+        lambda pl: ops.add_gaussian_noise(pl, sig),
+        whole_stack=use_stack,
+        viewer=viewer,
+        image=image,
+        record_cmd=f'tiki.add_noise({sig!r}, whole_stack={use_stack!r})',
+    )
+
+
 def add_specified_noise_dialog(tiki):
     """``Process ▸ Noise ▸ Add Specified Noise…``: Gaussian noise with chosen σ."""
     viewer, image = tiki.require_image()
@@ -124,20 +140,12 @@ def add_specified_noise_dialog(tiki):
     process._buttons(dlg, form)
     if dlg.exec_() != QDialog.Accepted:
         return None
-    sig = sigma_spin.value()
-    use_stack = has_stack and whole.isChecked()
-    return _apply_plane_op(
+    return run_add_noise(
         tiki,
-        'Add Specified Noise',
-        f'noise σ={sig:g}',
-        lambda pl: ops.add_gaussian_noise(pl, sig),
-        whole_stack=use_stack,
-        record_cmd=(
-            'layer = tiki.layer(); '
-            f'tiki.add_image(np.stack([tiki.ops.add_gaussian_noise(p, {sig!r}) for p in layer.data]) '
-            'if layer.data.ndim > 2 else tiki.ops.add_gaussian_noise(layer.data, '
-            f'{sig!r}), f"{{layer.name}} noise")'
-        ),
+        viewer,
+        image,
+        sigma=sigma_spin.value(),
+        whole_stack=has_stack and whole.isChecked(),
     )
 
 
@@ -271,6 +279,35 @@ class RemoveOutliersDialog(QDialog):
         super().done(result)
 
 
+def run_remove_outliers(
+    tiki,
+    viewer,
+    image: Image,
+    radius: float = 2.0,
+    threshold: float = 50.0,
+    which: str = 'bright',
+    whole_stack: bool = True,
+):
+    """Remove bright/dark intensity outliers on ``image`` (plane or stack) and record it."""
+    if image.rgb:
+        process._error('Remove Outliers works on greyscale images (split channels or convert first)')
+    r = float(radius)
+    thr = float(threshold)
+    w = str(which).lower()
+    use_stack = image.ndim > 2 and bool(whole_stack)
+    return _apply_plane_op(
+        tiki,
+        'Remove Outliers',
+        f'outliers r={r:g} thr={thr:g}',
+        lambda pl: ops.remove_outliers(pl, radius=r, threshold=thr, which=w),
+        whole_stack=use_stack,
+        out_dtype=image.data.dtype,
+        viewer=viewer,
+        image=image,
+        record_cmd=f'tiki.remove_outliers(radius={r!r}, threshold={thr!r}, which={w!r}, whole_stack={use_stack!r})',
+    )
+
+
 def remove_outliers_dialog(tiki):
     """``Process ▸ Noise ▸ Remove Outliers…``."""
     viewer, image = tiki.require_image()
@@ -284,16 +321,33 @@ def remove_outliers_dialog(tiki):
     if not accepted or dlg.image is None:
         return None
     opts = dlg.options()
-    use_stack = dlg.has_stack and dlg.whole_stack.isChecked()
+    return run_remove_outliers(
+        tiki,
+        viewer,
+        dlg.image,
+        radius=opts['radius'],
+        threshold=opts['threshold'],
+        which=opts['which'],
+        whole_stack=dlg.has_stack and dlg.whole_stack.isChecked(),
+    )
+
+
+def run_remove_nans(tiki, viewer, image: Image, radius: float = 2.0, whole_stack: bool = True):
+    """Replace non-finite pixels on ``image`` (plane or stack) with local median."""
+    if image.rgb:
+        process._error('Remove NaNs works on greyscale images')
+    r = float(radius)
+    use_stack = image.ndim > 2 and bool(whole_stack)
     return _apply_plane_op(
         tiki,
-        'Remove Outliers',
-        f'outliers r={opts["radius"]:g} thr={opts["threshold"]:g}',
-        lambda pl: ops.remove_outliers(pl, **opts),
+        'Remove NaNs',
+        f'no-nan r={r:g}',
+        lambda pl: ops.remove_nans(pl, r),
         whole_stack=use_stack,
-        out_dtype=dlg.image.data.dtype,
+        out_dtype=np.float32 if np.issubdtype(image.data.dtype, np.floating) else image.data.dtype,
         viewer=viewer,
-        image=dlg.image,
+        image=image,
+        record_cmd=f'tiki.remove_nans(radius={r!r}, whole_stack={use_stack!r})',
     )
 
 
@@ -319,15 +373,12 @@ def remove_nans_dialog(tiki):
     process._buttons(dlg, form)
     if dlg.exec_() != QDialog.Accepted:
         return None
-    r = radius_spin.value()
-    use_stack = has_stack and whole.isChecked()
-    return _apply_plane_op(
+    return run_remove_nans(
         tiki,
-        'Remove NaNs',
-        f'no-nan r={r:g}',
-        lambda pl: ops.remove_nans(pl, r),
-        whole_stack=use_stack,
-        out_dtype=np.float32 if np.issubdtype(image.data.dtype, np.floating) else image.data.dtype,
+        viewer,
+        image,
+        radius=radius_spin.value(),
+        whole_stack=has_stack and whole.isChecked(),
     )
 
 
@@ -513,6 +564,49 @@ class BandpassDialog(QDialog):
         super().done(result)
 
 
+def run_bandpass(
+    tiki,
+    viewer,
+    image: Image,
+    filter_large: float = 40.0,
+    filter_small: float = 3.0,
+    suppress_stripes: str = 'none',
+    tolerance: float = 5.0,
+    autoscale: bool = False,
+    whole_stack: bool = True,
+):
+    """Run 2D FFT Bandpass Filter on ``image`` (plane or stack) and record it."""
+    if image.rgb:
+        process._error('Bandpass Filter works on greyscale images (split channels or convert first)')
+    fl = float(filter_large)
+    fs = float(filter_small)
+    ss = str(suppress_stripes).lower()
+    tol = float(tolerance)
+    auto = bool(autoscale)
+    use_stack = image.ndim > 2 and bool(whole_stack)
+    return _apply_plane_op(
+        tiki,
+        'Bandpass Filter',
+        f'bandpass {fs:g}–{fl:g}',
+        lambda pl: ops.bandpass_filter(
+            pl,
+            filter_large=fl,
+            filter_small=fs,
+            suppress_stripes=ss,
+            tolerance=tol,
+            autoscale=auto,
+        ),
+        whole_stack=use_stack,
+        out_dtype=np.float32,
+        viewer=viewer,
+        image=image,
+        record_cmd=(
+            f'tiki.bandpass_filter(filter_large={fl!r}, filter_small={fs!r}, '
+            f'suppress_stripes={ss!r}, tolerance={tol!r}, autoscale={auto!r}, whole_stack={use_stack!r})'
+        ),
+    )
+
+
 def bandpass_dialog(tiki):
     """``Process ▸ FFT ▸ Bandpass Filter…``."""
     viewer, image = tiki.require_image()
@@ -526,14 +620,14 @@ def bandpass_dialog(tiki):
     if not accepted or dlg.image is None:
         return None
     opts = dlg.options()
-    use_stack = dlg.has_stack and dlg.whole_stack.isChecked()
-    return _apply_plane_op(
+    return run_bandpass(
         tiki,
-        'Bandpass Filter',
-        f'bandpass {opts["filter_small"]:g}–{opts["filter_large"]:g}',
-        lambda pl: ops.bandpass_filter(pl, **opts),
-        whole_stack=use_stack,
-        out_dtype=np.float32,
-        viewer=viewer,
-        image=dlg.image,
+        viewer,
+        dlg.image,
+        filter_large=opts['filter_large'],
+        filter_small=opts['filter_small'],
+        suppress_stripes=opts['suppress_stripes'],
+        tolerance=opts['tolerance'],
+        autoscale=opts['autoscale'],
+        whole_stack=dlg.has_stack and dlg.whole_stack.isChecked(),
     )

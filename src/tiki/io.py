@@ -560,6 +560,7 @@ def read_zarr(path: str | Path) -> tuple[object, dict]:
     root = zarr.open(str(path), mode='r')
     attrs = dict(getattr(root, 'attrs', {}))
     target = root
+    container_key = ''
     info = None
     luts = None
     channel_names: list[str] = []
@@ -568,6 +569,7 @@ def read_zarr(path: str | Path) -> tuple[object, dict]:
     if hasattr(root, 'keys') and 'multiscales' in attrs:
         ms = attrs['multiscales'][0]
         ds_path = ms['datasets'][0]['path']
+        container_key = str(ds_path)
         target = root[ds_path]
         arr = da.from_zarr(target)
         info, hex_colors = axes_mod.from_ome_zarr(attrs, arr.shape)
@@ -594,25 +596,32 @@ def read_zarr(path: str | Path) -> tuple[object, dict]:
             ]
     else:
         if hasattr(root, 'keys'):
-            def _find_array(grp):
+            def _find_array(grp, prefix: str = ''):
                 for key in sorted(grp.keys()):
                     item = grp[key]
+                    rel = f'{prefix}/{key}' if prefix else str(key)
                     if hasattr(item, 'shape') and hasattr(item, 'dtype'):
-                        return item
+                        return item, rel
                     if hasattr(item, 'keys'):
-                        found = _find_array(item)
+                        found, found_rel = _find_array(item, rel)
                         if found is not None:
-                            return found
-                return None
+                            return found, found_rel
+                return None, ''
 
-            target = _find_array(root)
+            target, container_key = _find_array(root)
             if target is None:
                 raise ValueError(f'No array found inside Zarr group {path.name}')
         arr = da.from_zarr(target)
         info = _axes_without_metadata(path, arr.shape)
 
     first_plane = np.asarray(arr[(0,) * max(0, arr.ndim - 2)])
-    meta: dict = {'name': path.name, 'path': str(path), 'axes': info, 'first_plane': first_plane}
+    meta: dict = {
+        'name': path.name,
+        'path': str(path),
+        'axes': info,
+        'first_plane': first_plane,
+        'container_key': container_key,
+    }
     if luts is not None:
         meta['imagej_luts'] = luts
     if channel_names:
@@ -712,7 +721,12 @@ def read_hdf5(path: str | Path, dataset: str | None = None) -> tuple[object, dic
     if len(datasets) > 1:
         others = [d[0] for d in datasets if d[0] != key][:4]
         info.notes.append(f'opened dataset "{key}" (others: {", ".join(others)})')
-    meta: dict = {'name': f'{path.name}:{key}' if len(datasets) > 1 else path.name, 'path': str(path), 'axes': info}
+    meta: dict = {
+        'name': f'{path.name}:{key}' if len(datasets) > 1 else path.name,
+        'path': str(path),
+        'axes': info,
+        'container_key': key,
+    }
     if hasattr(data, 'compute'):
         meta['first_plane'] = first_plane
     return data, meta

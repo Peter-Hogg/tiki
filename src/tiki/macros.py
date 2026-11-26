@@ -269,8 +269,10 @@ class MacroAPI:
 
     def open(self, path: str | Path):
         """Open an image file and return its napari viewer."""
-        self._app.open_paths([str(path)])
-        return self.viewer()
+        opened = self._app.open_paths([str(path)], raise_errors=True)
+        if not opened:
+            raise RuntimeError(f'failed to open {path}')
+        return opened[-1]
 
     def save_tiff(self, path: str | Path, merge_split: bool = False):
         """Save the active image or labels layer as a calibrated TIFF."""
@@ -392,16 +394,147 @@ class MacroAPI:
             max_size=max_size,
         )
 
+    def math(self, op_name: str, value: float = 0.0, whole_stack: bool = True):
+        """Run Process > Math on the active greyscale image."""
+        from . import process
+
+        return process.run_math(self._app, self.viewer(), self.layer(), op_name, value, whole_stack=whole_stack)
+
+    def resize(self, height: int, width: int, order: int = 1):
+        """Resize the active image to (height, width), updating pixel calibration."""
+        from . import process
+
+        return process.run_resize(self._app, self.viewer(), self.layer(), height, width, order=order)
+
+    def morphology_labels(self, op: str = 'open', radius: float = 1.0, scope: str = 'whole', three_d: bool = True):
+        """Apply morphological operation to the active Labels layer."""
+        from . import process
+
+        viewer = self.viewer()
+        return process.run_morphology_labels(
+            self._app, viewer, self._app.labels_layer(viewer), op=op, radius=radius, scope=scope, three_d=three_d
+        )
+
+    def voronoi(self, boundaries_only: bool = False, use_physical: bool = True):
+        """Compute Voronoi territories or boundaries from the active Labels layer."""
+        from . import process
+
+        viewer = self.viewer()
+        return process.run_voronoi(
+            self._app, viewer, self._app.labels_layer(viewer), boundaries_only=boundaries_only, use_physical=use_physical
+        )
+
+    def convolve(self, kernel, normalize: bool = True, whole_stack: bool = True):
+        """Convolve the active greyscale image (plane or stack) with a 2D kernel."""
+        from . import process
+
+        return process.run_convolve(self._app, self.viewer(), self.layer(), kernel, normalize=normalize, whole_stack=whole_stack)
+
+    def find_maxima(
+        self,
+        prominence: float = 10.0,
+        output: str = 'Point Selection',
+        exclude_edges: bool = False,
+        light_background: bool = False,
+        strict: bool = False,
+        whole_stack: bool = False,
+        use_roi: bool = False,
+    ):
+        """Find local intensity maxima on the active greyscale image."""
+        from . import process
+
+        return process.run_find_maxima(
+            self._app,
+            self.viewer(),
+            self.layer(),
+            prominence=prominence,
+            output=output,
+            exclude_edges=exclude_edges,
+            light_background=light_background,
+            strict=strict,
+            whole_stack=whole_stack,
+            use_roi=use_roi,
+        )
+
+    def edge_detection(
+        self,
+        method: str = 'canny',
+        sigma: float = 1.0,
+        low_threshold: float = 0.1,
+        high_threshold: float = 0.2,
+        use_quantiles: bool = True,
+        sigma_ratio: float = 1.6,
+        whole_stack: bool = False,
+        three_d: bool = False,
+        as_labels: bool = False,
+    ):
+        """Run Process > Edge Detection on the active greyscale image."""
+        from . import process
+
+        return process.run_edge_detection(
+            self._app,
+            self.viewer(),
+            self.layer(),
+            method=method,
+            sigma=sigma,
+            low_threshold=low_threshold,
+            high_threshold=high_threshold,
+            use_quantiles=use_quantiles,
+            sigma_ratio=sigma_ratio,
+            whole_stack=whole_stack,
+            three_d=three_d,
+            as_labels=as_labels,
+        )
+
+    def add_noise(self, sigma: float = 25.0, whole_stack: bool = True):
+        """Add zero-mean Gaussian noise with standard deviation ``sigma``."""
+        from . import fft_noise
+
+        return fft_noise.run_add_noise(self._app, self.viewer(), self.layer(), sigma=sigma, whole_stack=whole_stack)
+
+    def remove_outliers(self, radius: float = 2.0, threshold: float = 50.0, which: str = 'bright', whole_stack: bool = True):
+        """Remove bright, dark, or both intensity outliers relative to local median."""
+        from . import fft_noise
+
+        return fft_noise.run_remove_outliers(
+            self._app, self.viewer(), self.layer(), radius=radius, threshold=threshold, which=which, whole_stack=whole_stack
+        )
+
+    def remove_nans(self, radius: float = 2.0, whole_stack: bool = True):
+        """Replace non-finite pixels with the local finite median."""
+        from . import fft_noise
+
+        return fft_noise.run_remove_nans(self._app, self.viewer(), self.layer(), radius=radius, whole_stack=whole_stack)
+
+    def bandpass_filter(
+        self,
+        filter_large: float = 40.0,
+        filter_small: float = 3.0,
+        suppress_stripes: str = 'none',
+        tolerance: float = 5.0,
+        autoscale: bool = False,
+        whole_stack: bool = True,
+    ):
+        """Run 2D FFT Bandpass Filter on the active greyscale image or stack."""
+        from . import fft_noise
+
+        return fft_noise.run_bandpass(
+            self._app,
+            self.viewer(),
+            self.layer(),
+            filter_large=filter_large,
+            filter_small=filter_small,
+            suppress_stripes=suppress_stripes,
+            tolerance=tolerance,
+            autoscale=autoscale,
+            whole_stack=whole_stack,
+        )
+
     # -- running -------------------------------------------------------------
 
-    def run(self, command: str) -> None:
+    def run(self, command: str):
         """Run a TIKI menu command by its name (e.g. 'Z Project…', 'Measure')."""
-        wanted = command.rstrip('.…').strip().lower()
-        for path, action in self._app._actions.items():
-            if path.split('>')[-1].rstrip('.…').strip().lower() == wanted:
-                action.trigger()
-                return
-        raise ValueError(f'no TIKI command called {command!r}')
+        return self._app.run_command(command, raise_errors=True)
 
     def status(self, message: str) -> None:
         self._app.status(str(message))
@@ -439,6 +572,10 @@ def run_code(app, code: str, filename: str = '<macro>', namespace: dict | None =
     ns.setdefault('np', np)
     buffer = io.StringIO()
     ok = True
+    rec = getattr(app, 'recorder_window', None)
+    was_paused = rec.paused if rec is not None else False
+    if rec is not None:
+        rec.paused = True
     try:
         compiled = compile(code, filename, 'exec')
         with redirect_stdout(buffer), redirect_stderr(buffer):
@@ -455,6 +592,9 @@ def run_code(app, code: str, filename: str = '<macro>', namespace: dict | None =
             buffer.write(''.join(traceback.format_exception_only(type(exc), exc)))
         else:
             buffer.write('Traceback (macro lines):\n' + ''.join(lines) + f'{type(exc).__name__}: {exc}\n')
+    finally:
+        if rec is not None:
+            rec.paused = was_paused
     return ok, buffer.getvalue(), ns
 
 

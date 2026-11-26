@@ -15,12 +15,18 @@ and `np` for numpy; anything installed in TIKI's environment can be imported
   there appears in the Plugins → Macros menu; files starting with `_` are
   hidden. Output of menu-run macros goes to the Log window.
 - **Plugins → Macros → Record…** opens the Macro Recorder, capturing menu
-  operations (Open, Filters, Threshold, Z Project, Analyze Particles, Find
-  Maxima, Set Scale, etc.) as runnable Python code with **Pause / Resume** and
-  one-click **Create Macro**.
+  operations (Open, Math, Resize, Convolve, Filters, Noise, FFT Bandpass, Edge
+  Detection, Threshold, Z Project, Analyze Particles, Find Maxima, Set Scale,
+  Labels Morphology/Voronoi, etc.) as runnable Python code with **Pause / Resume**
+  and one-click **Create Macro**.
+- **Process → Batch → Convert…** plans output destinations upfront with collision
+  and source-overwrite protection (`rename`, `skip`, or `overwrite`).
 - **Process → Batch → Run Macro…** runs a saved macro, recorded macro, or
   inline Python script across a folder of images (optional TIFF auto-save and
-  combined `Results.csv` output).
+  combined `Results.csv` output). Failed commands or unreadable files fail fast
+  and are recorded in `errors` rather than silently succeeding; multi-scene
+  files can run on **Each scene separately**, **First scene only**, or **All
+  scenes open, run once on active**.
 
 ## The `tiki` object
 
@@ -52,9 +58,17 @@ A wrong name raises an error listing the names that exist.
 | `tiki.add_roi(yx)`, `tiki.rois_from_labels(labels)` | add ROIs to the manager |
 | `tiki.traces(masks=None, which=None, window=None)` | (n, frames) mean traces |
 | `tiki.measure(**values)` | add a row to the Results table |
-| `tiki.run('Measure')` | run any menu command by name, like ImageJ's `run()` |
+| `tiki.run('Measure')` | run any menu command by name (raises on errors in macros/batch) |
 | `tiki.open(path)`, `tiki.save_tiff(path)` | open a file; save the active image/labels as calibrated TIFF |
+| `tiki.math(op, value, whole_stack=True)` | scalar arithmetic or unary transform (32-bit float) |
+| `tiki.resize(h, w, order=1)` | spatial resize preserving physical pixel calibration |
+| `tiki.convolve(kernel, normalize=True, whole_stack=True)` | spatial 2D convolution across plane or stack |
+| `tiki.edge_detection(method='canny', ...)` | Canny, Sobel, Scharr, Prewitt, Roberts, LoG, DoG (2D/3D) |
+| `tiki.find_maxima(prominence=10.0, output='Point Selection', ...)` | local maxima detection across any of the 5 Fiji outputs |
 | `tiki.filter(key, whole_stack=True, three_d=False, **params)` | run any registered filter (`'gaussian'`, `'variance'`, `'tophat'`, …) |
+| `tiki.add_noise(sigma=25.0)`, `tiki.remove_outliers(...)`, `tiki.remove_nans(...)` | noise cleanup & synthetic noise generation |
+| `tiki.bandpass_filter(...)` | 2D FFT bandpass filter with stripe suppression |
+| `tiki.morphology_labels(op='open', ...)`, `tiki.voronoi(...)` | Labels morphology and Voronoi partitioning |
 | `tiki.z_project(method='max')`, `tiki.threshold(lo, hi)` | Z/T projection; threshold to a Labels layer |
 | `tiki.analyze_particles(...)`, `tiki.set_scale(sx, sy, unit)` | run Analyze Particles; set XY pixel calibration |
 | `tiki.set_lut(name)` | apply a LUT (`'Fire'`, `'Cyan Hot'`, …) |

@@ -1519,6 +1519,51 @@ def stack_to_hyperstack_dialog(tiki):
 
 # ------------------------------------ everyday image & stack commands
 
+def run_math(tiki, viewer, img: Image, op_name: str, value: float = 0.0, whole_stack: bool = True):
+    """Apply scalar or unary math operation to ``img`` (plane or stack) and record it."""
+    if img.rgb:
+        _error('Process ▸ Math works on greyscale images (split channels or convert first)')
+    val = float(value)
+    use_stack = img.ndim > 2 and bool(whole_stack)
+    if use_stack:
+        if not _confirm_size(tiki, img.data.shape, f'Math ({op_name})'):
+            return None
+        total = int(np.prod(img.data.shape[: img.ndim - 2]))
+        with tiki.progress(f'Math ({op_name})', total) as tick:
+            out = ops.math_op(img.data, op_name, val, progress=tick)
+        if tick.cancelled:
+            return None
+        axes_out = axes_mod.fit(axes_mod.get(img), out.shape)
+    else:
+        plane = roi_mod.current_plane(viewer, img)
+        out = ops.math_op(plane, op_name, val)
+        axes_out = axes_mod.fit(
+            axes_mod.AxesInfo(axes_mod.get(img).axes[-2:], axes_mod.get(img).source, True),
+            out.shape,
+        )
+
+    finite = out[np.isfinite(out)]
+    lo, hi = ops.saturated_limits(finite if out.ndim == 2 else out[(0,) * (out.ndim - 2)])
+    suffix = op_name if op_name in ops.UNARY_MATH_OPS else f'{op_name} {val:g}'
+    if out.ndim == img.ndim:
+        layer = _add_result(tiki, viewer, img, out, f'{img.name} ({suffix})', img.colormap, (lo, hi), axes=axes_out)
+    else:
+        layer = Image(
+            out,
+            name=f'{img.name} ({suffix})',
+            colormap=img.colormap,
+            contrast_limits=(lo, hi),
+            metadata={'axes': axes_out.to_dict()},
+            **axes_mod.geometry(img, ndim=2),
+        )
+        viewer.add_layer(layer)
+        tiki.reapply_tool(viewer)
+        tiki.push_undo_layer(f'Math ({suffix})', viewer, layer)
+    tiki.record(f'tiki.math({op_name!r}, {val!r}, whole_stack={use_stack!r})')
+    tiki.status(f'Math ({suffix}) → "{layer.name}"')
+    return layer
+
+
 def math_dialog(tiki):
     """``Process ▸ Math…``: scalar arithmetic and unary transforms (32-bit float result)."""
     from .layer_select import LayerCombo
@@ -1558,52 +1603,45 @@ def math_dialog(tiki):
     img = image_box.layer()
     if img is None:
         return None
-    if img.rgb:
-        _error('Process ▸ Math works on greyscale images')
-    op_name = op_box.currentText()
-    val = val_spin.value()
-    use_stack = img.ndim > 2 and whole.isChecked()
-    if use_stack:
-        if not _confirm_size(tiki, img.data.shape, f'Math ({op_name})'):
-            return None
-        total = int(np.prod(img.data.shape[: img.ndim - 2]))
-        with tiki.progress(f'Math ({op_name})', total) as tick:
-            out = ops.math_op(img.data, op_name, val, progress=tick)
-        if tick.cancelled:
-            return None
-        axes_out = axes_mod.fit(axes_mod.get(img), out.shape)
-        drop = None
-    else:
-        plane = roi_mod.current_plane(viewer, img)
-        out = ops.math_op(plane, op_name, val)
-        axes_out = axes_mod.fit(
-            axes_mod.AxesInfo(axes_mod.get(img).axes[-2:], axes_mod.get(img).source, True),
-            out.shape,
-        )
-        drop = None
-
-    finite = out[np.isfinite(out)]
-    lo, hi = ops.saturated_limits(finite if out.ndim == 2 else out[(0,) * (out.ndim - 2)])
-    suffix = op_name if op_name in ops.UNARY_MATH_OPS else f'{op_name} {val:g}'
-    if out.ndim == img.ndim:
-        layer = _add_result(tiki, viewer, img, out, f'{img.name} ({suffix})', img.colormap, (lo, hi), axes=axes_out, drop=drop)
-    else:
-        layer = Image(
-            out,
-            name=f'{img.name} ({suffix})',
-            colormap=img.colormap,
-            contrast_limits=(lo, hi),
-            metadata={'axes': axes_out.to_dict()},
-            **axes_mod.geometry(img, ndim=2),
-        )
-        viewer.add_layer(layer)
-        tiki.reapply_tool(viewer)
-        tiki.push_undo_layer(f'Math ({suffix})', viewer, layer)
-    tiki.record(
-        f'tiki.add_image(tiki.ops.math_op(tiki.image(), {op_name!r}, {val!r}), f"{{tiki.layer().name}} ({suffix})")'
+    return run_math(
+        tiki,
+        viewer,
+        img,
+        op_box.currentText(),
+        val_spin.value(),
+        whole_stack=img.ndim > 2 and whole.isChecked(),
     )
-    tiki.status(f'Math ({suffix}) → "{layer.name}"')
-    return layer
+
+
+def run_resize(tiki, viewer, img: Image, height: int, width: int, order: int = 1):
+    """Resize ``img`` spatially to ``(height, width)``, updating Y/X pixel calibration."""
+    old_h, old_w = roi_mod.spatial_shape(img)
+    new_h, new_w = max(1, int(height)), max(1, int(width))
+    order_val = int(order)
+    spatial_end = img.data.ndim - 1 if img.rgb else img.data.ndim
+    lead = img.data.shape[: max(0, spatial_end - 2)]
+    out_shape = lead + (new_h, new_w) + ((img.data.shape[-1],) if img.rgb else ())
+    if not _confirm_size(tiki, out_shape, 'Resize'):
+        return None
+
+    total = int(np.prod(lead)) if lead else 1
+    with tiki.progress('Resize', total) as tick:
+        out = ops.resize_image(img.data, (new_h, new_w), order=order_val, rgb=bool(img.rgb), progress=tick)
+    if tick.cancelled:
+        return None
+
+    src_info = axes_mod.get(img)
+    new_axes = [axes_mod.Axis(a.role, a.size, a.step, a.unit) for a in src_info.axes]
+    new_axes[-2] = axes_mod.Axis('Y', new_h, (src_info.axes[-2].step * old_h / new_h) if src_info.axes[-2].step else None, src_info.axes[-2].unit)
+    new_axes[-1] = axes_mod.Axis('X', new_w, (src_info.axes[-1].step * old_w / new_w) if src_info.axes[-1].step else None, src_info.axes[-1].unit)
+    new_info = axes_mod.AxesInfo(new_axes, src_info.source, src_info.confident, list(src_info.notes))
+    kw: dict = {'axes': new_info, 'rgb': bool(img.rgb)}
+    if not img.rgb:
+        kw['colormap'] = img.colormap
+    v = tiki.open_data(out, f'Resize_{img.name}', **kw)
+    tiki.record(f'tiki.resize({new_h!r}, {new_w!r}, order={order_val!r})')
+    tiki.status(f'Resized {img.name} to {new_w}×{new_h} px')
+    return v
 
 
 def resize_dialog(tiki):
@@ -1695,32 +1733,74 @@ def resize_dialog(tiki):
     img = image_box.layer()
     if img is None:
         return None
-    old_h, old_w = roi_mod.spatial_shape(img)
-    new_h, new_w = h_spin.value(), w_spin.value()
-    spatial_end = img.data.ndim - 1 if img.rgb else img.data.ndim
-    lead = img.data.shape[: max(0, spatial_end - 2)]
-    out_shape = lead + (new_h, new_w) + ((img.data.shape[-1],) if img.rgb else ())
-    if not _confirm_size(tiki, out_shape, 'Resize'):
-        return None
+    return run_resize(tiki, viewer, img, h_spin.value(), w_spin.value(), order=interp.currentData())
 
-    total = int(np.prod(lead)) if lead else 1
-    with tiki.progress('Resize', total) as tick:
-        out = ops.resize_image(img.data, (new_h, new_w), order=interp.currentData(), rgb=bool(img.rgb), progress=tick)
-    if tick.cancelled:
-        return None
 
-    src_info = axes_mod.get(img)
-    new_axes = [axes_mod.Axis(a.role, a.size, a.step, a.unit) for a in src_info.axes]
-    new_axes[-2] = axes_mod.Axis('Y', new_h, (src_info.axes[-2].step * old_h / new_h) if src_info.axes[-2].step else None, src_info.axes[-2].unit)
-    new_axes[-1] = axes_mod.Axis('X', new_w, (src_info.axes[-1].step * old_w / new_w) if src_info.axes[-1].step else None, src_info.axes[-1].unit)
-    new_info = axes_mod.AxesInfo(new_axes, src_info.source, src_info.confident, list(src_info.notes))
-    kw: dict = {'axes': new_info, 'rgb': bool(img.rgb)}
-    if not img.rgb:
-        kw['colormap'] = img.colormap
-    v = tiki.open_data(out, f'Resize_{img.name}', **kw)
-    tiki.record(f'tiki.show(tiki.ops.resize_image(tiki.image(), {(new_h, new_w)!r}, order={interp.currentData()!r}), f"Resize_{{tiki.layer().name}}")')
-    tiki.status(f'Resized {img.name} to {new_w}×{new_h} px')
-    return v
+def run_morphology_labels(
+    tiki,
+    viewer,
+    ly: Labels,
+    op: str = 'open',
+    radius: float = 1.0,
+    scope: str = 'whole',
+    three_d: bool = True,
+):
+    """Apply morphological operation to a ``Labels`` layer (plane, volume, or whole stack)."""
+    op_key = str(op).lower()
+    rad = float(radius)
+    info = _labels_info(viewer, ly)
+    has_z = info.index('Z') is not None
+    eff_scope = scope if ly.ndim > 2 else nd.PLANE
+    by_volume = has_z and bool(three_d) and eff_scope != nd.PLANE
+    zr = _labels_z_ratio(viewer, ly)
+    shape = tuple(ly.data.shape[: ly.ndim])
+    ref = roi_mod.target_image(viewer)
+    if ref is not None and len(axes_mod.get(ref).axes) >= ly.ndim:
+        index = roi_mod.current_index(viewer, ref)[-ly.ndim :]
+    else:
+        point = ly.world_to_data(viewer.dims.point[-ly.ndim :])
+        index = tuple(int(np.clip(np.round(point[d]), 0, shape[d] - 1)) for d in range(ly.ndim))
+
+    if eff_scope == nd.PLANE or ly.ndim == 2:
+        out = ops.morphology_labels(tiki.labels_plane(viewer, ly), op=op_key, radius=rad)
+        geom = axes_mod.geometry(ly, ndim=2)
+    else:
+        blocks = nd.blocks(info, shape, index, eff_scope, by_volume)
+        out_arr = np.zeros(shape, dtype=np.int32)
+        with tiki.progress(f'Morphology ({op_key})', len(blocks)) as tick:
+            for n, b in enumerate(blocks, 1):
+                blk = np.asarray(ly.data[b])
+                out_arr[b] = ops.morphology_labels(blk, op=op_key, radius=rad, z_ratio=zr if blk.ndim == 3 else 1.0)
+                if tick(n, len(blocks)) is False:
+                    return None
+        if eff_scope == nd.VOLUME:
+            out = out_arr[blocks[0]]
+            geom = axes_mod.geometry(ly, ndim=3)
+        else:
+            out = out_arr
+            geom = axes_mod.geometry(ly)
+
+    out_info = info if out.ndim == ly.ndim else axes_mod.fit(
+        axes_mod.AxesInfo(info.axes[-out.ndim :], info.source, info.confident), out.shape
+    )
+    new_ly = Labels(
+        out,
+        name=f'{ly.name} {op_key}',
+        opacity=0.6,
+        metadata={'axes': out_info.to_dict()} if out.ndim > 2 else {},
+        **geom,
+    )
+    viewer.add_layer(new_ly)
+    viewer.layers.selection.active = new_ly
+    tiki.push_undo_layer(f'Labels {op_key}', viewer, new_ly)
+    roi = roi_mod.roi_layer(viewer, create=False)
+    if roi is not None:
+        viewer.layers.move(viewer.layers.index(roi), len(viewer.layers))
+    tiki.record(
+        f'tiki.morphology_labels(op={op_key!r}, radius={rad!r}, scope={eff_scope!r}, three_d={bool(three_d)!r})'
+    )
+    tiki.status(f'Labels {op_key} (r={rad:g} px) → "{new_ly.name}"')
+    return new_ly
 
 
 def morphology_dialog(tiki):
@@ -1786,57 +1866,16 @@ def morphology_dialog(tiki):
     ly = labels_box.layer()
     if ly is None:
         return None
-    op_key = op_box.currentData()
-    rad = radius_spin.value()
-    info = _labels_info(viewer, ly)
     scope = scope_box.currentData() if state['has_stack'] else nd.PLANE
-    by_volume = state['has_z'] and three_d.isChecked() and scope != nd.PLANE
-    zr = _labels_z_ratio(viewer, ly)
-    shape = tuple(ly.data.shape[: ly.ndim])
-    ref = roi_mod.target_image(viewer)
-    if ref is not None and len(axes_mod.get(ref).axes) >= ly.ndim:
-        index = roi_mod.current_index(viewer, ref)[-ly.ndim :]
-    else:
-        point = ly.world_to_data(viewer.dims.point[-ly.ndim :])
-        index = tuple(int(np.clip(np.round(point[d]), 0, shape[d] - 1)) for d in range(ly.ndim))
-
-    if scope == nd.PLANE or ly.ndim == 2:
-        out = ops.morphology_labels(tiki.labels_plane(viewer, ly), op=op_key, radius=rad)
-        geom = axes_mod.geometry(ly, ndim=2)
-    else:
-        blocks = nd.blocks(info, shape, index, scope, by_volume)
-        out_arr = np.zeros(shape, dtype=np.int32)
-        with tiki.progress(f'Morphology ({op_key})', len(blocks)) as tick:
-            for n, b in enumerate(blocks, 1):
-                blk = np.asarray(ly.data[b])
-                out_arr[b] = ops.morphology_labels(blk, op=op_key, radius=rad, z_ratio=zr if blk.ndim == 3 else 1.0)
-                if tick(n, len(blocks)) is False:
-                    return None
-        if scope == nd.VOLUME:
-            out = out_arr[blocks[0]]
-            geom = axes_mod.geometry(ly, ndim=3)
-        else:
-            out = out_arr
-            geom = axes_mod.geometry(ly)
-
-    new_ly = Labels(
-        out,
-        name=f'{ly.name} {op_key}',
-        opacity=0.6,
-        metadata={'axes': info.to_dict()} if out.ndim > 2 else {},
-        **geom,
+    return run_morphology_labels(
+        tiki,
+        viewer,
+        ly,
+        op=op_box.currentData(),
+        radius=radius_spin.value(),
+        scope=scope,
+        three_d=state['has_z'] and three_d.isChecked(),
     )
-    viewer.add_layer(new_ly)
-    viewer.layers.selection.active = new_ly
-    tiki.push_undo_layer(f'Labels {op_key}', viewer, new_ly)
-    roi = roi_mod.roi_layer(viewer, create=False)
-    if roi is not None:
-        viewer.layers.move(viewer.layers.index(roi), len(viewer.layers))
-    tiki.record(
-        f'tiki.add_labels(tiki.ops.morphology_labels(tiki.labels(), op={op_key!r}, radius={rad!r}), f"{{tiki.layer().name}} {op_key}")'
-    )
-    tiki.status(f'Labels {op_key} (r={rad:g} px) → "{new_ly.name}"')
-    return new_ly
 
 
 def _apply_labels_geom(viewer, layer: Labels, fn, use_physical: bool = True, out_dtype=None):
@@ -1943,6 +1982,38 @@ def outline_command(tiki):
     return new_ly
 
 
+def run_voronoi(
+    tiki,
+    viewer,
+    ly: Labels,
+    boundaries_only: bool = False,
+    use_physical: bool = True,
+):
+    """Compute Voronoi territories or boundaries on a ``Labels`` layer."""
+    bnd_only = bool(boundaries_only)
+    phys = bool(use_physical)
+    info, out, _unit = _apply_labels_geom(
+        viewer,
+        ly,
+        lambda blk, sc: ops.voronoi_labels(blk, scale=sc, boundaries_only=bnd_only),
+        use_physical=phys,
+    )
+    new_ly = Labels(
+        out,
+        name=f'{ly.name} voronoi' + (' boundaries' if bnd_only else ''),
+        opacity=0.6,
+        metadata={'axes': info.to_dict()} if out.ndim > 2 else {},
+        **axes_mod.geometry(ly),
+    )
+    viewer.add_layer(new_ly)
+    viewer.layers.selection.active = new_ly
+    tiki.reapply_tool(viewer)
+    tiki.push_undo_layer('Voronoi', viewer, new_ly)
+    tiki.record(f'tiki.voronoi(boundaries_only={bnd_only!r}, use_physical={phys!r})')
+    tiki.status(f'Voronoi → "{new_ly.name}"')
+    return new_ly
+
+
 def voronoi_dialog(tiki):
     """``Process ▸ Labels ▸ Voronoi…``: partition image by nearest object seed."""
     from .layer_select import LayerCombo
@@ -1965,29 +2036,13 @@ def voronoi_dialog(tiki):
     ly = labels_box.layer()
     if ly is None:
         return None
-    bnd_only = bool(mode_box.currentData())
-    info, out, _unit = _apply_labels_geom(
+    return run_voronoi(
+        tiki,
         viewer,
         ly,
-        lambda blk, sc: ops.voronoi_labels(blk, scale=sc, boundaries_only=bnd_only),
+        boundaries_only=bool(mode_box.currentData()),
         use_physical=phys_box.isChecked(),
     )
-    new_ly = Labels(
-        out,
-        name=f'{ly.name} voronoi' + (' boundaries' if bnd_only else ''),
-        opacity=0.6,
-        metadata={'axes': info.to_dict()} if out.ndim > 2 else {},
-        **axes_mod.geometry(ly),
-    )
-    viewer.add_layer(new_ly)
-    viewer.layers.selection.active = new_ly
-    tiki.reapply_tool(viewer)
-    tiki.push_undo_layer('Voronoi', viewer, new_ly)
-    tiki.record(
-        f'tiki.add_labels(tiki.ops.voronoi_labels(tiki.labels(), boundaries_only={bnd_only!r}), f"{{tiki.layer().name}} voronoi")'
-    )
-    tiki.status(f'Voronoi → "{new_ly.name}"')
-    return new_ly
 
 
 def _plane_filter_command(tiki, title: str, suffix: str, func):
@@ -2162,25 +2217,29 @@ class ConvolveDialog(QDialog):
         super().done(result)
 
 
-def convolve_dialog(tiki):
-    """``Process ▸ Filters ▸ Convolve…``: custom 2D spatial kernel convolution."""
-    viewer, image = tiki.require_image()
-    if image.rgb:
-        _error('Convolve works on greyscale images (split channels or convert first)')
-    dlg = ConvolveDialog(tiki, viewer, image)
-    try:
-        accepted = dlg.exec_() == QDialog.Accepted
-    finally:
-        dlg.cleanup()
-    if not accepted or dlg.image is None or dlg.kernel is None:
-        return None
-    img = dlg.image
+def run_convolve(
+    tiki,
+    viewer,
+    img: Image,
+    kernel,
+    normalize: bool = True,
+    whole_stack: bool = True,
+):
+    """Convolve ``img`` with ``kernel`` (text or 2D array) across current plane or stack."""
     if img.rgb:
         _error('Convolve works on greyscale images (split channels or convert first)')
-    kernel = dlg.kernel
-    normalize = dlg.norm_box.isChecked()
-    use_stack = dlg.has_stack and dlg.whole_stack.isChecked()
-    fn = lambda plane: ops.convolve_plane(plane, kernel, normalize=normalize)  # noqa: E731
+    if isinstance(kernel, str):
+        kernel_text = kernel
+        k_arr = ops.parse_kernel(kernel_text)
+    else:
+        k_arr = np.asarray(kernel, dtype=np.float32)
+        if k_arr.ndim != 2 or k_arr.size == 0:
+            raise ValueError('kernel must be a non-empty 2D array')
+        kernel_text = '\n'.join(' '.join(f'{v:g}' for v in row) for row in k_arr)
+
+    norm = bool(normalize)
+    use_stack = img.ndim > 2 and bool(whole_stack)
+    fn = lambda plane: ops.convolve_plane(plane, k_arr, normalize=norm)  # noqa: E731
     if use_stack:
         if not _confirm_size(tiki, img.data.shape, 'Convolve'):
             return None
@@ -2192,7 +2251,7 @@ def convolve_dialog(tiki):
     else:
         out = fn(roi_mod.current_plane(viewer, img))
     lo, hi = ops.saturated_limits(out if out.ndim == 2 else out[(0,) * (out.ndim - 2)])
-    name = f'{img.name} convolve {kernel.shape[0]}×{kernel.shape[1]}'
+    name = f'{img.name} convolve {k_arr.shape[0]}×{k_arr.shape[1]}'
     if out.ndim == img.ndim:
         layer = _add_result(tiki, viewer, img, out, name, img.colormap, (lo, hi))
     else:
@@ -2208,9 +2267,31 @@ def convolve_dialog(tiki):
         viewer.add_layer(layer)
         tiki.reapply_tool(viewer)
         tiki.push_undo_layer('Convolve', viewer, layer)
-    tiki.record(f"tiki.add_image(tiki.ops.convolve_plane(tiki.image(), tiki.ops.parse_kernel({dlg.kernel_edit.toPlainText()!r}), normalize={normalize!r}), {name!r})")
-    tiki.status(f'Convolve ({kernel.shape[0]}×{kernel.shape[1]}) → "{layer.name}"')
+    tiki.record(f'tiki.convolve({kernel_text!r}, normalize={norm!r}, whole_stack={use_stack!r})')
+    tiki.status(f'Convolve ({k_arr.shape[0]}×{k_arr.shape[1]}) → "{layer.name}"')
     return layer
+
+
+def convolve_dialog(tiki):
+    """``Process ▸ Filters ▸ Convolve…``: custom 2D spatial kernel convolution."""
+    viewer, image = tiki.require_image()
+    if image.rgb:
+        _error('Convolve works on greyscale images (split channels or convert first)')
+    dlg = ConvolveDialog(tiki, viewer, image)
+    try:
+        accepted = dlg.exec_() == QDialog.Accepted
+    finally:
+        dlg.cleanup()
+    if not accepted or dlg.image is None or dlg.kernel is None:
+        return None
+    return run_convolve(
+        tiki,
+        viewer,
+        dlg.image,
+        dlg.kernel_edit.toPlainText(),
+        normalize=dlg.norm_box.isChecked(),
+        whole_stack=dlg.has_stack and dlg.whole_stack.isChecked(),
+    )
 
 
 class FindMaximaDialog(QDialog):
@@ -2373,38 +2454,56 @@ class FindMaximaDialog(QDialog):
         super().done(result)
 
 
-def find_maxima_dialog(tiki):
-    """``Process ▸ Find Maxima…``: local maxima detection with preview and 5 Fiji output modes."""
-    viewer, image = tiki.require_image()
-    if image.rgb:
-        _error('Find Maxima works on greyscale images (split channels or convert first)')
-    dlg = FindMaximaDialog(tiki, viewer, image)
-    try:
-        accepted = dlg.exec_() == QDialog.Accepted
-    finally:
-        dlg.cleanup()
-    if not accepted or dlg.image is None:
-        return None
-    img = dlg.image
+def run_find_maxima(
+    tiki,
+    viewer,
+    img: Image,
+    prominence: float = 10.0,
+    output: str = 'Point Selection',
+    exclude_edges: bool = False,
+    light_background: bool = False,
+    strict: bool = False,
+    whole_stack: bool = False,
+    use_roi: bool = False,
+):
+    """Run Find Maxima on ``img`` with any of Fiji's 5 output modes."""
     if img.rgb:
         _error('Find Maxima works on greyscale images (split channels or convert first)')
-    opts = dlg.options()
-    out_mode = dlg.output_box.currentText()
-    roi_mask = dlg.roi_mask_for(img)
-    use_stack = dlg.has_stack and dlg.whole_stack.isChecked()
+    if output not in FindMaximaDialog.OUTPUT_TYPES:
+        raise ValueError(f'unknown Find Maxima output mode {output!r}; expected one of {FindMaximaDialog.OUTPUT_TYPES}')
+
+    opts = {
+        'prominence': float(prominence),
+        'exclude_edges': bool(exclude_edges),
+        'light_background': bool(light_background),
+        'strict': bool(strict),
+    }
+    roi_mask = None
+    if use_roi:
+        current = tiki.current_roi(viewer)
+        if current is not None and current[1] not in ('line', 'path'):
+            roi_mask = roi_mod.shape_mask(*current, roi_mod.spatial_shape(img))
+    use_roi_flag = roi_mask is not None
+    use_stack = img.ndim > 2 and bool(whole_stack) and output != 'Point Selection'
     info = axes_mod.get(img)
     shape = tuple(img.data.shape[: img.ndim])
     index = roi_mod.current_index(viewer, img)
+    rec = (
+        f'tiki.find_maxima(prominence={opts["prominence"]!r}, output={output!r}, '
+        f'exclude_edges={opts["exclude_edges"]!r}, light_background={opts["light_background"]!r}, '
+        f'strict={opts["strict"]!r}, whole_stack={use_stack!r}, use_roi={use_roi_flag!r})'
+    )
 
-    if out_mode == 'Point Selection':
+    if output == 'Point Selection':
         plane = roi_mod.current_plane(viewer, img)
         coords, _ = ops.find_maxima(plane, mask=roi_mask, **opts)
         layer = roi_mod.points_layer(viewer)
         layer.data = coords.astype(float) if len(coords) else np.empty((0, 2), dtype=float)
+        tiki.record(rec)
         tiki.status(f'Find Maxima: {len(coords)} points selected')
         return layer
 
-    if out_mode == 'Single Points':
+    if output == 'Single Points':
         if use_stack:
             blocks = nd.blocks(info, shape, index, nd.WHOLE, False)
             out = np.zeros(shape, dtype=np.int32)
@@ -2432,15 +2531,11 @@ def find_maxima_dialog(tiki):
         viewer.add_layer(layer)
         tiki.reapply_tool(viewer)
         tiki.push_undo_layer('Find Maxima', viewer, layer)
-        tiki.record(
-            f'coords, _ = tiki.ops.find_maxima(tiki.image(), prominence={opts["prominence"]!r}, '
-            f'exclude_edges={opts["exclude_edges"]!r}, light_background={opts["light_background"]!r}, '
-            f'strict={opts["strict"]!r})'
-        )
+        tiki.record(rec)
         tiki.status(f'Find Maxima (Single Points): {total_pts} points → "{layer.name}"')
         return layer
 
-    if out_mode == 'Segmented Particles':
+    if output == 'Segmented Particles':
         if use_stack:
             blocks = nd.blocks(info, shape, index, nd.WHOLE, False)
             out = np.zeros(shape, dtype=np.int32)
@@ -2470,14 +2565,11 @@ def find_maxima_dialog(tiki):
         viewer.add_layer(layer)
         tiki.reapply_tool(viewer)
         tiki.push_undo_layer('Find Maxima', viewer, layer)
-        tiki.record(
-            f'coords, _ = tiki.ops.find_maxima(tiki.image(), prominence={opts["prominence"]!r}); '
-            'tiki.add_labels(tiki.ops.segment_maxima(tiki.image(), coords), f"{tiki.layer().name} maxima segmented")'
-        )
+        tiki.record(rec)
         tiki.status(f'Find Maxima (Segmented): {total_pts} regions → "{layer.name}"')
         return layer
 
-    if out_mode == 'List':
+    if output == 'List':
         u = axes_mod.spatial_unit(info)
         tiki._sync_result_units({'X': u, 'Y': u} if u else {})
         sy, sx = float(img.scale[-2]), float(img.scale[-1])
@@ -2497,6 +2589,7 @@ def find_maxima_dialog(tiki):
                 tiki.results.add_row(base | {'X': x_val, 'Y': y_val, 'Value': float(val)})
                 total_pts += 1
         tiki.show_results()
+        tiki.record(rec)
         tiki.status(f'Find Maxima (List): {total_pts} rows')
         return total_pts
 
@@ -2516,8 +2609,36 @@ def find_maxima_dialog(tiki):
         tiki.results.add_row(row)
         total_rows += 1
     tiki.show_results()
+    tiki.record(rec)
     tiki.status(f'Find Maxima (Count): {total_rows} row(s)')
     return total_rows
+
+
+def find_maxima_dialog(tiki):
+    """``Process ▸ Find Maxima…``: local maxima detection with preview and 5 Fiji output modes."""
+    viewer, image = tiki.require_image()
+    if image.rgb:
+        _error('Find Maxima works on greyscale images (split channels or convert first)')
+    dlg = FindMaximaDialog(tiki, viewer, image)
+    try:
+        accepted = dlg.exec_() == QDialog.Accepted
+    finally:
+        dlg.cleanup()
+    if not accepted or dlg.image is None:
+        return None
+    opts = dlg.options()
+    return run_find_maxima(
+        tiki,
+        viewer,
+        dlg.image,
+        prominence=opts['prominence'],
+        output=dlg.output_box.currentText(),
+        exclude_edges=opts['exclude_edges'],
+        light_background=opts['light_background'],
+        strict=opts['strict'],
+        whole_stack=dlg.has_stack and dlg.whole_stack.isChecked(),
+        use_roi=dlg.has_roi and dlg.roi_box.isChecked(),
+    )
 
 
 def concatenate_dialog(tiki):
@@ -3142,29 +3263,42 @@ class EdgeDetectionDialog(QDialog):
         super().done(result)
 
 
-def edge_detection_dialog(tiki):
-    """``Process ▸ Edge Detection…``: Canny, Sobel, Scharr, Prewitt, Roberts, LoG, or DoG."""
+def run_edge_detection(
+    tiki,
+    viewer,
+    img: Image,
+    method: str = 'canny',
+    sigma: float = 1.0,
+    low_threshold: float = 0.1,
+    high_threshold: float = 0.2,
+    use_quantiles: bool = True,
+    sigma_ratio: float = 1.6,
+    whole_stack: bool = False,
+    three_d: bool = False,
+    as_labels: bool = False,
+):
+    """Run configurable 2D or anisotropic 3D edge detection on ``img`` and record it."""
     from . import filters
 
-    viewer, image = tiki.require_image()
-    if image.rgb:
-        _error('Edge Detection works on greyscale images (split channels or convert first)')
-    dlg = EdgeDetectionDialog(tiki, viewer, image)
-    try:
-        accepted = dlg.exec_() == QDialog.Accepted
-    finally:
-        dlg.cleanup()
-    if not accepted or dlg.image is None:
-        return None
-    img = dlg.image
     if img.rgb:
         _error('Edge Detection works on greyscale images (split channels or convert first)')
-    opts = dlg.options()
-    method = opts['method']
-    use_stack = dlg.use_whole_stack()
-    use_3d = dlg.use_3d()
-    as_labels = method == 'canny' and dlg.as_labels.isChecked()
+    m = str(method).lower()
+    if m not in ops.EDGE_METHODS.values():
+        raise ValueError(f'unknown edge detection method {method!r}')
+
+    opts = {
+        'method': m,
+        'sigma': float(sigma),
+        'low_threshold': float(low_threshold),
+        'high_threshold': float(high_threshold),
+        'sigma_ratio': float(sigma_ratio),
+        'use_quantiles': bool(use_quantiles),
+    }
     info = axes_mod.get(img)
+    has_z = info.index('Z') is not None
+    use_3d = bool(three_d) and img.ndim > 2 and has_z and m in ops.EDGE_3D_METHODS
+    use_stack = img.ndim > 2 and bool(whole_stack)
+    as_lab = (m == 'canny') and bool(as_labels)
     shape = tuple(img.data.shape[: img.ndim])
     index = roi_mod.current_index(viewer, img)
 
@@ -3172,20 +3306,20 @@ def edge_detection_dialog(tiki):
         if use_3d:
             zr = filters.z_ratio(img)
             fn = lambda vol: ops.detect_edges_3d(  # noqa: E731
-                vol, zr, method=method, sigma=opts['sigma'], sigma_ratio=opts['sigma_ratio']
+                vol, zr, method=m, sigma=opts['sigma'], sigma_ratio=opts['sigma_ratio']
             )
             blocks = nd.blocks(info, shape, index, nd.WHOLE if use_stack else nd.VOLUME, True)
         else:
             fn = lambda pl: ops.detect_edges(pl, **opts)  # noqa: E731
             blocks = nd.blocks(info, shape, index, nd.WHOLE, False)
-        if not _confirm_size(tiki, shape, f'Edge Detection ({method})'):
+        if not _confirm_size(tiki, shape, f'Edge Detection ({m})'):
             return None
-        with tiki.progress(f'Edge Detection ({method})', len(blocks)) as tick:
+        with tiki.progress(f'Edge Detection ({m})', len(blocks)) as tick:
             out = ops.map_blocks(
                 fn,
                 img.data,
                 blocks,
-                out_dtype=np.uint8 if method == 'canny' else np.float32,
+                out_dtype=np.uint8 if m == 'canny' else np.float32,
                 progress=tick,
             )
         if tick.cancelled:
@@ -3195,13 +3329,13 @@ def edge_detection_dialog(tiki):
     else:
         out = ops.detect_edges(roi_mod.current_plane(viewer, img), **opts)
 
-    suffix = f'edges ({method}' + (' 3D' if use_3d else '') + ')'
+    suffix = f'edges ({m}' + (' 3D' if use_3d else '') + ')'
     name = f'{img.name} {suffix}'
     out_info = info if out.ndim == img.ndim else axes_mod.fit(
         axes_mod.AxesInfo(info.axes[-out.ndim :], info.source, info.confident), out.shape
     )
     geom = axes_mod.geometry(img) if out.ndim == img.ndim else axes_mod.geometry(img, ndim=out.ndim)
-    if as_labels:
+    if as_lab:
         layer = Labels(
             (out > 0).astype(np.uint8),
             name=name,
@@ -3213,10 +3347,10 @@ def edge_detection_dialog(tiki):
         tiki.reapply_tool(viewer)
         tiki.push_undo_layer('Edge Detection', viewer, layer)
     else:
-        lo, hi = (0.0, 255.0) if method == 'canny' else ops.saturated_limits(
+        lo, hi = (0.0, 255.0) if m == 'canny' else ops.saturated_limits(
             out if out.ndim == 2 else out[(0,) * (out.ndim - 2)]
         )
-        cmap = 'gray' if method == 'canny' else img.colormap
+        cmap = 'gray' if m == 'canny' else img.colormap
         if out.ndim == img.ndim:
             layer = _add_result(tiki, viewer, img, out, name, cmap, (lo, hi), axes=out_info)
         else:
@@ -3232,7 +3366,39 @@ def edge_detection_dialog(tiki):
             tiki.reapply_tool(viewer)
             tiki.push_undo_layer('Edge Detection', viewer, layer)
     tiki.record(
-        f'tiki.add_image(tiki.ops.detect_edges(tiki.image(), method={method!r}, sigma={opts["sigma"]!r}), f"{{tiki.layer().name}} edges")'
+        f'tiki.edge_detection(method={m!r}, sigma={opts["sigma"]!r}, '
+        f'low_threshold={opts["low_threshold"]!r}, high_threshold={opts["high_threshold"]!r}, '
+        f'use_quantiles={opts["use_quantiles"]!r}, sigma_ratio={opts["sigma_ratio"]!r}, '
+        f'whole_stack={use_stack!r}, three_d={use_3d!r}, as_labels={as_lab!r})'
     )
-    tiki.status(f'Edge Detection ({method}) → "{layer.name}"')
+    tiki.status(f'Edge Detection ({m}) → "{layer.name}"')
     return layer
+
+
+def edge_detection_dialog(tiki):
+    """``Process ▸ Edge Detection…``: Canny, Sobel, Scharr, Prewitt, Roberts, LoG, or DoG."""
+    viewer, image = tiki.require_image()
+    if image.rgb:
+        _error('Edge Detection works on greyscale images (split channels or convert first)')
+    dlg = EdgeDetectionDialog(tiki, viewer, image)
+    try:
+        accepted = dlg.exec_() == QDialog.Accepted
+    finally:
+        dlg.cleanup()
+    if not accepted or dlg.image is None:
+        return None
+    opts = dlg.options()
+    return run_edge_detection(
+        tiki,
+        viewer,
+        dlg.image,
+        method=opts['method'],
+        sigma=opts['sigma'],
+        low_threshold=opts['low_threshold'],
+        high_threshold=opts['high_threshold'],
+        use_quantiles=True,
+        sigma_ratio=opts['sigma_ratio'],
+        whole_stack=dlg.use_whole_stack(),
+        three_d=dlg.use_3d(),
+        as_labels=opts['method'] == 'canny' and dlg.as_labels.isChecked(),
+    )

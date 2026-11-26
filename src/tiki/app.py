@@ -91,6 +91,7 @@ class Tiki(QMainWindow):
         self.profiles: list[ProfileWindow] = []
         self._message_until = 0.0
         self._actions: dict[str, QAction] = {}
+        self._action_slots: dict[str, tuple[str, object]] = {}
         self.contrast_window = None
         self.threshold_window = None
         self.roi_manager = None
@@ -148,7 +149,9 @@ class Tiki(QMainWindow):
         if shortcut:
             action.setShortcut(QKeySequence(shortcut))
             action.setShortcutContext(Qt.ApplicationShortcut)
-        self._actions[f'{menu.title()}>{text}'.replace('&', '')] = action
+        key = f'{menu.title()}>{text}'.replace('&', '')
+        self._actions[key] = action
+        self._action_slots[key] = (text, slot)
         return action
 
     def _build_menus(self) -> None:
@@ -393,6 +396,27 @@ class Tiki(QMainWindow):
                 error=True,
                 details=details,
             )
+
+    def run_command(self, command: str, raise_errors: bool = False):
+        """Run a registered menu command by menu path or leaf label."""
+        raw = command.strip().lower()
+        wanted = command.rstrip('.…').strip().lower()
+        matched = None
+        for path, (text, slot) in self._action_slots.items():
+            if path.lower() == raw:
+                matched = (text, slot)
+                break
+        if matched is None:
+            for path, (text, slot) in self._action_slots.items():
+                if path.split('>')[-1].rstrip('.…').strip().lower() == wanted:
+                    matched = (text, slot)
+                    break
+        if matched is None:
+            raise ValueError(f'no TIKI command called {command!r}')
+        text, slot = matched
+        if raise_errors:
+            return slot()
+        return self._run(text, slot)
 
     def report(
         self,
@@ -646,50 +670,67 @@ class Tiki(QMainWindow):
 
     # ------------------------------------------------------------- File
 
-    def open_paths(self, paths) -> None:
+    def open_scene_entry(self, data, meta: dict, scene_idx: int | None = None, raise_errors: bool = False):
+        """Open one loaded ``(data, meta)`` entry in a new window and return the viewer."""
+        metadata = {'path': meta['path']}
+        if scene_idx is not None:
+            metadata['scene'] = scene_idx
+        for key in ('imagej_luts', 'channel_names', 'acquisition', 'raw_metadata', 'container_key'):
+            if meta.get(key) is not None:
+                metadata[key] = meta[key]
+        info = meta['axes']
+        open_kw: dict = {'axes': info, 'metadata': metadata}
+        rgb = data.ndim == len(info.axes) + 1 and data.shape[-1] in (3, 4)
+        if meta.get('first_plane') is not None and not rgb:
+            open_kw['contrast_limits'] = ops.saturated_limits(meta['first_plane'])
+        luts = meta.get('imagej_luts')
+        if info.index('C') is None and not rgb and luts and len(luts) == 1:
+            lut = np.asarray(luts[0], dtype=float)
+            if lut.shape == (3, 256):
+                ramp = np.arange(256, dtype=float)
+                if not all(np.allclose(lut[ch], ramp, atol=1.5) for ch in range(3)):
+                    from napari.utils.colormaps import Colormap
+
+                    rgba = np.column_stack([np.clip(lut.T / 255.0, 0.0, 1.0), np.ones(256)])
+                    open_kw['colormap'] = Colormap(rgba, name='imagej_lut')
+        viewer = self.open_data(data, meta['name'], **open_kw)
+        msg = f'Opened {meta["name"]}: {info.describe()} {data.dtype} [{info.source}]'
+        if info.notes:
+            msg += ' — ' + '; '.join(info.notes)
+        if not info.confident:
+            msg += ' — check Image ▸ Properties (Ctrl+Shift+P)'
+        self.status(msg)
+        if not info.confident or info.notes:
+            self._message_until = time.monotonic() + 10
+        if 'warning' in meta:
+            if raise_errors:
+                self.status(f'{meta["name"]}: {meta["warning"]}')
+            else:
+                self.report('Open', f'{meta["name"]}: {meta["warning"]}')
+        return viewer
+
+    def open_paths(self, paths, raise_errors: bool = False) -> list:
+        opened: list = []
         for path in paths:
-            t0 = time.perf_counter()
             try:
                 loaded = io.read_multi(path)
             except Exception as exc:
+                if raise_errors:
+                    raise
                 traceback.print_exc()
                 self.report('Open', f'Could not open {Path(path).name}:\n{exc}')
                 continue
             for scene_idx, (data, meta) in enumerate(loaded):
-                metadata = {'path': meta['path']}
-                if len(loaded) > 1:
-                    metadata['scene'] = scene_idx
-                for key in ('imagej_luts', 'channel_names', 'acquisition', 'raw_metadata'):
-                    if meta.get(key) is not None:
-                        metadata[key] = meta[key]
-                info = meta['axes']
-                open_kw: dict = {'axes': info, 'metadata': metadata}
-                rgb = data.ndim == len(info.axes) + 1 and data.shape[-1] in (3, 4)
-                if meta.get('first_plane') is not None and not rgb:
-                    open_kw['contrast_limits'] = ops.saturated_limits(meta['first_plane'])
-                luts = meta.get('imagej_luts')
-                if info.index('C') is None and not rgb and luts and len(luts) == 1:
-                    lut = np.asarray(luts[0], dtype=float)
-                    if lut.shape == (3, 256):
-                        ramp = np.arange(256, dtype=float)
-                        if not all(np.allclose(lut[ch], ramp, atol=1.5) for ch in range(3)):
-                            from napari.utils.colormaps import Colormap
-
-                            rgba = np.column_stack([np.clip(lut.T / 255.0, 0.0, 1.0), np.ones(256)])
-                            open_kw['colormap'] = Colormap(rgba, name='imagej_lut')
-                self.open_data(data, meta['name'], **open_kw)
-                msg = f'Opened {meta["name"]}: {info.describe()} {data.dtype} [{info.source}]'
-                if info.notes:
-                    msg += ' — ' + '; '.join(info.notes)
-                if not info.confident:
-                    msg += ' — check Image ▸ Properties (Ctrl+Shift+P)'
-                self.status(msg)
-                if not info.confident or info.notes:
-                    self._message_until = time.monotonic() + 10
-                if 'warning' in meta:
-                    self.report('Open', f'{meta["name"]}: {meta["warning"]}')
+                v = self.open_scene_entry(
+                    data,
+                    meta,
+                    scene_idx=scene_idx if len(loaded) > 1 else None,
+                    raise_errors=raise_errors,
+                )
+                opened.append(v)
             self.record(f'tiki.open({str(path)!r})')
             recent.add(path)
+        return opened
 
     def open_sequence(self, folder_or_paths, **kwargs):
         t0 = time.perf_counter()
@@ -836,6 +877,7 @@ class Tiki(QMainWindow):
                 luts=luts,
                 channel_names=ch_names if any(ch_names) else None,
             )
+            self.record(f'tiki.save_tiff({str(path)!r}, merge_split=True)')
             self.status(f'Saved hyperstack {path}')
             return Path(path)
 
@@ -960,22 +1002,49 @@ class Tiki(QMainWindow):
     UNDO_MAX = 10
     UNDO_MAX_BYTES = 256 * 2**20
 
-    def push_undo_data(self, label: str, viewer, layer) -> None:
-        """Snapshot ``layer.data`` and axes before an in-place edit (up to 256 MB total)."""
-        arr = np.asarray(layer.data)
-        if arr.nbytes > self.UNDO_MAX_BYTES:
-            return
+    @staticmethod
+    def _estimate_nbytes(data) -> int | None:
+        nb = getattr(data, 'nbytes', None)
+        if isinstance(nb, (int, np.integer)):
+            return int(nb)
+        shape = getattr(data, 'shape', None)
+        dtype = getattr(data, 'dtype', None)
+        if shape is not None and dtype is not None:
+            try:
+                return int(np.prod(shape)) * int(np.dtype(dtype).itemsize)
+            except Exception:
+                return None
+        return None
+
+    def push_undo_data(self, label: str, viewer, layer, in_place: bool = False) -> bool:
+        """Snapshot ``layer.data`` and axes before an edit without materializing oversized lazy arrays."""
+        raw = layer.data
+        est = self._estimate_nbytes(raw)
+        if est is not None and est > self.UNDO_MAX_BYTES:
+            return False
+        if hasattr(raw, 'compute') and not in_place:
+            snapshot = raw
+            snap_bytes = 0
+        else:
+            arr = np.asarray(raw)
+            if arr.nbytes > self.UNDO_MAX_BYTES:
+                return False
+            snapshot = arr.copy()
+            snap_bytes = int(arr.nbytes)
         entry = {
             'kind': 'data',
             'label': label,
             'viewer': viewer,
             'layer': layer,
-            'data': arr.copy(),
-            'bytes': int(arr.nbytes),
+            'data': snapshot,
+            'bytes': snap_bytes,
             'axes': axes_mod.get(layer).to_dict(),
+            'had_modified': 'modified' in layer.metadata,
+            'modified': layer.metadata.get('modified'),
         }
         self._undo_stack.append(entry)
         self._trim_undo_stack()
+        return True
 
     def push_undo_layer(self, label: str, viewer, layer) -> None:
         """Register a newly created layer so Edit ▸ Undo removes it."""
@@ -1010,6 +1079,10 @@ class Tiki(QMainWindow):
                 ly.data = entry['data']
                 if entry.get('axes'):
                     axes_mod.apply(v, ly, axes_mod.AxesInfo.from_dict(entry['axes']))
+                if entry.get('had_modified'):
+                    ly.metadata['modified'] = entry.get('modified')
+                else:
+                    ly.metadata.pop('modified', None)
                 v.reset_view()
             else:
                 v.layers.remove(ly)

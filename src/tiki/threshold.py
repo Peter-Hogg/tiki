@@ -475,6 +475,7 @@ class ThresholdWindow(QWidget):
         if not split:
             layer.colormap = self._colormap()
         viewer.add_layer(layer)
+        self.tiki.push_undo_layer('Threshold', viewer, layer)
         roi = roi_mod.roi_layer(viewer, create=False)
         if roi is not None:
             viewer.layers.move(viewer.layers.index(roi), len(viewer.layers))
@@ -484,6 +485,10 @@ class ThresholdWindow(QWidget):
         viewer.layers.selection.active = layer
         self.tiki.windows.show_layer_controls(viewer)
         n = len(np.unique(out)) - (1 if (out == 0).any() else 0) if split else None
+        self.tiki.record(
+            f'tiki.threshold({self.lo_val!r}, {self.hi_val!r}, scope={scope!r}, split={split!r}, '
+            f'connect_z={three_d!r}, min_size={min_size!r})'
+        )
         self.tiki.status(
             f'Threshold {self.lo_val:.4g}–{self.hi_val:.4g}: '
             + (f'{n} {"3D " if three_d else ""}objects' if split else f'{100 * (out > 0).mean():.2f} % of pixels')

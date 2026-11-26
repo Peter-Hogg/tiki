@@ -27,8 +27,109 @@ from . import axes as axes_mod
 from . import io, macros, ops, process, style
 
 
+CONFLICT_POLICIES = ('rename', 'skip', 'overwrite', 'error')
+SCENE_POLICIES = ('all', 'first', 'active')
+
+
 def _natkey(path: Path) -> list:
     return [int(t) if t.isdigit() else t.lower() for t in re.split(r'(\d+)', path.name)]
+
+
+def _stem_collisions(files: list[Path], in_root: Path, out_root: Path) -> set[tuple[Path, str]]:
+    """Return ``(resolved_dst_dir, lowercase_stem)`` keys shared by more than one input file."""
+    counts: dict[tuple[Path, str], int] = {}
+    for src in files:
+        rel_parent = src.relative_to(in_root).parent
+        key = ((out_root / rel_parent).resolve(strict=False), src.stem.lower())
+        counts[key] = counts.get(key, 0) + 1
+    return {k for k, n in counts.items() if n > 1}
+
+
+def _collision_stem(src: Path) -> str:
+    ext_tag = re.sub(r'[^A-Za-z0-9]+', '_', src.suffix.lstrip('.').lower()).strip('_')
+    return f'{src.stem}_{ext_tag}' if ext_tag else src.stem
+
+
+def _unique_dest(
+    dst: Path,
+    source_resolved: set[Path],
+    used_resolved: set[Path],
+    on_conflict: str,
+) -> Path | None:
+    """Resolve a safe output path avoiding source overwrites and intra-batch collisions."""
+    res = dst.resolve(strict=False)
+    hits_source = res in source_resolved
+    hits_used = res in used_resolved
+    exists_on_disk = dst.exists()
+
+    if not hits_source and not hits_used and not (exists_on_disk and on_conflict != 'overwrite'):
+        used_resolved.add(res)
+        return dst
+
+    if hits_source:
+        if on_conflict in ('error', 'overwrite'):
+            raise ValueError(f'Refusing to overwrite input source file: {dst}')
+        if on_conflict == 'skip':
+            return None
+    elif hits_used:
+        if on_conflict == 'error':
+            raise ValueError(f'Output destination collision in batch: {dst}')
+        if on_conflict == 'skip':
+            return None
+    else:
+        if on_conflict == 'error':
+            raise ValueError(f'Output file already exists: {dst}')
+        if on_conflict == 'skip':
+            return None
+        if on_conflict == 'overwrite':
+            used_resolved.add(res)
+            return dst
+
+    tag = '_out' if hits_source else ''
+    n = 1
+    while True:
+        if tag:
+            suffix = tag if n == 1 else f'{tag}_{n}'
+        else:
+            suffix = f'_{n + 1}'
+        cand = dst.with_name(f'{dst.stem}{suffix}{dst.suffix}')
+        cand_res = cand.resolve(strict=False)
+        if cand_res not in source_resolved and cand_res not in used_resolved and not cand.exists():
+            used_resolved.add(cand_res)
+            return cand
+        n += 1
+
+
+def plan_batch_convert(
+    files: list[Path],
+    in_root: str | Path,
+    out_root: str | Path,
+    ext: str,
+    on_conflict: str = 'rename',
+) -> tuple[list[tuple[Path, Path, str, Path | None]], set[Path], set[Path]]:
+    """Pre-compute output paths for ``files`` and enforce collision/source safety before writing."""
+    if on_conflict not in CONFLICT_POLICIES:
+        raise ValueError(f'unknown on_conflict policy {on_conflict!r}; expected one of {CONFLICT_POLICIES}')
+    in_p = Path(in_root)
+    out_p = Path(out_root)
+    source_resolved = {p.resolve(strict=False) for p in files}
+    used_resolved: set[Path] = set()
+    collisions = _stem_collisions(files, in_p, out_p)
+
+    plan: list[tuple[Path, Path, str, Path | None]] = []
+    for src in files:
+        rel_parent = src.relative_to(in_p).parent
+        dst_dir = out_p / rel_parent
+        key = (dst_dir.resolve(strict=False), src.stem.lower())
+        if key in collisions:
+            if on_conflict == 'error':
+                raise ValueError(f'Filename collision in batch output for stem {src.stem!r} ({src.name})')
+            base_stem = _collision_stem(src)
+        else:
+            base_stem = src.stem
+        planned = _unique_dest(dst_dir / f'{base_stem}{ext}', source_resolved, used_resolved, on_conflict)
+        plan.append((src, dst_dir, base_stem, planned))
+    return plan, source_resolved, used_resolved
 
 
 def find_batch_files(folder: str | Path, pattern: str = '*', recursive: bool = False) -> list[Path]:
@@ -82,27 +183,48 @@ def batch_convert(
     pattern: str = '*',
     recursive: bool = False,
     stack_mode: str = 'max',
+    on_conflict: str = 'rename',
     progress=None,
 ) -> tuple[int, list[tuple[Path, str]]]:
     """Convert matching images in ``input_dir`` into ``output_dir`` as tiff/png/jpeg/npy."""
     in_root = Path(input_dir)
     out_root = Path(output_dir)
-    out_root.mkdir(parents=True, exist_ok=True)
     files = find_batch_files(in_root, pattern=pattern, recursive=recursive)
     fmt_l = fmt.lower()
     ext = {'tiff': '.tif', 'png': '.png', 'jpeg': '.jpg', 'jpg': '.jpg', 'npy': '.npy'}[fmt_l]
+    plan, source_resolved, used_resolved = plan_batch_convert(
+        files, in_root, out_root, ext, on_conflict=on_conflict
+    )
+    out_root.mkdir(parents=True, exist_ok=True)
 
     ok_count = 0
     errors: list[tuple[Path, str]] = []
-    for n, src in enumerate(files, 1):
+    for n, (src, dst_dir, base_stem, planned_dst) in enumerate(plan, 1):
         try:
-            rel_parent = src.relative_to(in_root).parent
-            dst_dir = out_root / rel_parent
-            dst_dir.mkdir(parents=True, exist_ok=True)
+            if planned_dst is None:
+                if progress is not None and progress(n, len(plan)) is False:
+                    break
+                continue
             scenes = io.read_multi(src)
-            for idx, (data, meta) in enumerate(scenes):
-                suffix = f'_s{idx + 1}' if len(scenes) > 1 else ''
-                dst = dst_dir / f'{src.stem}{suffix}{ext}'
+            if len(scenes) == 1:
+                targets = [planned_dst]
+            else:
+                used_resolved.discard(planned_dst.resolve(strict=False))
+                targets = []
+                for idx in range(len(scenes)):
+                    t = _unique_dest(
+                        dst_dir / f'{base_stem}_s{idx + 1}{ext}',
+                        source_resolved,
+                        used_resolved,
+                        on_conflict,
+                    )
+                    targets.append(t)
+
+            wrote_any = False
+            for (data, meta), dst in zip(scenes, targets):
+                if dst is None:
+                    continue
+                dst.parent.mkdir(parents=True, exist_ok=True)
                 info = meta['axes']
                 rgb = data.ndim == len(info.axes) + 1 and data.shape[-1] in (3, 4)
                 if fmt_l == 'tiff':
@@ -121,10 +243,12 @@ def batch_convert(
                     plane = _flatten_to_2d(data, rgb=rgb, stack_mode=stack_mode)
                     u8 = _to_uint8_display(plane, rgb=rgb)
                     PilImage.fromarray(u8).save(dst)
-            ok_count += 1
+                wrote_any = True
+            if wrote_any:
+                ok_count += 1
         except Exception as exc:
             errors.append((src, str(exc)))
-        if progress is not None and progress(n, len(files)) is False:
+        if progress is not None and progress(n, len(plan)) is False:
             break
     return ok_count, errors
 
@@ -139,14 +263,30 @@ def batch_macro(
     auto_save: bool = False,
     save_results_csv: bool = True,
     close_after: bool = True,
+    scenes: str = 'all',
+    on_conflict: str = 'rename',
     progress=None,
 ) -> tuple[int, list[tuple[Path, str]]]:
-    """Run Python macro ``code`` across matching files in ``input_dir``."""
+    """Run Python macro ``code`` across matching files and scenes in ``input_dir``."""
+    if scenes not in SCENE_POLICIES:
+        raise ValueError(f'unknown scenes policy {scenes!r}; expected one of {SCENE_POLICIES}')
+    if on_conflict not in CONFLICT_POLICIES:
+        raise ValueError(f'unknown on_conflict policy {on_conflict!r}; expected one of {CONFLICT_POLICIES}')
+
     in_root = Path(input_dir)
     out_root = Path(output_dir) if output_dir else None
+    files = find_batch_files(in_root, pattern=pattern, recursive=recursive)
+
+    if auto_save and out_root is not None:
+        save_plan, source_resolved, used_resolved = plan_batch_convert(
+            files, in_root, out_root, '.tif', on_conflict=on_conflict
+        )
+    else:
+        save_plan = [(src, in_root, src.stem, None) for src in files]
+        source_resolved, used_resolved = set(), set()
+
     if out_root is not None:
         out_root.mkdir(parents=True, exist_ok=True)
-    files = find_batch_files(in_root, pattern=pattern, recursive=recursive)
 
     rec = getattr(tiki, 'recorder_window', None)
     was_paused = rec.paused if rec is not None else False
@@ -155,33 +295,106 @@ def batch_macro(
     ok_count = 0
     errors: list[tuple[Path, str]] = []
     try:
-        for n, src in enumerate(files, 1):
-            before = set(tiki.windows.viewers)
+        for n, (src, dst_dir, base_stem, planned_dst) in enumerate(save_plan, 1):
             try:
-                tiki.open_paths([str(src)])
-                ok, log_text, _ns = macros.run_code(
-                    tiki,
-                    code,
-                    filename=str(src.name),
-                    namespace={'input_path': src, 'output_dir': out_root},
-                )
-                if not ok:
-                    errors.append((src, log_text.strip() or 'macro stopped'))
-                else:
-                    if auto_save and out_root is not None and tiki.windows.active is not None:
-                        rel_parent = src.relative_to(in_root).parent
-                        dst_dir = out_root / rel_parent
-                        dst_dir.mkdir(parents=True, exist_ok=True)
-                        tiki.save_layer(dst_dir / f'{src.stem}.tif')
-                    ok_count += 1
+                loaded = io.read_multi(src)
             except Exception as exc:
                 errors.append((src, str(exc)))
-            finally:
-                if close_after:
-                    for v in list(tiki.windows.viewers):
-                        if v not in before:
-                            tiki.windows.close(v)
-            if progress is not None and progress(n, len(files)) is False:
+                if progress is not None and progress(n, len(save_plan)) is False:
+                    break
+                continue
+
+            multi = len(loaded) > 1
+            if scenes == 'active':
+                before = set(tiki.windows.viewers)
+                try:
+                    for idx, (data, meta) in enumerate(loaded):
+                        tiki.open_scene_entry(data, meta, scene_idx=idx if multi else None, raise_errors=True)
+                    ok, log_text, _ns = macros.run_code(
+                        tiki,
+                        code,
+                        filename=src.name,
+                        namespace={
+                            'input_path': src,
+                            'output_dir': out_root,
+                            'scene_index': None,
+                            'scene_count': len(loaded),
+                            'scene_name': src.name,
+                        },
+                    )
+                    if not ok:
+                        errors.append((src, log_text.strip() or 'macro stopped'))
+                    else:
+                        if auto_save and out_root is not None and tiki.windows.active is not None:
+                            dst = planned_dst
+                            if dst is not None:
+                                dst.parent.mkdir(parents=True, exist_ok=True)
+                                tiki.save_layer(dst)
+                        ok_count += 1
+                except Exception as exc:
+                    errors.append((src, str(exc)))
+                finally:
+                    if close_after:
+                        for v in list(tiki.windows.viewers):
+                            if v not in before:
+                                tiki.windows.close(v)
+            else:
+                scene_items = list(enumerate(loaded)) if scenes == 'all' else [(0, loaded[0])]
+                if multi and len(scene_items) > 1 and auto_save and out_root is not None and planned_dst is not None:
+                    used_resolved.discard(planned_dst.resolve(strict=False))
+                file_ok = True
+                for scene_idx, (data, meta) in scene_items:
+                    before = set(tiki.windows.viewers)
+                    try:
+                        tiki.open_scene_entry(
+                            data,
+                            meta,
+                            scene_idx=scene_idx if multi else None,
+                            raise_errors=True,
+                        )
+                        scene_name = str(meta.get('name') or src.name)
+                        fname = f'{src.name}[{scene_idx}]' if multi else src.name
+                        ok, log_text, _ns = macros.run_code(
+                            tiki,
+                            code,
+                            filename=fname,
+                            namespace={
+                                'input_path': src,
+                                'output_dir': out_root,
+                                'scene_index': scene_idx,
+                                'scene_count': len(loaded),
+                                'scene_name': scene_name,
+                            },
+                        )
+                        if not ok:
+                            file_ok = False
+                            msg = log_text.strip() or 'macro stopped'
+                            errors.append((src, f'scene {scene_idx + 1}: {msg}' if multi else msg))
+                        elif auto_save and out_root is not None and tiki.windows.active is not None:
+                            if len(scene_items) > 1:
+                                dst = _unique_dest(
+                                    dst_dir / f'{base_stem}_s{scene_idx + 1}.tif',
+                                    source_resolved,
+                                    used_resolved,
+                                    on_conflict,
+                                )
+                            else:
+                                dst = planned_dst
+                            if dst is not None:
+                                dst.parent.mkdir(parents=True, exist_ok=True)
+                                tiki.save_layer(dst)
+                    except Exception as exc:
+                        file_ok = False
+                        errors.append((src, f'scene {scene_idx + 1}: {exc}' if multi else str(exc)))
+                    finally:
+                        if close_after:
+                            for v in list(tiki.windows.viewers):
+                                if v not in before:
+                                    tiki.windows.close(v)
+                if file_ok:
+                    ok_count += 1
+
+            if progress is not None and progress(n, len(save_plan)) is False:
                 break
     finally:
         if rec is not None:
@@ -229,6 +442,10 @@ def batch_convert_dialog(tiki):
     stack_box = QComboBox()
     stack_box.addItem('Max Z/T projection (for 2D PNG/JPEG)', 'max')
     stack_box.addItem('First plane (for 2D PNG/JPEG)', 'first')
+    conflict_box = QComboBox()
+    conflict_box.addItem('Rename automatically (_2, _out)', 'rename')
+    conflict_box.addItem('Skip existing / conflicting', 'skip')
+    conflict_box.addItem('Overwrite non-source outputs', 'overwrite')
     count_label = QLabel('Choose an input folder')
 
     form.addRow('Input folder:', in_row)
@@ -237,14 +454,19 @@ def batch_convert_dialog(tiki):
     form.addRow(rec_box)
     form.addRow('Output format:', fmt_box)
     form.addRow('Stacks in 2D formats:', stack_box)
+    form.addRow('Existing / colliding files:', conflict_box)
     form.addRow('', count_label)
     buttons = process._buttons(dlg, form)
 
     def refresh(_=None):
         in_dir = Path(in_edit.text().strip())
+        out_txt = out_edit.text().strip()
         files = find_batch_files(in_dir, pat_edit.text(), rec_box.isChecked()) if in_edit.text().strip() else []
-        ok = bool(files) and bool(out_edit.text().strip())
-        count_label.setText(f'{len(files)} matching file(s)' if in_edit.text().strip() else 'Choose an input folder')
+        ok = bool(files) and bool(out_txt)
+        msg = f'{len(files)} matching file(s)' if in_edit.text().strip() else 'Choose an input folder'
+        if files and out_txt and in_dir.resolve(strict=False) == Path(out_txt).resolve(strict=False):
+            msg += ' (same folder as input: source files will not be overwritten)'
+        count_label.setText(msg)
         buttons.button(buttons.Ok).setEnabled(ok)
         stack_box.setEnabled(fmt_box.currentData() in ('png', 'jpeg'))
 
@@ -266,6 +488,7 @@ def batch_convert_dialog(tiki):
             pattern=pat_edit.text(),
             recursive=rec_box.isChecked(),
             stack_mode=stack_box.currentData(),
+            on_conflict=conflict_box.currentData(),
             progress=tick,
         )
     if errs:
@@ -301,6 +524,15 @@ def batch_macro_dialog(tiki):
     code_edit.setFont(font)
     code_edit.setMinimumHeight(140)
     auto_save = QCheckBox('Auto-save active image as TIFF to output folder')
+    scenes_box = QComboBox()
+    scenes_box.addItem('Each scene separately', 'all')
+    scenes_box.addItem('First scene only', 'first')
+    scenes_box.addItem('All scenes open, run once on active', 'active')
+    conflict_box = QComboBox()
+    conflict_box.addItem('Rename automatically (_2, _out)', 'rename')
+    conflict_box.addItem('Skip existing / conflicting', 'skip')
+    conflict_box.addItem('Overwrite non-source outputs', 'overwrite')
+    conflict_box.setEnabled(False)
     save_csv = QCheckBox('Write Results.csv to output folder', checked=True)
     close_box = QCheckBox('Close image windows after each file', checked=True)
     count_label = QLabel('Choose an input folder')
@@ -320,9 +552,11 @@ def batch_macro_dialog(tiki):
     form.addRow('Output folder:', out_row)
     form.addRow('Filename pattern:', pat_edit)
     form.addRow(rec_box)
+    form.addRow('Multi-scene files:', scenes_box)
     form.addRow('Load macro:', preset_box)
     form.addRow('Python code:', code_edit)
     form.addRow(auto_save)
+    form.addRow('Auto-save conflicts:', conflict_box)
     form.addRow(save_csv)
     form.addRow(close_box)
     form.addRow('', count_label)
@@ -334,11 +568,13 @@ def batch_macro_dialog(tiki):
         ok = bool(files) and bool(code_edit.toPlainText().strip())
         count_label.setText(f'{len(files)} matching file(s)' if in_edit.text().strip() else 'Choose an input folder')
         buttons.button(buttons.Ok).setEnabled(ok)
+        conflict_box.setEnabled(auto_save.isChecked())
 
     in_edit.textChanged.connect(refresh)
     pat_edit.textChanged.connect(refresh)
     rec_box.toggled.connect(refresh)
     code_edit.textChanged.connect(refresh)
+    auto_save.toggled.connect(refresh)
     refresh()
 
     if dlg.exec_() != QDialog.Accepted:
@@ -355,6 +591,8 @@ def batch_macro_dialog(tiki):
             auto_save=auto_save.isChecked(),
             save_results_csv=save_csv.isChecked(),
             close_after=close_box.isChecked(),
+            scenes=scenes_box.currentData(),
+            on_conflict=conflict_box.currentData(),
             progress=tick,
         )
     if errs:

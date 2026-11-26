@@ -2117,4 +2117,332 @@ def test_review_bugfixes_export_integrity_collisions_rgb_crop_and_units(tiki, tm
     assert int(ns['labels']['a_b'][0, 0]) == 2
 
 
+def test_lazy_dask_undo_skips_oversized_and_preserves_laziness(tiki):
+    import dask
+    import dask.array as da
+
+    from tiki import axes as axes_mod
+
+    # 1. > 256 MB Dask array: chunks outside ROI raise if materialized during push_undo_data or crop()
+    guard = {'strict': False}
+
+    def _safe_half_chunk(z_idx, x_half):
+        if guard['strict'] and x_half > 0:
+            raise AssertionError('oversized Dask array materialized outside ROI during push_undo_data/crop')
+        return np.zeros((1, 512, 256), dtype=np.float32)
+
+    huge = da.concatenate(
+        [
+            da.concatenate(
+                [
+                    da.from_delayed(dask.delayed(_safe_half_chunk)(k, 0), shape=(1, 512, 256), dtype=np.float32),
+                    da.from_delayed(dask.delayed(_safe_half_chunk)(k, 1), shape=(1, 512, 256), dtype=np.float32),
+                ],
+                axis=2,
+            )
+            for k in range(300)
+        ],
+        axis=0,
+    )  # 300 * 512 * 512 * 4 ~= 300 MB > 256 MB
+    info_huge = axes_mod.AxesInfo(
+        [axes_mod.Axis('Z', 300), axes_mod.Axis('Y', 512), axes_mod.Axis('X', 512)],
+        'test',
+        True,
+    )
+    v_huge = tiki.open_data(huge, 'huge.tif', axes=info_huge, contrast_limits=(0.0, 1.0))
+    guard['strict'] = True
+    assert tiki.push_undo_data('Crop', v_huge, v_huge.layers[0]) is False
+    _rect(v_huge.layers[roi.ROI_NAME], 0, 16, 0, 16)
+    tiki.crop()
+    assert v_huge.layers['huge.tif'].data.shape == (300, 16, 16)
+    tiki.windows.close(v_huge)
+
+    # 2. <= 256 MB Dask array: Crop snapshots lazily without computing full array, and Undo restores lazy reference
+    calls = {'count': 0}
+
+    def _chunk(z_val):
+        calls['count'] += 1
+        return np.full((1, 16, 16), float(z_val + 1), dtype=np.float32)
+
+    small_dask = da.concatenate(
+        [da.from_delayed(dask.delayed(_chunk)(k), shape=(1, 16, 16), dtype=np.float32) for k in range(4)],
+        axis=0,
+    )
+    info_small = axes_mod.AxesInfo(
+        [axes_mod.Axis('Z', 4), axes_mod.Axis('Y', 16), axes_mod.Axis('X', 16)],
+        'test',
+        True,
+    )
+    v_small = tiki.open_data(small_dask, 'lazy.tif', axes=info_small, contrast_limits=(0.0, 5.0))
+    calls_after_open = calls['count']
+    _rect(v_small.layers[roi.ROI_NAME], 2, 10, 2, 10)
+    tiki.crop()
+    assert v_small.layers['lazy.tif'].data.shape == (4, 8, 8)
+    assert v_small.layers['lazy.tif'].metadata.get('modified') is True
+    # Only the crop itself materialized chunks (1 pass), not an extra full copy in push_undo_data
+    assert calls['count'] - calls_after_open <= 4
+
+    tiki.undo()
+    ly = v_small.layers['lazy.tif']
+    assert ly.data is small_dask and hasattr(ly.data, 'compute')
+    assert 'modified' not in ly.metadata
+
+
+def test_macro_recorder_replay_reproduces_pixels_and_metadata(tiki, accept_dialogs):
+    from napari.layers import Image, Labels
+    from qtpy.QtWidgets import QDoubleSpinBox, QPlainTextEdit
+    from tiki import axes as axes_mod
+    from tiki import fft_noise, macros, process
+
+    rng = np.random.default_rng(3)
+    vol = rng.uniform(5.0, 15.0, (4, 18, 18)).astype(np.float32)
+    vol[:, 5:13, 5:13] = 120.0
+    vol[1, 9, 9] = 900.0
+    info = axes_mod.AxesInfo(
+        [axes_mod.Axis('Z', 4, 1.0, 'µm'), axes_mod.Axis('Y', 18, 0.5, 'µm'), axes_mod.Axis('X', 18, 0.5, 'µm')],
+        'test',
+        True,
+    )
+
+    rec = tiki.show_macro_recorder()
+    v1 = tiki.open_data(vol.copy(), 'sample.tif', axes=info)
+    v1.dims.set_current_step(0, 1)
+
+    # 1. Convolve (3D stack plane-by-plane)
+    accept_dialogs['configure'] = lambda d: d.findChild(QPlainTextEdit).setPlainText('1 1 1\n1 1 1\n1 1 1')
+    conv_1 = process.convolve_dialog(tiki)
+
+    # 2. Edge Detection: Canny as Labels across stack with explicit thresholds
+    v1.layers.selection.active = v1.layers['sample.tif']
+
+    def cfg_canny(dlg):
+        dlg.method_box.setCurrentIndex(dlg.method_box.findData('canny'))
+        dlg.sigma_spin.setValue(1.2)
+        dlg.low_spin.setValue(0.05)
+        dlg.high_spin.setValue(0.30)
+        dlg.whole_stack.setChecked(True)
+        dlg.as_labels.setChecked(True)
+
+    accept_dialogs['configure'] = cfg_canny
+    canny_1 = process.edge_detection_dialog(tiki)
+
+    # 3. Edge Detection: 3D Scharr across Z-stack
+    v1.layers.selection.active = v1.layers['sample.tif']
+
+    def cfg_scharr3d(dlg):
+        dlg.method_box.setCurrentIndex(dlg.method_box.findData('scharr'))
+        dlg.three_d.setChecked(True)
+        dlg.whole_stack.setChecked(True)
+
+    accept_dialogs['configure'] = cfg_scharr3d
+    scharr_1 = process.edge_detection_dialog(tiki)
+
+    # 4. Math (single current plane only -> whole_stack=False)
+    v1.layers.selection.active = v1.layers['sample.tif']
+
+    def cfg_math(dlg):
+        _combo(dlg, 'Add').setCurrentText('Multiply')
+        dlg.findChild(QDoubleSpinBox).setValue(2.5)
+        from qtpy.QtWidgets import QCheckBox
+        dlg.findChild(QCheckBox).setChecked(False)
+
+    accept_dialogs['configure'] = cfg_math
+    math_1 = process.math_dialog(tiki)
+
+    # 5. Find Maxima (Segmented Particles, plane)
+    v1.layers.selection.active = v1.layers['sample.tif']
+
+    def cfg_fm(dlg):
+        dlg.prom_spin.setValue(15.0)
+        dlg.output_box.setCurrentText('Segmented Particles')
+        dlg.whole_stack.setChecked(False)
+
+    accept_dialogs['configure'] = cfg_fm
+    fm_1 = process.find_maxima_dialog(tiki)
+
+    # 6. Remove Outliers + Bandpass Filter (stripe suppression)
+    v1.layers.selection.active = v1.layers['sample.tif']
+    accept_dialogs['configure'] = lambda d: None
+    ro_1 = fft_noise.remove_outliers_dialog(tiki)
+
+    v1.layers.selection.active = v1.layers['sample.tif']
+
+    def cfg_bp(dlg):
+        dlg.stripes_box.setCurrentText('Horizontal')
+        dlg.whole_stack.setChecked(True)
+
+    accept_dialogs['configure'] = cfg_bp
+    bp_1 = fft_noise.bandpass_dialog(tiki)
+
+    # 7. Resize (updates physical Y/X calibration)
+    v1.layers.selection.active = v1.layers['sample.tif']
+
+    def cfg_resize(dlg):
+        spins = dlg.findChildren(QDoubleSpinBox)
+        spins[0].setValue(2.0)
+
+    accept_dialogs['configure'] = cfg_resize
+    v_res_1 = process.resize_dialog(tiki)
+    res_1_data = np.asarray(v_res_1.layers[0].data).copy()
+    res_1_axes = axes_mod.get(v_res_1.layers[0]).to_dict()
+
+    recorded = rec.code()
+    exp_conv = (np.asarray(conv_1.data).copy(), axes_mod.get(conv_1).to_dict())
+    exp_canny = (np.asarray(canny_1.data).copy(), isinstance(canny_1, Labels), axes_mod.get(canny_1).to_dict())
+    exp_scharr = (np.asarray(scharr_1.data).copy(), axes_mod.get(scharr_1).to_dict())
+    exp_math = (np.asarray(math_1.data).copy(), axes_mod.get(math_1).to_dict())
+    exp_fm = (np.asarray(fm_1.data).copy(), axes_mod.get(fm_1).to_dict())
+    exp_ro = (np.asarray(ro_1.data).copy(), axes_mod.get(ro_1).to_dict())
+    exp_bp = (np.asarray(bp_1.data).copy(), axes_mod.get(bp_1).to_dict())
+
+    # Replay recorded code on a fresh identical stack (keeping active source layer selected cleanly)
+    tiki.windows.close_all()
+    v2 = tiki.open_data(vol.copy(), 'sample.tif', axes=info)
+    v2.dims.set_current_step(0, 1)
+
+    lines_rebuilt = []
+    for ln in recorded.splitlines():
+        s = ln.strip()
+        if not s or s.startswith('#'):
+            continue
+        lines_rebuilt.append("tiki.viewer().layers.selection.active = tiki.layer('sample.tif')")
+        lines_rebuilt.append(ln)
+    ok, log_txt, _ = macros.run_code(tiki, '\n'.join(lines_rebuilt))
+    assert ok, log_txt
+    # Running a macro must NOT re-record lines into the open Recorder window
+    assert rec.code() == recorded
+    rec.close()
+
+    # Compare reproduced pixels, layer types, and calibrated axes metadata
+    by_name = {ly.name: ly for ly in v2.layers}
+    np.testing.assert_allclose(by_name[conv_1.name].data, exp_conv[0])
+    assert axes_mod.get(by_name[conv_1.name]).to_dict()['axes'] == exp_conv[1]['axes']
+
+    assert isinstance(by_name[canny_1.name], Labels) is exp_canny[1]
+    np.testing.assert_array_equal(by_name[canny_1.name].data, exp_canny[0])
+
+    np.testing.assert_allclose(by_name[scharr_1.name].data, exp_scharr[0])
+    assert axes_mod.get(by_name[scharr_1.name]).to_dict()['axes'] == exp_scharr[1]['axes']
+
+    np.testing.assert_allclose(by_name[math_1.name].data, exp_math[0])
+    assert by_name[math_1.name].data.ndim == 2
+
+    np.testing.assert_array_equal(by_name[fm_1.name].data, exp_fm[0])
+    np.testing.assert_allclose(by_name[ro_1.name].data, exp_ro[0])
+    np.testing.assert_allclose(by_name[bp_1.name].data, exp_bp[0])
+
+    v_res_2 = tiki.windows.viewers[-1]
+    assert v_res_2.title.startswith('Resize_')
+    np.testing.assert_allclose(v_res_2.layers[0].data, res_1_data)
+    assert axes_mod.get(v_res_2.layers[0]).to_dict()['axes'] == res_1_axes['axes']
+
+
+def test_notebook_export_container_h5_and_zarr(tiki, tmp_path, monkeypatch):
+    import sys
+    import types
+
+    import dask.array as da
+
+    from tiki import export, io
+
+    # 1. Multi-dataset HDF5 container exports selected dataset key and closes file handle
+    closed_handles = []
+
+    class FakeDataset:
+        def __init__(self, arr, attrs=None):
+            self._arr = np.asarray(arr)
+            self.shape = self._arr.shape
+            self.ndim = self._arr.ndim
+            self.dtype = self._arr.dtype
+            self.attrs = attrs or {}
+
+        def __getitem__(self, item):
+            return self._arr[item]
+
+        def __array__(self, dtype=None, copy=None):
+            return self._arr if dtype is None else self._arr.astype(dtype)
+
+    h5_arr = np.arange(3 * 6 * 8, dtype=np.uint16).reshape(3, 6, 8) + 5
+
+    class FakeH5File:
+        def __init__(self, _p, _m='r'):
+            self.closed = False
+            self._items = {
+                'small': FakeDataset(np.zeros((2, 2), np.float32)),
+                'sub/stack': FakeDataset(h5_arr, {'axes': 'ZYX'}),
+            }
+
+        def visititems(self, fn):
+            for k, v in self._items.items():
+                fn(k, v)
+
+        def __getitem__(self, k):
+            return self._items[k]
+
+        def close(self):
+            self.closed = True
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            self.close()
+            closed_handles.append(self)
+            return False
+
+    monkeypatch.setitem(sys.modules, 'h5py', types.SimpleNamespace(File=FakeH5File, Dataset=FakeDataset))
+    h5_path = tmp_path / 'sample.h5'
+    h5_path.write_bytes(b'dummy')
+    data_h5, meta_h5 = io.read_hdf5(h5_path)
+    assert meta_h5['container_key'] == 'sub/stack'
+    v_h5 = tiki.open_scene_entry(data_h5, meta_h5)
+
+    out_h5 = tmp_path / 'nb_h5'
+    folder_h5, snippet_h5 = export.export_session(out_h5, v_h5, v_h5.layers[0])
+    assert '_h5[\'sub/stack\']' in snippet_h5
+    ns_h5: dict = {}
+    exec(compile(snippet_h5, str(folder_h5 / 'load_session.py'), 'exec'), ns_h5)
+    assert isinstance(ns_h5['image'], np.ndarray)
+    np.testing.assert_array_equal(ns_h5['image'], h5_arr)
+    assert closed_handles and closed_handles[-1].closed
+
+    # Missing container_key on HDF5 falls back cleanly to image.npy instead of broken h5py.File
+    v_h5_nokey = tiki.open_data(h5_arr, 'nokey.h5', metadata={'path': str(h5_path)})
+    folder_fb, snippet_fb = export.export_session(tmp_path / 'nb_fb', v_h5_nokey, v_h5_nokey.layers[0])
+    assert (folder_fb / 'image.npy').is_file() and 'image.npy' in snippet_fb
+
+    # 2. Nested plain Zarr & OME-Zarr export selected dataset key, not root group
+    zarr_arr = np.arange(2 * 6 * 6, dtype=np.float32).reshape(2, 6, 6) + 10.0
+
+    class FakeZarrGroup:
+        def __init__(self, children, attrs=None):
+            self._children = children
+            self.attrs = attrs or {}
+
+        def keys(self):
+            return list(self._children.keys())
+
+        def __getitem__(self, k):
+            cur = self
+            for part in str(k).split('/'):
+                cur = cur._children[part]
+            return cur
+
+    fake_zarr = FakeZarrGroup({'sub': FakeZarrGroup({'stack': zarr_arr})})
+    monkeypatch.setitem(sys.modules, 'zarr', types.SimpleNamespace(open=lambda *_a, **_kw: fake_zarr))
+    monkeypatch.setattr(da, 'from_zarr', lambda arr: da.from_array(arr, chunks=(1, 6, 6)))
+    z_path = tmp_path / 'nested.zarr'
+    z_path.mkdir()
+    data_z, meta_z = io.read_zarr(z_path)
+    assert meta_z['container_key'] == 'sub/stack'
+    v_z = tiki.open_scene_entry(data_z, meta_z)
+
+    folder_z, snippet_z = export.export_session(tmp_path / 'nb_zarr', v_z, v_z.layers[0])
+    assert "['sub/stack']" in snippet_z
+    ns_z: dict = {}
+    exec(compile(snippet_z, str(folder_z / 'load_session.py'), 'exec'), ns_z)
+    np.testing.assert_array_equal(np.asarray(ns_z['image']), zarr_arr)
+
+
+
 

@@ -38,7 +38,12 @@ def _unique_name(base: str, ext: str, used: set[str]) -> str:
     return cand
 
 
-def _loader_line(var: str, path: str) -> str:
+def _loader_line(
+    var: str,
+    path: str,
+    container_key: str | None = None,
+    lazy: bool = False,
+) -> str:
     low = path.lower()
     p = repr(str(path))
     if low.endswith('.npy'):
@@ -50,9 +55,14 @@ def _loader_line(var: str, path: str) -> str:
     if low.endswith('.nd2'):
         return f"import nd2; {var} = nd2.imread({p})"
     if low.endswith('.zarr'):
+        if container_key:
+            return f"import zarr; {var} = zarr.open({p}, mode='r')[{container_key!r}]"
         return f"import zarr; {var} = zarr.open({p}, mode='r')"
     if low.endswith(('.h5', '.hdf5', '.mat')):
-        return f"import h5py; {var} = h5py.File({p}, 'r')"
+        key = container_key or ''
+        if lazy:
+            return f"import h5py; _h5 = h5py.File({p}, 'r'); {var} = _h5[{key!r}]  # lazy HDF5 dataset; call _h5.close() when done"
+        return f"import h5py\nwith h5py.File({p}, 'r') as _h5:\n    {var} = _h5[{key!r}][:]"
     return f"import skimage.io; {var} = skimage.io.imread({p})"
 
 
@@ -63,11 +73,17 @@ def _can_reload_source(image, src: str | None) -> bool:
     p = Path(src)
     if not p.exists():
         return False
-    if p.is_dir() and p.suffix.lower() != '.zarr':
+    low = src.lower()
+    if p.is_dir() and not low.endswith('.zarr'):
         return False
     meta = getattr(image, 'metadata', {}) or {}
     if meta.get('modified') or 'split_from' in meta or meta.get('scene') is not None:
         return False
+    if low.endswith(('.h5', '.hdf5', '.mat')):
+        ck = meta.get('container_key')
+        return isinstance(ck, str) and bool(ck)
+    if low.endswith('.zarr'):
+        return isinstance(meta.get('container_key'), str)
     return True
 
 
@@ -110,11 +126,15 @@ def export_session(
 
     # -- image ---------------------------------------------------------
     src = image.metadata.get('path')
+    ck = image.metadata.get('container_key')
     if src:
         manifest['source_path'] = src
+    if isinstance(ck, str) and ck:
+        manifest['container_key'] = ck
     if _can_reload_source(image, src):
         manifest['image_path'] = src
-        lines.append(_loader_line('image', src))
+        is_lazy = bool(hasattr(image.data, 'compute') or getattr(image.data, 'nbytes', 0) > 256 * 2**20)
+        lines.append(_loader_line('image', src, container_key=ck, lazy=is_lazy))
     elif image.data.nbytes <= MAX_COPY_BYTES:
         np.save(folder / 'image.npy', np.asarray(image.data))
         manifest['image_path'] = 'image.npy'

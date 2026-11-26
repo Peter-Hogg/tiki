@@ -398,7 +398,7 @@ def test_ome_zarr_nd2_lif_and_hdf5_readers(tmp_path, monkeypatch):
     h5_path = tmp_path / 'movie.h5'
     h5_path.write_bytes(b'dummy')
     h5_data, h5_meta = io.read_hdf5(h5_path)
-    assert h5_data.shape == (5, 8, 8) and h5_meta['axes'].roles == 'TYX'
+    assert h5_data.shape == (5, 8, 8) and h5_meta['axes'].roles == 'TYX' and h5_meta['container_key'] == 'mov'
 
 
 def test_parse_ome_xml_greek_units_deltat_channels_and_instrument():
@@ -630,6 +630,7 @@ def test_scanimage_micromanager_czi_nd2_zarr_metadata(tmp_path, monkeypatch):
     z_path.mkdir()
     _, z_meta = io.read_zarr(z_path)
     assert z_meta['channel_names'] == ['Hoechst', 'AF488']
+    assert z_meta['container_key'] == '0'
     assert z_meta['axes'].scale == pytest.approx([1.0, 0.5, 0.5])
 
 
