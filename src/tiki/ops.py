@@ -79,10 +79,47 @@ MEASUREMENT_KEYS = [
 DEFAULT_MEASUREMENTS = {'Area', 'Mean', 'StdDev', 'Min', 'Max', 'IntDen', 'RawIntDen'}
 
 
+def _physical_contour_metrics(bin_mask: np.ndarray, sy: float, sx: float) -> tuple[float, float]:
+    """Compute ``(perimeter, max_feret)`` of a 2D binary mask in physical units."""
+    from scipy.spatial import ConvexHull
+    from scipy.spatial.distance import pdist
+    from skimage.measure import find_contours, regionprops
+
+    m = np.asarray(bin_mask, dtype=bool)
+    if not m.any():
+        return 0.0, 0.0
+    if abs(sy - sx) <= 1e-12 * max(sy, sx, 1.0):
+        reg = regionprops(m.astype(np.uint8))[0]
+        return float(reg.perimeter * sx), float(reg.feret_diameter_max * sx)
+
+    contours = find_contours(np.pad(m, 1).astype(np.uint8), 0.5)
+    if not contours:
+        return 0.0, float(max(sy, sx))
+    scale_yx = np.array([sy, sx], dtype=np.float64)
+    perim = 0.0
+    scaled_pts = []
+    for c in contours:
+        pts = (c - 1.0) * scale_yx
+        perim += float(np.linalg.norm(np.diff(pts, axis=0), axis=1).sum())
+        scaled_pts.append(pts)
+    all_pts = np.vstack(scaled_pts)
+    if len(all_pts) < 2:
+        feret = float(max(sy, sx))
+    elif len(all_pts) <= 64:
+        feret = float(pdist(all_pts).max())
+    else:
+        try:
+            hull = ConvexHull(all_pts)
+            feret = float(pdist(all_pts[hull.vertices]).max())
+        except Exception:
+            feret = float(pdist(all_pts).max())
+    return perim, feret
+
+
 def mask_stats(
     plane: np.ndarray,
     mask: np.ndarray | None,
-    pixel_area: float = 1.0,
+    pixel_area: float | None = None,
     scale: tuple[float, float] | None = None,
     include: set[str] | list[str] | None = None,
 ) -> dict:
@@ -90,7 +127,12 @@ def mask_stats(
     wanted = DEFAULT_MEASUREMENTS if include is None else set(include)
     values = plane[mask] if mask is not None else plane.ravel()
     values = np.asarray(values, dtype=np.float64)
-    sy, sx = (float(scale[0]), float(scale[1])) if scale is not None else (float(np.sqrt(pixel_area)), float(np.sqrt(pixel_area)))
+    if scale is not None:
+        sy, sx = float(scale[0]), float(scale[1])
+        px_area = float(pixel_area) if pixel_area is not None else sy * sx
+    else:
+        px_area = float(pixel_area) if pixel_area is not None else 1.0
+        sy = sx = float(np.sqrt(px_area))
 
     if values.size == 0:
         nan = float('nan')
@@ -115,7 +157,7 @@ def mask_stats(
             row['Solidity'] = nan
         return row
 
-    area = values.size * pixel_area
+    area = values.size * px_area
     mean = float(values.mean())
     row = {}
     if 'Area' in wanted:
@@ -140,26 +182,32 @@ def mask_stats(
         from skimage.measure import regionprops
 
         bin_mask = np.ones(plane.shape[:2], dtype=np.uint8) if mask is None else mask.astype(np.uint8)
-        props = regionprops(bin_mask)
+        iso = abs(sy - sx) <= 1e-12 * max(sy, sx, 1.0)
+        props = regionprops(bin_mask, spacing=(sy, sx)) if not iso else regionprops(bin_mask)
         if props:
             reg = props[0]
-            area_px = float(reg.area)
-            perim_px = float(reg.perimeter)
-            cy, cx = reg.centroid
             if 'Centroid' in wanted:
-                row['X'] = float(cx * sx)
-                row['Y'] = float(cy * sy)
+                cy, cx = reg.centroid
+                row['X'] = float(cx if not iso else cx * sx)
+                row['Y'] = float(cy if not iso else cy * sy)
+            perim_phys = None
+            feret_phys = None
+            if wanted & {'Perimeter', 'Circularity', 'Feret'}:
+                perim_phys, feret_phys = _physical_contour_metrics(bin_mask > 0, sy, sx)
             if 'Perimeter' in wanted:
-                row['Perim.'] = float(perim_px * sx)
+                row['Perim.'] = float(perim_phys)
             if 'Circularity' in wanted:
-                row['Circ.'] = float(min(1.0, 4 * np.pi * area_px / perim_px**2)) if perim_px > 0 else 1.0
+                row['Circ.'] = float(min(1.0, 4 * np.pi * area / perim_phys**2)) if perim_phys > 0 else 1.0
             if 'Feret' in wanted:
-                row['Feret'] = float(reg.feret_diameter_max * sx)
+                row['Feret'] = float(feret_phys)
             if 'AR' in wanted:
                 major, minor = reg.axis_major_length, reg.axis_minor_length
                 row['AR'] = float(major / minor) if minor > 0 else float('nan')
             if 'Solidity' in wanted:
-                row['Solidity'] = float(reg.solidity)
+                try:
+                    row['Solidity'] = float(reg.solidity)
+                except NotImplementedError:
+                    row['Solidity'] = float(regionprops(bin_mask)[0].solidity)
     return row
 
 
@@ -347,26 +395,40 @@ def particle_table(labels: np.ndarray, intensity: np.ndarray, scale=(1.0, 1.0)) 
             })
         return rows
     sy, sx = scale
-    for region in regionprops(labels, intensity):
+    iso = abs(sy - sx) <= 1e-12 * max(sy, sx, 1.0)
+    iterable = regionprops(labels, intensity) if iso else regionprops(labels, intensity, spacing=(sy, sx))
+    for region in iterable:
         vals = region.image_intensity[region.image].astype(np.float64)
-        area_px = float(region.area)
-        perim_px = float(region.perimeter)
+        area_px = float(region.image.sum())
+        area_phys = area_px * sy * sx
         cy, cx = region.centroid
         major, minor = region.axis_major_length, region.axis_minor_length
+        if iso:
+            perim_phys = float(region.perimeter) * sx
+            feret_phys = float(region.feret_diameter_max) * sx
+            x_val, y_val = float(cx * sx), float(cy * sy)
+        else:
+            perim_phys, feret_phys = _physical_contour_metrics(region.image, sy, sx)
+            x_val, y_val = float(cx), float(cy)
+        try:
+            sol = float(region.solidity)
+        except NotImplementedError:
+            sol = float(regionprops(region.image.astype(np.uint8))[0].solidity)
         rows.append({
             'Label': int(region.label),
-            'Area': area_px * sy * sx,
+            'Area': area_phys,
             'Mean': float(vals.mean()),
             'StdDev': float(vals.std(ddof=1)) if vals.size > 1 else 0.0,
             'Min': float(vals.min()),
             'Max': float(vals.max()),
-            'X': cx * sx,
-            'Y': cy * sy,
-            'Perim.': perim_px * sx,
-            'Circ.': min(1.0, 4 * np.pi * area_px / perim_px**2) if perim_px > 0 else 1.0,
+            'X': x_val,
+            'Y': y_val,
+            'Perim.': perim_phys,
+            'Circ.': min(1.0, 4 * np.pi * area_phys / perim_phys**2) if perim_phys > 0 else 1.0,
+            'Feret': feret_phys,
             'AR': major / minor if minor > 0 else float('nan'),
-            'Solidity': float(region.solidity),
-            'IntDen': area_px * sy * sx * float(vals.mean()),
+            'Solidity': sol,
+            'IntDen': area_phys * float(vals.mean()),
         })
     return rows
 
@@ -1755,3 +1817,438 @@ def stack_to_hyperstack(
     reshaped = data.reshape(new_shape)
     roles = ''.join(kept_roles) + 'YX'
     return reshaped, roles
+
+
+# -------------------------------------------- everyday image & stack commands
+
+def invert_image(data, rgb: bool = False, progress=None) -> np.ndarray:
+    """Invert intensity values (``max - x`` for unsigned int, ``min + max - x`` otherwise)."""
+    dtype = np.dtype(data.dtype)
+    is_uint = np.issubdtype(dtype, np.unsignedinteger)
+    is_int = np.issubdtype(dtype, np.integer)
+    spatial_end = data.ndim - 1 if rgb and data.ndim >= 3 else data.ndim
+    lead_shape = data.shape[: max(0, spatial_end - 2)]
+    combos = list(np.ndindex(*lead_shape)) if lead_shape else [()]
+
+    if is_uint:
+        hi_val = int(np.iinfo(dtype).max)
+        lo_val = 0
+        out_dtype = dtype
+    else:
+        lo_val = float('inf')
+        hi_val = float('-inf')
+        for idx in combos:
+            plane = np.asarray(data[idx], dtype=np.float64)
+            src = plane[..., :3] if rgb and plane.ndim == 3 else plane
+            finite = src[np.isfinite(src)]
+            if finite.size:
+                lo_val = min(lo_val, float(finite.min()))
+                hi_val = max(hi_val, float(finite.max()))
+        if not np.isfinite(lo_val):
+            lo_val, hi_val = 0.0, 0.0
+        out_dtype = dtype if not is_int else np.result_type(dtype, np.int64)
+
+    out = np.empty(data.shape, dtype=out_dtype)
+    for n, idx in enumerate(combos):
+        plane = np.asarray(data[idx])
+        if is_uint:
+            inv = (hi_val - plane.astype(np.int64)).astype(out_dtype) if not rgb else plane.copy()
+            if rgb:
+                c_end = 3 if plane.shape[-1] == 4 else plane.shape[-1]
+                inv[..., :c_end] = (hi_val - plane[..., :c_end].astype(np.int64)).astype(out_dtype)
+        else:
+            sum_hl = lo_val + hi_val
+            if rgb and plane.ndim == 3 and plane.shape[-1] == 4:
+                inv = plane.astype(out_dtype, copy=True)
+                inv[..., :3] = (sum_hl - plane[..., :3]).astype(out_dtype)
+            else:
+                inv = (sum_hl - plane).astype(out_dtype)
+        out[idx] = inv
+        if progress is not None and progress(n + 1, len(combos)) is False:
+            break
+    return out
+
+
+MATH_OPS = (
+    'Add',
+    'Subtract',
+    'Multiply',
+    'Divide',
+    'Min',
+    'Max',
+    'Gamma',
+    'Log',
+    'Exp',
+    'Square Root',
+    'Abs',
+    'Reciprocal',
+)
+UNARY_MATH_OPS = {'Log', 'Exp', 'Square Root', 'Abs', 'Reciprocal'}
+
+
+def math_op(data, op: str, value: float = 0.0, progress=None) -> np.ndarray:
+    """Apply an ImageJ Process > Math operation, returning float32 plane by plane."""
+    if op not in MATH_OPS:
+        raise ValueError(f'unknown math operation {op!r}')
+    val = float(value)
+    lead = data.shape[:-2]
+    combos = list(np.ndindex(*lead)) if lead else [()]
+
+    vmin, vmax = 0.0, 1.0
+    if op == 'Gamma':
+        lo, hi = float('inf'), float('-inf')
+        for idx in combos:
+            arr = np.asarray(data[idx], dtype=np.float64)
+            fin = arr[np.isfinite(arr)]
+            if fin.size:
+                lo = min(lo, float(fin.min()))
+                hi = max(hi, float(fin.max()))
+        if np.isfinite(lo) and hi > lo:
+            vmin, vmax = lo, hi
+
+    out = np.empty(data.shape, dtype=np.float32)
+    for n, idx in enumerate(combos):
+        p = np.asarray(data[idx], dtype=np.float32)
+        with np.errstate(divide='ignore', invalid='ignore', over='ignore'):
+            if op == 'Add':
+                res = p + np.float32(val)
+            elif op == 'Subtract':
+                res = p - np.float32(val)
+            elif op == 'Multiply':
+                res = p * np.float32(val)
+            elif op == 'Divide':
+                res = np.full_like(p, np.nan) if val == 0 else p / np.float32(val)
+            elif op == 'Min':
+                res = np.maximum(p, np.float32(val))
+            elif op == 'Max':
+                res = np.minimum(p, np.float32(val))
+            elif op == 'Gamma':
+                span = vmax - vmin
+                if span > 0:
+                    norm = np.clip((p.astype(np.float64) - vmin) / span, 0.0, 1.0)
+                    res = (vmin + (norm ** val) * span).astype(np.float32)
+                else:
+                    res = p.copy()
+            elif op == 'Log':
+                res = np.where(p > 0, np.log(p), np.nan)
+            elif op == 'Exp':
+                res = np.exp(p)
+            elif op == 'Square Root':
+                res = np.where(p >= 0, np.sqrt(p), np.nan)
+            elif op == 'Abs':
+                res = np.abs(p)
+            elif op == 'Reciprocal':
+                res = np.where(p != 0, 1.0 / p, np.nan)
+        out[idx] = res.astype(np.float32, copy=False)
+        if progress is not None and progress(n + 1, len(combos)) is False:
+            break
+    return out
+
+
+def resize_image(
+    data,
+    shape_yx: tuple[int, int],
+    order: int = 1,
+    rgb: bool = False,
+    progress=None,
+) -> np.ndarray:
+    """Resize spatial ``(Y, X)`` axes to ``shape_yx`` plane by plane."""
+    from skimage.transform import resize
+
+    new_h, new_w = int(shape_yx[0]), int(shape_yx[1])
+    if new_h < 1 or new_w < 1:
+        raise ValueError('target dimensions must be >= 1')
+    spatial_end = data.ndim - 1 if rgb and data.ndim >= 3 else data.ndim
+    old_h, old_w = data.shape[spatial_end - 2], data.shape[spatial_end - 1]
+    lead_shape = data.shape[: max(0, spatial_end - 2)]
+    tail_shape = (new_h, new_w) + ((data.shape[-1],) if rgb and data.ndim >= 3 else ())
+    src_dtype = np.dtype(data.dtype)
+    is_int = np.issubdtype(src_dtype, np.integer)
+    out_dtype = src_dtype if is_int else np.float32
+    anti_aliasing = int(order) > 0 and (new_h < old_h or new_w < old_w)
+
+    def _resize_plane(plane: np.ndarray) -> np.ndarray:
+        target = (new_h, new_w, plane.shape[-1]) if rgb and plane.ndim == 3 else (new_h, new_w)
+        res = resize(
+            np.asarray(plane, dtype=np.float64),
+            target,
+            order=int(order),
+            mode='edge',
+            anti_aliasing=anti_aliasing,
+            preserve_range=True,
+        )
+        if is_int:
+            ii = np.iinfo(src_dtype)
+            return np.clip(np.round(res), ii.min, ii.max).astype(src_dtype)
+        return res.astype(np.float32)
+
+    if not lead_shape:
+        return _resize_plane(np.asarray(data))
+
+    combos = list(np.ndindex(*lead_shape))
+    out = np.empty(lead_shape + tail_shape, dtype=out_dtype)
+    for n, idx in enumerate(combos):
+        out[idx] = _resize_plane(np.asarray(data[idx]))
+        if progress is not None and progress(n + 1, len(combos)) is False:
+            break
+    return out
+
+
+def _disk_footprint(radius: float) -> np.ndarray | None:
+    from skimage.morphology import disk
+
+    r = max(int(round(radius)), 0)
+    return disk(r) if r > 0 else None
+
+
+def _ellipsoid_footprint(radius: float, z_ratio: float) -> np.ndarray | None:
+    r = max(int(round(radius)), 0)
+    if r == 0:
+        return None
+    rz = max(0, int(round(radius * z_ratio)))
+    zz, yy, xx = np.ogrid[-rz : rz + 1, -r : r + 1, -r : r + 1]
+    return ((xx / r) ** 2 + (yy / r) ** 2 + ((zz / rz) ** 2 if rz else zz.astype(float) * 0)) <= 1
+
+
+def mean_filter(plane: np.ndarray, radius: float) -> np.ndarray:
+    """Mean over a circular disk of ``radius`` pixels."""
+    from scipy.ndimage import correlate
+
+    fp = _disk_footprint(radius)
+    img = np.asarray(plane, dtype=np.float32)
+    if fp is None:
+        return img.copy()
+    kernel = fp.astype(np.float32) / float(fp.sum())
+    return correlate(img, kernel, mode='nearest')
+
+
+def mean_3d(volume: np.ndarray, radius: float, z_ratio: float) -> np.ndarray:
+    """Mean over an anisotropic 3D ellipsoid of ``radius`` XY pixels."""
+    from scipy.ndimage import correlate
+
+    fp = _ellipsoid_footprint(radius, z_ratio)
+    img = np.asarray(volume, dtype=np.float32)
+    if fp is None:
+        return img.copy()
+    kernel = fp.astype(np.float32) / float(fp.sum())
+    return correlate(img, kernel, mode='nearest')
+
+
+def minimum_filter(plane: np.ndarray, radius: float) -> np.ndarray:
+    """Minimum over a circular disk of ``radius`` pixels."""
+    from scipy.ndimage import minimum_filter as _min
+
+    fp = _disk_footprint(radius)
+    arr = np.asarray(plane)
+    return arr.copy() if fp is None else _min(arr, footprint=fp)
+
+
+def minimum_3d(volume: np.ndarray, radius: float, z_ratio: float) -> np.ndarray:
+    """Minimum over an anisotropic 3D ellipsoid."""
+    from scipy.ndimage import minimum_filter as _min
+
+    fp = _ellipsoid_footprint(radius, z_ratio)
+    arr = np.asarray(volume)
+    return arr.copy() if fp is None else _min(arr, footprint=fp)
+
+
+def maximum_filter(plane: np.ndarray, radius: float) -> np.ndarray:
+    """Maximum over a circular disk of ``radius`` pixels."""
+    from scipy.ndimage import maximum_filter as _max
+
+    fp = _disk_footprint(radius)
+    arr = np.asarray(plane)
+    return arr.copy() if fp is None else _max(arr, footprint=fp)
+
+
+def maximum_3d(volume: np.ndarray, radius: float, z_ratio: float) -> np.ndarray:
+    """Maximum over an anisotropic 3D ellipsoid."""
+    from scipy.ndimage import maximum_filter as _max
+
+    fp = _ellipsoid_footprint(radius, z_ratio)
+    arr = np.asarray(volume)
+    return arr.copy() if fp is None else _max(arr, footprint=fp)
+
+
+def unsharp_mask(plane: np.ndarray, sigma: float = 2.0, weight: float = 0.6) -> np.ndarray:
+    """ImageJ-style Unsharp Mask: ``(img - weight * blur) / (1 - weight)``."""
+    w = float(np.clip(weight, 0.0, 0.99))
+    img = np.asarray(plane, dtype=np.float32)
+    blur = gaussian_blur(img, sigma)
+    return ((img - np.float32(w) * blur) / np.float32(1.0 - w)).astype(np.float32)
+
+
+def unsharp_mask_3d(volume: np.ndarray, sigma: float, z_ratio: float, weight: float = 0.6) -> np.ndarray:
+    """3D anisotropic Unsharp Mask."""
+    w = float(np.clip(weight, 0.0, 0.99))
+    img = np.asarray(volume, dtype=np.float32)
+    blur = gaussian_3d(img, sigma, z_ratio)
+    return ((img - np.float32(w) * blur) / np.float32(1.0 - w)).astype(np.float32)
+
+
+def find_edges(plane: np.ndarray) -> np.ndarray:
+    """Sobel edge magnitude of a 2D plane."""
+    from skimage.filters import sobel
+
+    return sobel(np.asarray(plane, dtype=np.float32)).astype(np.float32)
+
+
+def morphology_labels(
+    labels: np.ndarray,
+    op: str = 'open',
+    radius: float = 1.0,
+    z_ratio: float = 1.0,
+) -> np.ndarray:
+    """Binary or per-label morphological ``erode``, ``dilate``, ``open``, or ``close``."""
+    from scipy.ndimage import (
+        binary_closing,
+        binary_dilation,
+        binary_erosion,
+        binary_opening,
+        distance_transform_edt,
+    )
+    from skimage.measure import regionprops
+
+    key = op.lower().strip()
+    if key not in ('erode', 'dilate', 'open', 'close'):
+        raise ValueError(f'unknown morphology operation {op!r}')
+
+    arr = np.asarray(labels)
+    r = max(int(round(radius)), 0)
+    if arr.size == 0 or arr.max() == 0 or r == 0:
+        return arr.copy()
+
+    fp = _ellipsoid_footprint(radius, z_ratio) if arr.ndim == 3 else _disk_footprint(radius)
+    if fp is None:
+        return arr.copy()
+
+    if arr.min() >= 0 and arr.max() <= 1:
+        fn = {
+            'erode': binary_erosion,
+            'dilate': binary_dilation,
+            'open': binary_opening,
+            'close': binary_closing,
+        }[key]
+        res = fn(arr > 0, structure=fp)
+        return res.astype(arr.dtype if np.issubdtype(arr.dtype, np.integer) else np.uint8)
+
+    if key == 'dilate':
+        z_ratio = max(float(z_ratio), 1e-6)
+        sampling = (1.0 / z_ratio, 1.0, 1.0) if arr.ndim == 3 else (1.0, 1.0)
+        dist, idx = distance_transform_edt(arr == 0, sampling=sampling, return_indices=True)
+        grow = (arr == 0) & (dist <= float(radius))
+        out = arr.astype(np.int32, copy=True)
+        out[grow] = arr[tuple(c[grow] for c in idx)]
+        return out
+
+    bin_fn = {'erode': binary_erosion, 'open': binary_opening, 'close': binary_closing}[key]
+    out = np.zeros(arr.shape, dtype=np.int32)
+    pads = [max(1, s // 2) for s in fp.shape]
+    for region in regionprops(arr.astype(np.int32, copy=False)):
+        lid = int(region.label)
+        sl = tuple(
+            slice(max(0, s.start - p), min(dim, s.stop + p))
+            for s, p, dim in zip(region.slice, pads, arr.shape)
+        )
+        sub = arr[sl] == lid
+        res = bin_fn(sub, structure=fp)
+        view = out[sl]
+        if key == 'close':
+            orig_sub = arr[sl]
+            write_mask = res & ((orig_sub == 0) | (orig_sub == lid)) & (view == 0)
+            view[write_mask] = lid
+        else:
+            view[res] = lid
+    return out
+
+
+def concatenate_stacks(arrays: list, axis: int = 0) -> np.ndarray:
+    """Concatenate 2 or more arrays along ``axis`` (or stack 2D planes along new axis 0)."""
+    if len(arrays) < 2:
+        raise ValueError('need at least two images to concatenate')
+    ndims = {a.ndim for a in arrays}
+    if len(ndims) != 1:
+        raise ValueError(f'images must have the same number of dimensions (got {sorted(ndims)})')
+    out_dtype = np.result_type(*(a.dtype for a in arrays))
+    if arrays[0].ndim == 2:
+        ref = arrays[0].shape
+        for a in arrays[1:]:
+            if a.shape != ref:
+                raise ValueError(f'shapes {ref} and {a.shape} do not match')
+        out = np.empty((len(arrays),) + ref, dtype=out_dtype)
+        for i, a in enumerate(arrays):
+            out[i] = np.asarray(a, dtype=out_dtype)
+        return out
+
+    ax = int(axis) % arrays[0].ndim
+    ref_other = arrays[0].shape[:ax] + arrays[0].shape[ax + 1 :]
+    for a in arrays[1:]:
+        other = a.shape[:ax] + a.shape[ax + 1 :]
+        if other != ref_other:
+            raise ValueError(f'non-concatenated shapes must match: {arrays[0].shape} vs {a.shape}')
+    total = sum(a.shape[ax] for a in arrays)
+    out_shape = arrays[0].shape[:ax] + (total,) + arrays[0].shape[ax + 1 :]
+    out = np.empty(out_shape, dtype=out_dtype)
+    pos = 0
+    for a in arrays:
+        n = a.shape[ax]
+        sl = [slice(None)] * out.ndim
+        sl[ax] = slice(pos, pos + n)
+        out[tuple(sl)] = np.asarray(a, dtype=out_dtype)
+        pos += n
+    return out
+
+
+def images_to_stack(arrays: list) -> np.ndarray:
+    """Stack 2 or more matching-shape arrays along a new leading axis 0."""
+    if len(arrays) < 2:
+        raise ValueError('need at least two images to create a stack')
+    ref = arrays[0].shape
+    for a in arrays[1:]:
+        if a.shape != ref:
+            raise ValueError(f'all images must have shape {ref} (got {a.shape})')
+    out_dtype = np.result_type(*(a.dtype for a in arrays))
+    out = np.empty((len(arrays),) + ref, dtype=out_dtype)
+    for i, a in enumerate(arrays):
+        out[i] = np.asarray(a, dtype=out_dtype)
+    return out
+
+
+def reverse_stack(data, axis: int = 0):
+    """Reverse slice order along ``axis`` (preserves Dask laziness when applicable)."""
+    ax = int(axis) % data.ndim
+    if ax >= data.ndim - 2:
+        raise ValueError('cannot reverse a spatial axis; choose a stack axis')
+    if hasattr(data, 'compute'):
+        import dask.array as da
+
+        return da.flip(data, axis=ax)
+    return np.ascontiguousarray(np.flip(np.asarray(data), axis=ax))
+
+
+def remove_slices(data, axis: int, spec: str, rgb: bool = False):
+    """Remove slices specified by 1-based ``spec`` along ``axis``."""
+    spatial_end = data.ndim - 1 if rgb and data.ndim >= 3 else data.ndim
+    ax = int(axis) % spatial_end
+    if ax >= spatial_end - 2:
+        raise ValueError(f'axis {axis} is not a stack axis')
+    size = data.shape[ax]
+    parsed = parse_slice_spec(spec, size)
+    if isinstance(parsed, slice):
+        removed = set(range(*parsed.indices(size)))
+    else:
+        removed = set(int(i) for i in parsed.tolist())
+    keep = [i for i in range(size) if i not in removed]
+    if not keep:
+        raise ValueError('cannot remove all slices from the stack')
+    res, _, _ = substack(data, specs={ax: np.asarray(keep, dtype=int)}, squeeze_single=False, rgb=rgb)
+    return res
+
+
+def hyperstack_to_stack(data, rgb: bool = False):
+    """Flatten all leading axes of a hyperstack into a single stack axis ``(N, Y, X[, C])``."""
+    spatial_ndim = 3 if rgb else 2
+    if data.ndim <= spatial_ndim + 1:
+        return data
+    n_total = int(np.prod(data.shape[:-spatial_ndim]))
+    return data.reshape((n_total,) + data.shape[-spatial_ndim:])

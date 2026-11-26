@@ -20,9 +20,13 @@ from qtpy.QtWidgets import (
     QDoubleSpinBox,
     QFileDialog,
     QFormLayout,
+    QHBoxLayout,
     QLabel,
     QLineEdit,
+    QListWidget,
+    QListWidgetItem,
     QMessageBox,
+    QPushButton,
     QSpinBox,
     QWidget,
 )
@@ -257,13 +261,22 @@ def bleach_dialog(tiki) -> Image | None:
     if not _confirm_size(tiki, image.data.shape, 'Bleach Correction'):
         return None
     axis = axis_box.currentData()
+    ax_info = axes_mod.get(image)
+    ax_meta = ax_info.axes[axis]
     with tiki.progress('Bleach Correction', image.data.shape[axis]) as tick:
         try:
             corrected, info = ops.bleach_correct(image.data, axis, method.currentData(), background.value(),
                                                  progress=tick)
         except ValueError as exc:
             means = [float(np.mean(np.take(image.data, k, axis=axis))) for k in range(image.data.shape[axis])]
-            _plot_bleach(tiki, image.name, {'means': np.asarray(means)}, axes_mod.get(image).labels[axis])
+            _plot_bleach(
+                tiki,
+                image.name,
+                {'means': np.asarray(means)},
+                ax_info.labels[axis],
+                step=ax_meta.step,
+                unit=ax_meta.unit,
+            )
             _error(str(exc))
     if tick.cancelled:
         tiki.status('Bleach correction cancelled')
@@ -272,22 +285,23 @@ def bleach_dialog(tiki) -> Image | None:
     layer = _add_result(tiki, viewer, image, corrected, f'{image.name} bleach-corrected', image.colormap, (lo, hi))
     msg = f'Bleach correction ({method.currentText().lower()}) → "{layer.name}"'
     if 'tau_frames' in info:
-        step = axes_mod.get(image).axes[axis]
         tau = info['tau_frames']
-        msg += f'; τ = {tau:.3g} frames' + (f' = {tau * step.step:.3g} {step.unit}' if step.step else '')
+        msg += f'; τ = {tau:.3g} frames' + (f' = {tau * ax_meta.step:.3g} {ax_meta.unit}' if ax_meta.step else '')
         msg += f' (fit R² = {info["r2"]:.3f})'
     tiki.status(msg)
-    _plot_bleach(tiki, image.name, info, axes_mod.get(image).labels[axis])
+    _plot_bleach(tiki, image.name, info, ax_info.labels[axis], step=ax_meta.step, unit=ax_meta.unit)
     return layer
 
 
-def _plot_bleach(tiki, name, info, xlabel):
+def _plot_bleach(tiki, name, info, xlabel, step: float | None = None, unit: str | None = None):
     from .widgets import PlotWindow
 
-    win = PlotWindow(f'Bleaching — {name}', np.arange(len(info['means'])), info['means'], xlabel,
-                     'mean intensity')
+    scale_x = float(step) if (step and step > 0) else 1.0
+    x = np.arange(len(info['means'])) * scale_x
+    label_x = f'{xlabel} ({unit})' if (step and unit) else xlabel
+    win = PlotWindow(f'Bleaching — {name}', x, info['means'], label_x, 'mean intensity')
     if 'fit' in info:
-        win.add_line(np.arange(len(info['fit'])), info['fit'], 'exponential fit')
+        win.add_line(x, info['fit'], 'exponential fit')
     tiki.keep_window(win)
     win.show()
 
@@ -327,11 +341,25 @@ def kymograph_dialog(tiki):
         kymo = ops.kymograph(data, axis, index, current[0], width.value(), progress=tick)
     if tick.cancelled:
         return None
-    a, y = info.axes[axis], info.axes[-1]
+    a, y, x_ax = info.axes[axis], info.axes[-2], info.axes[-1]
     rows = f'{info.labels[axis]}' + (f', 1 px = {a.step:g} {a.unit}' if a.step else '')
-    cols = 'distance' + (f', 1 px = {y.step:g} {y.unit}' if y.step else '')
-    k_info = axes_mod.AxesInfo([axes_mod.Axis('Y', kymo.shape[0]), axes_mod.Axis('X', kymo.shape[1])],
-                               'kymograph', True, [f'rows: {rows}; columns: {cols}'])
+    cols = 'distance' + (f', 1 px = {x_ax.step:g} {x_ax.unit}' if x_ax.step else '')
+    k_y_step = None
+    k_y_unit = None
+    if a.role == 'Z' and a.step:
+        k_y_unit = x_ax.unit or y.unit or a.unit
+        k_y_step = axes_mod.convert_unit(a.step, a.unit, k_y_unit) if (a.unit and k_y_unit) else float(a.step)
+    k_x_step = x_ax.step if x_ax.step else None
+    k_x_unit = x_ax.unit if x_ax.step else None
+    k_info = axes_mod.AxesInfo(
+        [
+            axes_mod.Axis('Y', kymo.shape[0], k_y_step, k_y_unit if k_y_step else None),
+            axes_mod.Axis('X', kymo.shape[1], k_x_step, k_x_unit),
+        ],
+        'kymograph',
+        True,
+        [f'rows: {rows}; columns: {cols}'],
+    )
     new = tiki.open_data(kymo, f'Kymo_{image.name}', axes=k_info)
     tiki.status(f'Kymograph: rows = {rows}; columns = {cols}')
     return new
@@ -391,6 +419,16 @@ def calculator_dialog(tiki):
 
 # --------------------------------------------------------------- set scale
 
+def _xy_step_info(image) -> tuple[float, str | None]:
+    info = axes_mod.get(image)
+    u = axes_mod.spatial_unit(info)
+    if not u:
+        return 1.0, None
+    sy = float(info.axes[-2].step or 1.0)
+    sx = float(info.axes[-1].step or sy)
+    return 0.5 * (sy + sx), u
+
+
 def set_scale_dialog(tiki):
     viewer, image = tiki.require_image()
     current = tiki.current_roi(viewer)
@@ -400,40 +438,108 @@ def set_scale_dialog(tiki):
         pixels = float(np.linalg.norm(np.diff(verts, axis=0), axis=1).sum())
     info = axes_mod.get(image)
     y = info.axes[info.index('Y')]
+    x_ax = info.axes[info.index('X')]
+    cur_aspect = (float(y.step) / float(x_ax.step)) if (y.step and x_ax.step and x_ax.step > 0) else 1.0
+
     dlg, form = _form(tiki, 'Set Scale')
     dist_px = QDoubleSpinBox(decimals=2, minimum=0, maximum=1e9, value=pixels)
     known = QDoubleSpinBox(decimals=4, minimum=0, maximum=1e9, value=(pixels * y.step) if y.step and pixels else 0)
+    aspect = QDoubleSpinBox(decimals=4, minimum=0.001, maximum=1000.0, value=cur_aspect)
+    aspect.setToolTip('Ratio of Y pixel size to X pixel size (1.0 for square pixels)')
     unit = QComboBox()
     unit.setEditable(True)
     unit.addItems(['µm', 'nm', 'mm'])
     if y.unit:
         unit.setCurrentText(y.unit)
-    form.addRow('Distance in pixels:', dist_px)
-    form.addRow('Known distance:', known)
-    form.addRow('Unit:', unit)
+    global_box = QCheckBox('Global (apply to all open windows)')
+    summary = QLabel('')
     hint = QLabel('Draw a line across a feature of known length first to fill in the pixels.'
                   if not pixels else f'From the current line: {pixels:.2f} px')
     hint.setWordWrap(True)
+
+    form.addRow('Distance in pixels:', dist_px)
+    form.addRow('Known distance:', known)
+    form.addRow('Pixel aspect ratio (Y/X):', aspect)
+    form.addRow('Unit:', unit)
+    form.addRow(global_box)
+    form.addRow(summary)
     form.addRow(hint)
-    buttons = _buttons(dlg, form)
+
+    btn_row = QHBoxLayout()
+    remove_btn = QPushButton('Remove Scale')
+    buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+    buttons.accepted.connect(dlg.accept)
+    buttons.rejected.connect(dlg.reject)
+    btn_row.addWidget(remove_btn)
+    btn_row.addWidget(buttons)
+    form.addRow(btn_row)
+
+    removed = {'flag': False}
+
+    def _on_remove():
+        removed['flag'] = True
+        dlg.accept()
+
+    remove_btn.clicked.connect(_on_remove)
 
     def validate(_=None):
-        buttons.button(QDialogButtonBox.Ok).setEnabled(dist_px.value() > 0 and known.value() > 0)
+        ok = dist_px.value() > 0 and known.value() > 0
+        buttons.button(QDialogButtonBox.Ok).setEnabled(ok)
+        if ok:
+            sx_val = known.value() / dist_px.value()
+            u_val = unit.currentText() or 'µm'
+            summary.setText(f'Scale: {1 / sx_val:.4g} px/{u_val} ({sx_val:.4g} {u_val}/px)')
+        else:
+            summary.setText('')
 
     dist_px.valueChanged.connect(validate)
     known.valueChanged.connect(validate)
+    aspect.valueChanged.connect(validate)
+    unit.currentTextChanged.connect(validate)
     validate()
     if dlg.exec_() != QDialog.Accepted:
         return None
-    step = known.value() / dist_px.value()
-    for r in 'YX':
-        a = info.axes[info.index(r)]
-        a.step, a.unit = step, unit.currentText()
-    info.source, info.confident = 'set by you', True
-    axes_mod.apply(viewer, image, info)
-    viewer.reset_view()
-    tiki.status(f'Scale: {1 / step:.4g} pixels per {unit.currentText()} ({step:.4g} {unit.currentText()}/pixel)')
-    return step
+
+    targets = (
+        [
+            (v, ly)
+            for v in tiki.windows.viewers
+            for ly in v.layers
+            if isinstance(ly, Image) and ly.name not in roi_mod.PREVIEW_NAMES
+        ]
+        if global_box.isChecked()
+        else [(viewer, image)]
+    )
+
+    if removed['flag']:
+        for v, ly in targets:
+            ly_info = axes_mod.get(ly)
+            for r in 'YX':
+                idx = ly_info.index(r)
+                if idx is not None:
+                    ly_info.axes[idx].step = None
+                    ly_info.axes[idx].unit = None
+            ly_info.source, ly_info.confident = 'uncalibrated', True
+            axes_mod.apply(v, ly, ly_info)
+            v.reset_view()
+        tiki.status('Scale removed')
+        return 0.0
+
+    sx_step = known.value() / dist_px.value()
+    sy_step = sx_step * aspect.value()
+    u_txt = unit.currentText() or 'µm'
+    for v, ly in targets:
+        ly_info = axes_mod.get(ly)
+        y_i, x_i = ly_info.index('Y'), ly_info.index('X')
+        if y_i is not None:
+            ly_info.axes[y_i].step, ly_info.axes[y_i].unit = sy_step, u_txt
+        if x_i is not None:
+            ly_info.axes[x_i].step, ly_info.axes[x_i].unit = sx_step, u_txt
+        ly_info.source, ly_info.confident = 'set by you', True
+        axes_mod.apply(v, ly, ly_info)
+        v.reset_view()
+    tiki.status(f'Scale: {1 / sx_step:.4g} pixels per {u_txt} ({sx_step:.4g} {u_txt}/pixel)')
+    return sx_step
 
 
 # ------------------------------------------------------ duplicate & substack
@@ -848,10 +954,14 @@ def motion_correct_dialog(tiki):
     unit = y_ax.unit if y_ax.step and y_ax.unit else 'px'
     scale_y = float(src.scale[-2]) if y_ax.step else 1.0
     scale_x = float(src.scale[-1]) if src_info.axes[src_info.index('X')].step else 1.0
-    x_vals = np.arange(n_t)
+    ax_obj = src_info.axes[ax]
+    x_step = float(ax_obj.step) if (ax_obj.step and ax_obj.step > 0) else 1.0
+    x_unit = ax_obj.unit if (ax_obj.step and ax_obj.unit) else None
+    x_vals = np.arange(n_t) * x_step
+    x_label = f'{src_info.labels[ax]} ({x_unit})' if x_unit else src_info.labels[ax]
     dy_vals = shifts[:, 0] * scale_y
     dx_vals = shifts[:, 1] * scale_x
-    plot = PlotWindow(f'Motion shifts — {src.name}', x_vals, dy_vals, src_info.labels[ax], f'shift ({unit})')
+    plot = PlotWindow(f'Motion shifts — {src.name}', x_vals, dy_vals, x_label, f'shift ({unit})')
     plot.ax.lines[0].set_label('dy')
     plot.add_line(x_vals, dx_vals, 'dx')
     tiki.keep_window(plot)
@@ -914,6 +1024,7 @@ class WatershedDialog(QDialog):
         self.min_dist = QDoubleSpinBox(decimals=1, minimum=1.0, maximum=500.0, singleStep=1.0, value=5.0)
         self.min_dist.setSuffix(' px')
         self.min_dist.setKeyboardTracking(False)
+        self.phys_label = QLabel('')
         self.fill_holes = QCheckBox('Fill holes before splitting', checked=True)
         self.show_preview = QCheckBox('Preview (current slice)', checked=True)
 
@@ -921,6 +1032,7 @@ class WatershedDialog(QDialog):
         form.addRow('Apply to:', self.scope)
         form.addRow(self.three_d)
         form.addRow('Min peak distance:', self.min_dist)
+        form.addRow('', self.phys_label)
         form.addRow(self.fill_holes)
         form.addRow(self.show_preview)
         buttons = _buttons(self, form)
@@ -937,6 +1049,19 @@ class WatershedDialog(QDialog):
 
         self._update_options()
         self.update_preview()
+
+    def _update_phys_label(self) -> None:
+        if self.layer is None:
+            self.phys_label.setText('')
+            return
+        info = _labels_info(self.viewer, self.layer)
+        u = axes_mod.spatial_unit(info)
+        if not u:
+            self.phys_label.setText('')
+            return
+        sy = float(info.axes[-2].step or 1.0)
+        sx = float(info.axes[-1].step or sy)
+        self.phys_label.setText(f'≈ {self.min_dist.value() * 0.5 * (sy + sx):.4g} {u}')
 
     def _update_options(self) -> None:
         self._ok.setEnabled(self.layer is not None)
@@ -956,6 +1081,7 @@ class WatershedDialog(QDialog):
         self.scope.setVisible(self.has_stack)
         self.three_d.setVisible(self.has_z)
         self._update_3d_enabled()
+        self._update_phys_label()
 
     def _update_3d_enabled(self) -> None:
         self.three_d.setEnabled(self.has_z and self.scope_key() != nd.PLANE)
@@ -975,6 +1101,7 @@ class WatershedDialog(QDialog):
         self.schedule()
 
     def schedule(self, event=None) -> None:
+        self._update_phys_label()
         if self.show_preview.isChecked():
             self._timer.start()
 
@@ -1123,7 +1250,17 @@ def enlarge_dialog(tiki):
     dist = QDoubleSpinBox(decimals=1, minimum=-500.0, maximum=500.0, singleStep=1.0, value=5.0)
     dist.setSuffix(' px')
     dist.setToolTip('Positive values enlarge the selection; negative values shrink it')
+    phys = QLabel('')
+    step_xy, u = _xy_step_info(image)
+
+    def _sync_phys(_=None):
+        phys.setText(f'≈ {dist.value() * step_xy:+g} {u}' if u else '')
+
+    dist.valueChanged.connect(_sync_phys)
+    _sync_phys()
     form.addRow('Enlarge by:', dist)
+    if u:
+        form.addRow('', phys)
     _buttons(dlg, form)
     if dlg.exec_() != QDialog.Accepted:
         return None
@@ -1149,8 +1286,22 @@ def make_band_dialog(tiki):
     gap = QDoubleSpinBox(decimals=1, minimum=0.0, maximum=200.0, singleStep=1.0, value=0.0)
     gap.setSuffix(' px')
     gap.setToolTip('Optional gap between the ROI boundary and the inner edge of the band')
+    phys = QLabel('')
+    step_xy, u = _xy_step_info(image)
+
+    def _sync_phys(_=None):
+        if u:
+            phys.setText(f'width ≈ {width.value() * step_xy:.4g} {u}, gap ≈ {gap.value() * step_xy:.4g} {u}')
+        else:
+            phys.setText('')
+
+    width.valueChanged.connect(_sync_phys)
+    gap.valueChanged.connect(_sync_phys)
+    _sync_phys()
     form.addRow('Band width:', width)
     form.addRow('Gap from ROI:', gap)
+    if u:
+        form.addRow('', phys)
     _buttons(dlg, form)
     if dlg.exec_() != QDialog.Accepted:
         return None
@@ -1362,4 +1513,761 @@ def stack_to_hyperstack_dialog(tiki):
     if split_box.isChecked() and c > 1 and not image.rgb:
         tiki.split_channels()
     tiki.status(f'Hyperstack {roles}: {c} ch × {z} z × {t} t ({order})')
+    return v
+
+
+# ------------------------------------ everyday image & stack commands
+
+def math_dialog(tiki):
+    """``Process ▸ Math…``: scalar arithmetic and unary transforms (32-bit float result)."""
+    from .layer_select import LayerCombo
+
+    viewer, image = tiki.require_image()
+    if image.rgb:
+        _error('Process ▸ Math works on greyscale images (split channels or convert first)')
+    dlg, form = _form(tiki, 'Math')
+    image_box = LayerCombo(viewer, Image, current=image)
+    op_box = QComboBox()
+    op_box.addItems(list(ops.MATH_OPS))
+    val_spin = QDoubleSpinBox(decimals=4, minimum=-1e9, maximum=1e9, value=1.0)
+    whole = QCheckBox('Process whole stack', checked=True)
+
+    form.addRow('Image:', image_box)
+    form.addRow('Operation:', op_box)
+    form.addRow('Value:', val_spin)
+    form.addRow(whole)
+    _buttons(dlg, form)
+
+    def _sync(_=None):
+        op_name = op_box.currentText()
+        val_spin.setEnabled(op_name not in ops.UNARY_MATH_OPS)
+        img = image_box.layer()
+        has_stack = img is not None and img.ndim > 2
+        whole.setVisible(has_stack)
+        if has_stack:
+            n = int(np.prod(img.data.shape[: img.ndim - 2]))
+            whole.setText(f'Process whole stack ({n} planes)')
+
+    op_box.currentTextChanged.connect(_sync)
+    image_box.layer_changed.connect(_sync)
+    _sync()
+
+    if dlg.exec_() != QDialog.Accepted:
+        return None
+    img = image_box.layer()
+    if img is None:
+        return None
+    if img.rgb:
+        _error('Process ▸ Math works on greyscale images')
+    op_name = op_box.currentText()
+    val = val_spin.value()
+    use_stack = img.ndim > 2 and whole.isChecked()
+    if use_stack:
+        if not _confirm_size(tiki, img.data.shape, f'Math ({op_name})'):
+            return None
+        total = int(np.prod(img.data.shape[: img.ndim - 2]))
+        with tiki.progress(f'Math ({op_name})', total) as tick:
+            out = ops.math_op(img.data, op_name, val, progress=tick)
+        if tick.cancelled:
+            return None
+        axes_out = axes_mod.fit(axes_mod.get(img), out.shape)
+        drop = None
+    else:
+        plane = roi_mod.current_plane(viewer, img)
+        out = ops.math_op(plane, op_name, val)
+        axes_out = axes_mod.fit(
+            axes_mod.AxesInfo(axes_mod.get(img).axes[-2:], axes_mod.get(img).source, True),
+            out.shape,
+        )
+        drop = None
+
+    finite = out[np.isfinite(out)]
+    lo, hi = ops.saturated_limits(finite if out.ndim == 2 else out[(0,) * (out.ndim - 2)])
+    suffix = op_name if op_name in ops.UNARY_MATH_OPS else f'{op_name} {val:g}'
+    if out.ndim == img.ndim:
+        layer = _add_result(tiki, viewer, img, out, f'{img.name} ({suffix})', img.colormap, (lo, hi), axes=axes_out, drop=drop)
+    else:
+        layer = Image(
+            out,
+            name=f'{img.name} ({suffix})',
+            colormap=img.colormap,
+            contrast_limits=(lo, hi),
+            metadata={'axes': axes_out.to_dict()},
+            **axes_mod.geometry(img, ndim=2),
+        )
+        viewer.add_layer(layer)
+        tiki.reapply_tool(viewer)
+    tiki.status(f'Math ({suffix}) → "{layer.name}"')
+    return layer
+
+
+def resize_dialog(tiki):
+    """``Image ▸ Adjust ▸ Size…``: resize spatial X/Y and update physical pixel size."""
+    from .layer_select import LayerCombo
+
+    viewer, image = tiki.require_image()
+    dlg, form = _form(tiki, 'Resize (Size)')
+    image_box = LayerCombo(viewer, Image, current=image)
+    x_scale = QDoubleSpinBox(decimals=4, minimum=0.01, maximum=100.0, singleStep=0.1, value=1.0)
+    y_scale = QDoubleSpinBox(decimals=4, minimum=0.01, maximum=100.0, singleStep=0.1, value=1.0)
+    w_spin = QSpinBox(minimum=1, maximum=32768, suffix=' px')
+    h_spin = QSpinBox(minimum=1, maximum=32768, suffix=' px')
+    constrain = QCheckBox('Constrain aspect ratio', checked=True)
+    interp = QComboBox()
+    interp.addItem('Bilinear', 1)
+    interp.addItem('Bicubic', 3)
+    interp.addItem('Nearest neighbor', 0)
+
+    form.addRow('Image:', image_box)
+    form.addRow('X scale:', x_scale)
+    form.addRow('Y scale:', y_scale)
+    form.addRow('Width:', w_spin)
+    form.addRow('Height:', h_spin)
+    form.addRow(constrain)
+    form.addRow('Interpolation:', interp)
+    _buttons(dlg, form)
+
+    state = {'busy': False, 'h': 1, 'w': 1}
+
+    def _init_dims(_=None):
+        img = image_box.layer()
+        if img is None:
+            return
+        h, w = roi_mod.spatial_shape(img)
+        state['h'], state['w'] = h, w
+        state['busy'] = True
+        try:
+            x_scale.setValue(1.0)
+            y_scale.setValue(1.0)
+            w_spin.setValue(w)
+            h_spin.setValue(h)
+        finally:
+            state['busy'] = False
+
+    def _from_scale(which: str):
+        if state['busy']:
+            return
+        state['busy'] = True
+        try:
+            if constrain.isChecked():
+                val = x_scale.value() if which == 'x' else y_scale.value()
+                x_scale.setValue(val)
+                y_scale.setValue(val)
+            w_spin.setValue(max(1, int(round(state['w'] * x_scale.value()))))
+            h_spin.setValue(max(1, int(round(state['h'] * y_scale.value()))))
+        finally:
+            state['busy'] = False
+
+    def _from_pixels(which: str):
+        if state['busy']:
+            return
+        state['busy'] = True
+        try:
+            if which == 'w':
+                sx = w_spin.value() / max(state['w'], 1)
+                x_scale.setValue(sx)
+                if constrain.isChecked():
+                    y_scale.setValue(sx)
+                    h_spin.setValue(max(1, int(round(state['h'] * sx))))
+            else:
+                sy = h_spin.value() / max(state['h'], 1)
+                y_scale.setValue(sy)
+                if constrain.isChecked():
+                    x_scale.setValue(sy)
+                    w_spin.setValue(max(1, int(round(state['w'] * sy))))
+        finally:
+            state['busy'] = False
+
+    image_box.layer_changed.connect(_init_dims)
+    x_scale.valueChanged.connect(lambda _: _from_scale('x'))
+    y_scale.valueChanged.connect(lambda _: _from_scale('y'))
+    w_spin.valueChanged.connect(lambda _: _from_pixels('w'))
+    h_spin.valueChanged.connect(lambda _: _from_pixels('h'))
+    _init_dims()
+
+    if dlg.exec_() != QDialog.Accepted:
+        return None
+    img = image_box.layer()
+    if img is None:
+        return None
+    old_h, old_w = roi_mod.spatial_shape(img)
+    new_h, new_w = h_spin.value(), w_spin.value()
+    spatial_end = img.data.ndim - 1 if img.rgb else img.data.ndim
+    lead = img.data.shape[: max(0, spatial_end - 2)]
+    out_shape = lead + (new_h, new_w) + ((img.data.shape[-1],) if img.rgb else ())
+    if not _confirm_size(tiki, out_shape, 'Resize'):
+        return None
+
+    total = int(np.prod(lead)) if lead else 1
+    with tiki.progress('Resize', total) as tick:
+        out = ops.resize_image(img.data, (new_h, new_w), order=interp.currentData(), rgb=bool(img.rgb), progress=tick)
+    if tick.cancelled:
+        return None
+
+    src_info = axes_mod.get(img)
+    new_axes = [axes_mod.Axis(a.role, a.size, a.step, a.unit) for a in src_info.axes]
+    new_axes[-2] = axes_mod.Axis('Y', new_h, (src_info.axes[-2].step * old_h / new_h) if src_info.axes[-2].step else None, src_info.axes[-2].unit)
+    new_axes[-1] = axes_mod.Axis('X', new_w, (src_info.axes[-1].step * old_w / new_w) if src_info.axes[-1].step else None, src_info.axes[-1].unit)
+    new_info = axes_mod.AxesInfo(new_axes, src_info.source, src_info.confident, list(src_info.notes))
+    kw: dict = {'axes': new_info, 'rgb': bool(img.rgb)}
+    if not img.rgb:
+        kw['colormap'] = img.colormap
+    v = tiki.open_data(out, f'Resize_{img.name}', **kw)
+    tiki.status(f'Resized {img.name} to {new_w}×{new_h} px')
+    return v
+
+
+def morphology_dialog(tiki):
+    """``Process ▸ Labels ▸ Morphology…``: erode, dilate, open, or close Labels."""
+    from .layer_select import LayerCombo
+
+    viewer, _ = tiki.require_image()
+    layer = tiki.labels_layer(viewer)
+    dlg, form = _form(tiki, 'Labels Morphology')
+    labels_box = LayerCombo(viewer, Labels, current=layer)
+    op_box = QComboBox()
+    for label, key in (('Open', 'open'), ('Close', 'close'), ('Erode', 'erode'), ('Dilate', 'dilate')):
+        op_box.addItem(label, key)
+    radius_spin = QDoubleSpinBox(decimals=1, minimum=1.0, maximum=200.0, singleStep=1.0, value=1.0)
+    radius_spin.setSuffix(' px')
+    phys_label = QLabel('')
+    scope_box = QComboBox()
+    three_d = QCheckBox('3D (through Z, scaled by voxel size)', checked=True)
+
+    form.addRow('Labels:', labels_box)
+    form.addRow('Operation:', op_box)
+    form.addRow('Radius:', radius_spin)
+    form.addRow('', phys_label)
+    form.addRow('Apply to:', scope_box)
+    form.addRow(three_d)
+    _buttons(dlg, form)
+
+    state = {'has_z': False, 'has_stack': False}
+
+    def _update_opts(_=None):
+        ly = labels_box.layer()
+        if ly is None:
+            return
+        info = _labels_info(viewer, ly)
+        state['has_z'] = info.index('Z') is not None
+        state['has_stack'] = ly.ndim > 2
+        scope_box.blockSignals(True)
+        scope_box.clear()
+        for key, lbl in nd.scopes(info):
+            scope_box.addItem(lbl, key)
+        keys = [scope_box.itemData(i) for i in range(scope_box.count())]
+        default = nd.WHOLE if nd.WHOLE in keys else nd.PLANE
+        scope_box.setCurrentIndex(keys.index(default))
+        scope_box.blockSignals(False)
+        scope_box.setVisible(state['has_stack'])
+        three_d.setVisible(state['has_z'])
+        three_d.setEnabled(state['has_z'] and scope_box.currentData() != nd.PLANE)
+        u = axes_mod.spatial_unit(info)
+        if u:
+            sy = float(info.axes[-2].step or 1.0)
+            sx = float(info.axes[-1].step or sy)
+            phys_label.setText(f'≈ {radius_spin.value() * 0.5 * (sy + sx):.4g} {u}')
+        else:
+            phys_label.setText('')
+
+    labels_box.layer_changed.connect(_update_opts)
+    scope_box.currentIndexChanged.connect(lambda _: three_d.setEnabled(state['has_z'] and scope_box.currentData() != nd.PLANE))
+    radius_spin.valueChanged.connect(lambda _: _update_opts())
+    _update_opts()
+
+    if dlg.exec_() != QDialog.Accepted:
+        return None
+    ly = labels_box.layer()
+    if ly is None:
+        return None
+    op_key = op_box.currentData()
+    rad = radius_spin.value()
+    info = _labels_info(viewer, ly)
+    scope = scope_box.currentData() if state['has_stack'] else nd.PLANE
+    by_volume = state['has_z'] and three_d.isChecked() and scope != nd.PLANE
+    zr = _labels_z_ratio(viewer, ly)
+    shape = tuple(ly.data.shape[: ly.ndim])
+    ref = roi_mod.target_image(viewer)
+    if ref is not None and len(axes_mod.get(ref).axes) >= ly.ndim:
+        index = roi_mod.current_index(viewer, ref)[-ly.ndim :]
+    else:
+        point = ly.world_to_data(viewer.dims.point[-ly.ndim :])
+        index = tuple(int(np.clip(np.round(point[d]), 0, shape[d] - 1)) for d in range(ly.ndim))
+
+    if scope == nd.PLANE or ly.ndim == 2:
+        out = ops.morphology_labels(tiki.labels_plane(viewer, ly), op=op_key, radius=rad)
+        geom = axes_mod.geometry(ly, ndim=2)
+    else:
+        blocks = nd.blocks(info, shape, index, scope, by_volume)
+        out_arr = np.zeros(shape, dtype=np.int32)
+        with tiki.progress(f'Morphology ({op_key})', len(blocks)) as tick:
+            for n, b in enumerate(blocks, 1):
+                blk = np.asarray(ly.data[b])
+                out_arr[b] = ops.morphology_labels(blk, op=op_key, radius=rad, z_ratio=zr if blk.ndim == 3 else 1.0)
+                if tick(n, len(blocks)) is False:
+                    return None
+        if scope == nd.VOLUME:
+            out = out_arr[blocks[0]]
+            geom = axes_mod.geometry(ly, ndim=3)
+        else:
+            out = out_arr
+            geom = axes_mod.geometry(ly)
+
+    new_ly = Labels(
+        out,
+        name=f'{ly.name} {op_key}',
+        opacity=0.6,
+        metadata={'axes': info.to_dict()} if out.ndim > 2 else {},
+        **geom,
+    )
+    viewer.add_layer(new_ly)
+    viewer.layers.selection.active = new_ly
+    roi = roi_mod.roi_layer(viewer, create=False)
+    if roi is not None:
+        viewer.layers.move(viewer.layers.index(roi), len(viewer.layers))
+    tiki.status(f'Labels {op_key} (r={rad:g} px) → "{new_ly.name}"')
+    return new_ly
+
+
+def find_edges_command(tiki):
+    """``Process ▸ Filters ▸ Find Edges``: Sobel edge magnitude."""
+    viewer, image = tiki.require_image()
+    if image.rgb:
+        _error('Find Edges works on greyscale images (split channels or convert first)')
+    if image.ndim > 2:
+        if not _confirm_size(tiki, image.data.shape, 'Find Edges'):
+            return None
+        total = int(np.prod(image.data.shape[: image.ndim - 2]))
+        with tiki.progress('Find Edges', total) as tick:
+            out = ops.map_planes(ops.find_edges, image.data, out_dtype=np.float32, progress=tick)
+        if tick.cancelled:
+            return None
+    else:
+        out = ops.find_edges(image.data)
+    lo, hi = ops.saturated_limits(out if out.ndim == 2 else out[(0,) * (out.ndim - 2)])
+    layer = _add_result(tiki, viewer, image, out, f'{image.name} edges', image.colormap, (lo, hi))
+    tiki.status(f'Find Edges → "{layer.name}"')
+    return layer
+
+
+def concatenate_dialog(tiki):
+    """``Image ▸ Stacks ▸ Concatenate…``: join 2 or more open images along an axis."""
+    images = _all_images(tiki)
+    if len(images) < 2:
+        _error('Concatenate needs at least two open images')
+
+    dlg, form = _form(tiki, 'Concatenate')
+    list_w = QListWidget()
+    _, active = tiki.windows.active_image()
+    ref_shape = active.data.shape[-2:] if active is not None else images[0][2].data.shape[-2:]
+    ref_ndim = active.data.ndim if active is not None else images[0][2].data.ndim
+    checked_count = 0
+    for idx, (label, v, ly) in enumerate(images):
+        item = QListWidgetItem(f'{label}  {ly.data.shape}')
+        item.setData(Qt.UserRole, (v, ly))
+        item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
+        match = ly.data.ndim == ref_ndim and ly.data.shape[-2:] == ref_shape
+        should_check = (ly is active) or (match and checked_count < 2)
+        item.setCheckState(Qt.Checked if should_check else Qt.Unchecked)
+        if should_check:
+            checked_count += 1
+        list_w.addItem(item)
+
+    up_btn = QPushButton('Move Up')
+    down_btn = QPushButton('Move Down')
+    move_bar = QHBoxLayout()
+    move_bar.addWidget(up_btn)
+    move_bar.addWidget(down_btn)
+    move_bar.addStretch()
+
+    def _move(delta: int):
+        row = list_w.currentRow()
+        if row < 0:
+            return
+        new_row = row + delta
+        if not (0 <= new_row < list_w.count()):
+            return
+        it = list_w.takeItem(row)
+        list_w.insertItem(new_row, it)
+        list_w.setCurrentRow(new_row)
+
+    up_btn.clicked.connect(lambda: _move(-1))
+    down_btn.clicked.connect(lambda: _move(1))
+
+    axis_box = QComboBox()
+    note = QLabel('')
+    note.setStyleSheet('color: #b00020;')
+    form.addRow('Images (checked, in order):', list_w)
+    form.addRow('', move_bar)
+    form.addRow('Concatenate along:', axis_box)
+    form.addRow(note)
+    buttons = _buttons(dlg, form)
+
+    def _selected():
+        out = []
+        for i in range(list_w.count()):
+            it = list_w.item(i)
+            if it.checkState() == Qt.Checked:
+                out.append(it.data(Qt.UserRole))
+        return out
+
+    def _refresh_axes(_=None):
+        sel = _selected()
+        cur = axis_box.currentData()
+        axis_box.blockSignals(True)
+        axis_box.clear()
+        ok = len(sel) >= 2
+        if sel:
+            first_ly = sel[0][1]
+            if first_ly.ndim == 2:
+                for role, lbl in (('T', 'New T (time) axis'), ('Z', 'New Z (depth) axis'), ('?', 'New stack axis (?)')):
+                    axis_box.addItem(lbl, role)
+            else:
+                info0 = axes_mod.get(first_ly)
+                for d in range(first_ly.ndim - 2):
+                    axis_box.addItem(f'{info0.labels[d]} (axis {d})', d)
+                if cur is not None and axis_box.findData(cur) >= 0:
+                    axis_box.setCurrentIndex(axis_box.findData(cur))
+        axis_box.blockSignals(False)
+        msg = '' if ok else 'Select at least 2 images'
+        if ok:
+            ndims = {ly.data.ndim for _, ly in sel}
+            if len(ndims) != 1:
+                ok = False
+                msg = 'Selected images must have the same number of dimensions'
+        note.setText(msg)
+        buttons.button(QDialogButtonBox.Ok).setEnabled(ok)
+
+    list_w.itemChanged.connect(_refresh_axes)
+    _refresh_axes()
+
+    if dlg.exec_() != QDialog.Accepted:
+        return None
+    sel = _selected()
+    if len(sel) < 2:
+        _error('select at least two images to concatenate')
+
+    first_ly = sel[0][1]
+    arrays = [ly.data for _, ly in sel]
+    ax_choice = axis_box.currentData()
+    try:
+        if first_ly.ndim == 2:
+            out = ops.concatenate_stacks(arrays, axis=0)
+            src_info = axes_mod.get(first_ly)
+            new_axes = [axes_mod.Axis(ax_choice if isinstance(ax_choice, str) else 'T', out.shape[0])] + list(src_info.axes)
+            new_info = axes_mod.AxesInfo(new_axes, 'concatenated', True)
+        else:
+            ax = int(ax_choice)
+            out = ops.concatenate_stacks(arrays, axis=ax)
+            new_info = axes_mod.fit(axes_mod.get(first_ly), out.shape)
+    except ValueError as exc:
+        _error(str(exc))
+
+    kw: dict = {'axes': new_info, 'rgb': bool(first_ly.rgb)}
+    if not first_ly.rgb:
+        kw['colormap'] = first_ly.colormap
+    v = tiki.open_data(out, f'Concat_{first_ly.name}', **kw)
+    tiki.status(f'Concatenated {len(sel)} images → {out.shape}')
+    return v
+
+
+def images_to_stack_dialog(tiki):
+    """``Image ▸ Stacks ▸ Images to Stack…``: combine open matching images into one stack."""
+    images = _all_images(tiki)
+    if len(images) < 2:
+        _error('Images to Stack needs at least two open images')
+
+    _, active = tiki.windows.active_image()
+    ref_ly = active if active is not None else images[0][2]
+    ref_shape = ref_ly.data.shape
+
+    dlg, form = _form(tiki, 'Images to Stack')
+    filt_edit = QLineEdit()
+    filt_edit.setPlaceholderText('optional title substring')
+    axis_box = QComboBox()
+    axis_box.addItem('T (time)', 'T')
+    axis_box.addItem('Z (depth)', 'Z')
+    axis_box.addItem('C (channel)', 'C')
+    axis_box.addItem('? (unknown)', '?')
+    summary = QLabel('')
+
+    form.addRow('Title contains:', filt_edit)
+    form.addRow('Stack axis role:', axis_box)
+    form.addRow(summary)
+    buttons = _buttons(dlg, form)
+
+    def _matching():
+        q = filt_edit.text().strip().lower()
+        out = []
+        for label, _v, ly in images:
+            if ly.data.shape == ref_shape and (not q or q in ly.name.lower() or q in label.lower()):
+                out.append(ly)
+        return out
+
+    def _refresh(_=None):
+        matched = _matching()
+        ok = len(matched) >= 2
+        summary.setText(
+            f'Will stack {len(matched)} image(s) of shape {ref_shape}'
+            if ok
+            else f'Need at least 2 matching images of shape {ref_shape} (found {len(matched)})'
+        )
+        summary.setStyleSheet('' if ok else 'color: #b00020;')
+        buttons.button(QDialogButtonBox.Ok).setEnabled(ok)
+
+    filt_edit.textChanged.connect(_refresh)
+    _refresh()
+
+    if dlg.exec_() != QDialog.Accepted:
+        return None
+    matched = _matching()
+    if len(matched) < 2:
+        _error('need at least two matching open images')
+
+    out = ops.images_to_stack([ly.data for ly in matched])
+    role = axis_box.currentData()
+    ref_info = axes_mod.get(matched[0])
+    new_axes = [axes_mod.Axis(role, len(matched))] + [
+        axes_mod.Axis('?' if a.role == role else a.role, a.size, a.step, a.unit) for a in ref_info.axes
+    ]
+    new_info = axes_mod.AxesInfo(new_axes, ref_info.source, '?' not in ''.join(a.role for a in new_axes[:-2]))
+    kw: dict = {'axes': new_info, 'rgb': bool(matched[0].rgb)}
+    if not matched[0].rgb:
+        kw['colormap'] = matched[0].colormap
+    v = tiki.open_data(out, 'Stack', **kw)
+    tiki.status(f'Stacked {len(matched)} images → {out.shape}')
+    return v
+
+
+def reverse_stack_command(tiki):
+    """``Image ▸ Stacks ▸ Reverse``: reverse slice order along a stack axis."""
+    _viewer, image = tiki.require_image()
+    spatial_end = image.data.ndim - 1 if image.rgb else image.data.ndim
+    if spatial_end < 3:
+        _error('Reverse needs a stack or movie, not a single 2D image')
+    info = axes_mod.get(image)
+    candidates = [d for d in range(spatial_end - 2) if info.axes[d].role != 'C']
+    if not candidates:
+        candidates = list(range(spatial_end - 2))
+
+    if len(candidates) == 1:
+        ax = candidates[0]
+    else:
+        dlg, form = _form(tiki, 'Reverse Stack')
+        axis_box = QComboBox()
+        for d in candidates:
+            axis_box.addItem(f'{info.labels[d]} ({image.data.shape[d]})', d)
+        form.addRow('Reverse along:', axis_box)
+        _buttons(dlg, form)
+        if dlg.exec_() != QDialog.Accepted:
+            return None
+        ax = axis_box.currentData()
+
+    out = ops.reverse_stack(image.data, axis=ax)
+    new_info = axes_mod.fit(info, out.shape[:-1] if image.rgb else out.shape)
+    kw: dict = {'axes': new_info, 'rgb': bool(image.rgb)}
+    if not image.rgb:
+        kw['colormap'] = image.colormap
+    v = tiki.open_data(out, f'Rev_{image.name}', **kw)
+    tiki.status(f'Reversed {image.name} along {info.labels[ax]}')
+    return v
+
+
+def remove_slices_dialog(tiki):
+    """``Image ▸ Stacks ▸ Remove Slices…``: drop a 1-based slice range from a stack."""
+    from .layer_select import LayerCombo
+
+    viewer, image = tiki.require_image()
+    if image.ndim < 3:
+        _error('Remove Slices needs a stack or movie')
+    dlg, form = _form(tiki, 'Remove Slices')
+    image_box = LayerCombo(viewer, Image, current=image)
+    axis_box = QComboBox()
+    spec_edit = QLineEdit('1')
+    spec_edit.setToolTip('1-based inclusive indices to remove (e.g. 1, 1-5, 1-20-2)')
+    note = QLabel('')
+
+    form.addRow('Image:', image_box)
+    form.addRow('Axis:', axis_box)
+    form.addRow('Slices to remove:', spec_edit)
+    form.addRow(note)
+    buttons = _buttons(dlg, form)
+
+    def _fill_all_axes(_=None):
+        img = image_box.layer()
+        axis_box.blockSignals(True)
+        axis_box.clear()
+        if img is not None:
+            info = axes_mod.get(img)
+            for d in range(img.ndim - 2):
+                axis_box.addItem(f'{info.labels[d]} ({img.data.shape[d]})', d)
+            default = axes_mod.stack_axis(info, 'TZ')
+            if default is not None and axis_box.findData(default) >= 0:
+                axis_box.setCurrentIndex(axis_box.findData(default))
+        axis_box.blockSignals(False)
+        _validate()
+
+    def _validate(_=None):
+        img = image_box.layer()
+        ax = axis_box.currentData()
+        if img is None or ax is None:
+            buttons.button(QDialogButtonBox.Ok).setEnabled(False)
+            note.setText('Need a stack axis')
+            return
+        size = img.data.shape[ax]
+        try:
+            parsed = ops.parse_slice_spec(spec_edit.text(), size)
+            n_rem = len(range(*parsed.indices(size))) if isinstance(parsed, slice) else len(set(parsed.tolist()))
+            n_keep = size - n_rem
+            if n_keep < 1:
+                raise ValueError('cannot remove all slices')
+            note.setText(f'Will remove {n_rem} slice(s); {n_keep} remaining')
+            note.setStyleSheet('')
+            buttons.button(QDialogButtonBox.Ok).setEnabled(True)
+        except ValueError as exc:
+            note.setText(str(exc))
+            note.setStyleSheet('color: #b00020;')
+            buttons.button(QDialogButtonBox.Ok).setEnabled(False)
+
+    image_box.layer_changed.connect(_fill_all_axes)
+    axis_box.currentIndexChanged.connect(_validate)
+    spec_edit.textChanged.connect(_validate)
+    _fill_all_axes()
+
+    if dlg.exec_() != QDialog.Accepted:
+        return None
+    img = image_box.layer()
+    ax = axis_box.currentData()
+    out = ops.remove_slices(img.data, ax, spec_edit.text(), rgb=bool(img.rgb))
+    new_info = axes_mod.fit(axes_mod.get(img), out.shape[:-1] if img.rgb else out.shape)
+    kw: dict = {'axes': new_info, 'rgb': bool(img.rgb)}
+    if not img.rgb:
+        kw['colormap'] = img.colormap
+    v = tiki.open_data(out, f'Trim_{img.name}', **kw)
+    tiki.status(f'Removed slices ({spec_edit.text()}) → {out.shape}')
+    return v
+
+
+def hyperstack_to_stack_command(tiki):
+    """``Image ▸ Stacks ▸ Hyperstack to Stack``: flatten hyperstack axes into 3D stack."""
+    _viewer, image = tiki.require_image()
+    spatial_ndim = 3 if image.rgb else 2
+    if image.data.ndim <= spatial_ndim + 1:
+        _error('Hyperstack to Stack needs a 4D+ hyperstack (e.g. TZCYX or ZCYX)')
+    src_info = axes_mod.get(image)
+    out = ops.hyperstack_to_stack(image.data, rgb=bool(image.rgb))
+    ay, ax_x = src_info.axes[-2], src_info.axes[-1]
+    new_info = axes_mod.AxesInfo(
+        [
+            axes_mod.Axis('?', out.shape[0]),
+            axes_mod.Axis('Y', ay.size, ay.step, ay.unit),
+            axes_mod.Axis('X', ax_x.size, ax_x.step, ax_x.unit),
+        ],
+        'flattened hyperstack',
+        False,
+        [f'flattened from {src_info.roles}'],
+    )
+    kw: dict = {'axes': new_info, 'rgb': bool(image.rgb)}
+    if not image.rgb:
+        kw['colormap'] = image.colormap
+    v = tiki.open_data(out, f'Stack_{image.name}', **kw)
+    tiki.status(f'Flattened {src_info.roles} → stack {out.shape}')
+    return v
+
+
+def merge_channels_dialog(tiki):
+    """``Image ▸ Color ▸ Merge Channels…``: combine separate images into a composite stack."""
+    from . import contrast
+
+    slots = [
+        ('C1 (Red):', 'Red'),
+        ('C2 (Green):', 'Green'),
+        ('C3 (Blue):', 'Blue'),
+        ('C4 (Gray):', 'Grays'),
+        ('C5 (Cyan):', 'Cyan'),
+        ('C6 (Magenta):', 'Magenta'),
+        ('C7 (Yellow):', 'Yellow'),
+    ]
+    all_imgs = [
+        (label, ly)
+        for label, _v, ly in _all_images(tiki)
+        if not ly.rgb and axes_mod.get(ly).index('C') is None
+    ]
+    if not all_imgs:
+        _error('Merge Channels needs at least one open greyscale image without a C axis')
+
+    _, active = tiki.windows.active_image()
+    ref_shape = active.data.shape if (active is not None and not active.rgb) else all_imgs[0][1].data.shape
+    matching = [ly for _, ly in all_imgs if ly.data.shape == ref_shape]
+
+    dlg, form = _form(tiki, 'Merge Channels')
+    combos: list[tuple[QComboBox, str]] = []
+    for idx, (label, lut_name) in enumerate(slots):
+        cb = QComboBox()
+        cb.addItem('<None>', None)
+        for img_label, ly in all_imgs:
+            cb.addItem(img_label, ly)
+        if idx < len(matching) and idx < 3:
+            cb.setCurrentIndex(cb.findData(matching[idx]))
+        form.addRow(label, cb)
+        combos.append((cb, lut_name))
+
+    split_box = QCheckBox('Create composite (split channels in new window)', checked=True)
+    note = QLabel('')
+    note.setStyleSheet('color: #b00020;')
+    form.addRow(split_box)
+    form.addRow(note)
+    buttons = _buttons(dlg, form)
+
+    def _validate(_=None):
+        chosen = [cb.currentData() for cb, _ in combos if cb.currentData() is not None]
+        if not chosen:
+            note.setText('Choose at least one image')
+            buttons.button(QDialogButtonBox.Ok).setEnabled(False)
+            return
+        shapes = {ly.data.shape for ly in chosen}
+        if len(shapes) != 1:
+            note.setText('Selected channels must have matching shapes')
+            buttons.button(QDialogButtonBox.Ok).setEnabled(False)
+            return
+        note.setText('')
+        buttons.button(QDialogButtonBox.Ok).setEnabled(True)
+
+    for cb, _ in combos:
+        cb.currentIndexChanged.connect(_validate)
+    _validate()
+
+    if dlg.exec_() != QDialog.Accepted:
+        return None
+
+    chosen = [(cb.currentData(), lut_name) for cb, lut_name in combos if cb.currentData() is not None]
+    if not chosen:
+        return None
+    layers_sel = [ly for ly, _ in chosen]
+    merged = ops.images_to_stack([ly.data for ly in layers_sel])
+    first = layers_sel[0]
+    first_info = axes_mod.get(first)
+    c_axes = [axes_mod.Axis('C', len(layers_sel))] + [
+        axes_mod.Axis(a.role, a.size, a.step, a.unit) for a in first_info.axes
+    ]
+    new_info = axes_mod.AxesInfo(c_axes, first_info.source, first_info.confident)
+
+    luts = []
+    for _ly, lut_name in chosen:
+        cmap = contrast.LUTS[lut_name]
+        from napari.layers import Image as _Img
+
+        tmp_ly = _Img(np.zeros((2, 2), dtype=np.uint8), colormap=cmap)
+        luts.append(contrast.layer_lut_bytes(tmp_ly))
+
+    ch_names = [ly.name for ly in layers_sel]
+    v = tiki.open_data(
+        merged,
+        'Composite',
+        axes=new_info,
+        metadata={'imagej_luts': luts, 'channel_names': ch_names},
+    )
+    if split_box.isChecked() and len(layers_sel) > 1:
+        tiki.split_channels()
+    tiki.status(f'Merged {len(layers_sel)} channel(s) → "{v.title}"')
     return v

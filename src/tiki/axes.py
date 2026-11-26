@@ -17,21 +17,30 @@ from pathlib import Path
 ROLES = ['T', 'Z', 'C', 'Y', 'X', '?']
 ROLE_NAMES = {'T': 'time', 'Z': 'depth', 'C': 'channel', 'Y': 'rows', 'X': 'columns', '?': 'unknown'}
 DEFAULT_UNITS = {'T': 's', 'Z': 'µm', 'Y': 'µm', 'X': 'µm'}
-PINT_UNITS = {'µm': 'micrometer', 'nm': 'nanometer', 'mm': 'millimeter',
-              's': 'second', 'ms': 'millisecond', 'min': 'minute'}
+PINT_UNITS = {'µm': 'micrometer', 'nm': 'nanometer', 'mm': 'millimeter', 'cm': 'centimeter',
+              'm': 'meter', 's': 'second', 'ms': 'millisecond', 'µs': 'microsecond',
+              'ns': 'nanosecond', 'min': 'minute', 'h': 'hour'}
+LENGTH_TO_M = {'nm': 1e-9, 'µm': 1e-6, 'mm': 1e-3, 'cm': 1e-2, 'm': 1.0}
+TIME_TO_S = {'ns': 1e-9, 'µs': 1e-6, 'ms': 1e-3, 's': 1.0, 'min': 60.0, 'h': 3600.0}
+UNIT_FACTORS = {**LENGTH_TO_M, **TIME_TO_S}
 MEMORY_FILE = Path.home() / '.config' / 'tiki' / 'axes_memory.json'
 
 # tifffile axis codes -> TIKI roles. 'I' (generic image sequence) and the
 # rarer codes stay unknown: better to ask than to call a movie a z-stack.
 TIFF_ROLES = {'T': 'T', 'Z': 'Z', 'C': 'C', 'Y': 'Y', 'X': 'X'}
-UNIT_ALIASES = {'micron': 'µm', 'microns': 'µm', 'um': 'µm', 'µm': 'µm', '\\u00B5m': 'µm',
-                'micrometer': 'µm', 'micrometers': 'µm', 'micrometre': 'µm',
-                'nm': 'nm', 'nanometer': 'nm', 'nanometers': 'nm',
-                'mm': 'mm', 'millimeter': 'mm', 'millimeters': 'mm',
+UNIT_ALIASES = {'micron': 'µm', 'microns': 'µm', 'um': 'µm', 'µm': 'µm', 'μm': 'µm',
+                '\\u00b5m': 'µm', '\\u00B5m': 'µm',
+                'micrometer': 'µm', 'micrometers': 'µm', 'micrometre': 'µm', 'micrometres': 'µm',
+                'nm': 'nm', 'nanometer': 'nm', 'nanometers': 'nm', 'nanometre': 'nm',
+                'mm': 'mm', 'millimeter': 'mm', 'millimeters': 'mm', 'millimetre': 'mm',
+                'cm': 'cm', 'centimeter': 'cm', 'centimeters': 'cm', 'centimetre': 'cm',
                 'm': 'm', 'meter': 'm', 'meters': 'm', 'metre': 'm',
                 'sec': 's', 's': 's', 'second': 's', 'seconds': 's',
                 'ms': 'ms', 'millisecond': 'ms', 'milliseconds': 'ms',
-                'min': 'min', 'minute': 'min', 'minutes': 'min'}
+                'us': 'µs', 'µs': 'µs', 'μs': 'µs', 'microsecond': 'µs', 'microseconds': 'µs',
+                'ns': 'ns', 'nanosecond': 'ns', 'nanoseconds': 'ns',
+                'min': 'min', 'minute': 'min', 'minutes': 'min',
+                'h': 'h', 'hr': 'h', 'hour': 'h', 'hours': 'h'}
 
 
 @dataclass
@@ -156,6 +165,49 @@ def _unit(u) -> str | None:
     return UNIT_ALIASES.get(u.lower(), u) if u else None
 
 
+def convert_unit(value: float, src: str | None, dst: str | None) -> float:
+    """Convert ``value`` between compatible metric length or time units."""
+    s = _unit(src)
+    d = _unit(dst)
+    if s is None or d is None or s == d:
+        return float(value)
+    if s in LENGTH_TO_M and d in LENGTH_TO_M:
+        return float(value) * (LENGTH_TO_M[s] / LENGTH_TO_M[d])
+    if s in TIME_TO_S and d in TIME_TO_S:
+        return float(value) * (TIME_TO_S[s] / TIME_TO_S[d])
+    return float(value)
+
+
+def spatial_unit(info: AxesInfo) -> str | None:
+    """Physical spatial unit of Y/X if calibrated, else None."""
+    for role in ('Y', 'X'):
+        idx = info.index(role)
+        if idx is not None and info.axes[idx].step and info.axes[idx].unit:
+            return info.axes[idx].unit
+    return None
+
+
+def physical_scale_3d(info: AxesInfo) -> tuple[tuple[float, float, float], str | None, bool]:
+    """Return ``((sz, sy, sx), unit, z_assumed)`` in consistent XY spatial units."""
+    y_idx, x_idx, z_idx = info.index('Y'), info.index('X'), info.index('Z')
+    y_ax = info.axes[y_idx] if y_idx is not None else None
+    x_ax = info.axes[x_idx] if x_idx is not None else None
+    z_ax = info.axes[z_idx] if z_idx is not None else None
+
+    sy = float(y_ax.step) if (y_ax is not None and y_ax.step) else 1.0
+    sx = float(x_ax.step) if (x_ax is not None and x_ax.step) else sy
+    unit = spatial_unit(info)
+    z_assumed = info.z_assumed
+
+    if z_ax is not None and z_ax.step:
+        sz = convert_unit(float(z_ax.step), z_ax.unit, unit) if unit else float(z_ax.step)
+    elif z_assumed:
+        sz = sy
+    else:
+        sz = 1.0
+    return (sz, sy, sx), unit, z_assumed
+
+
 # ------------------------------------------------------------------- TIFF
 
 def _xy_step(tf, ij: dict) -> tuple[float | None, str | None, str | None]:
@@ -190,32 +242,280 @@ def _xy_step(tf, ij: dict) -> tuple[float | None, str | None, str | None]:
     return step, unit, None
 
 
-def _ome_steps(tf) -> dict:
+def _xml_tag(el) -> str:
+    return el.tag.split('}')[-1] if '}' in el.tag else el.tag
+
+
+def _find_child(el, name: str):
+    for child in el:
+        if _xml_tag(child) == name:
+            return child
+    return None
+
+
+def _find_children(el, name: str) -> list:
+    return [child for child in el if _xml_tag(child) == name]
+
+
+def _find_all(el, name: str) -> list:
+    return [node for node in el.iter() if _xml_tag(node) == name]
+
+
+def _float_attr(el, name: str) -> float | None:
+    if el is None:
+        return None
+    val = el.get(name)
+    if val is None:
+        return None
+    try:
+        return float(val)
+    except (ValueError, TypeError):
+        return None
+
+
+def parse_ome_xml(xml: str, series_index: int = 0) -> dict:
+    """Parse OME-XML calibration, channel names/colors, and acquisition metadata."""
+    import xml.etree.ElementTree as ET
+
+    empty = {
+        'steps': {},
+        'notes': [],
+        'series_name': None,
+        'channel_names': [],
+        'channel_colors': [],
+        'channels': [],
+        'acquisition': {},
+    }
+    if not xml or not str(xml).strip():
+        return empty
+    try:
+        root = ET.fromstring(xml)
+    except ET.ParseError:
+        return empty
+
+    images = _find_children(root, 'Image') or _find_all(root, 'Image')
+    if not images:
+        return empty
+    img_el = images[series_index] if 0 <= series_index < len(images) else images[0]
+    series_name = (img_el.get('Name') or '').strip() or None
+
+    steps: dict[str, tuple[float, str]] = {}
+    notes: list[str] = []
+    channel_names: list[str] = []
+    channel_colors: list[tuple[int, int, int] | None] = []
+    channels: list[dict] = []
+
+    pixels_el = _find_child(img_el, 'Pixels')
+    if pixels_el is not None:
+        for role, key in (
+            ('X', 'PhysicalSizeX'),
+            ('Y', 'PhysicalSizeY'),
+            ('Z', 'PhysicalSizeZ'),
+            ('T', 'TimeIncrement'),
+        ):
+            fval = _float_attr(pixels_el, key)
+            if fval is not None and fval > 0:
+                u = _unit(pixels_el.get(key + 'Unit'))
+                if u == 'm' and role in ('X', 'Y', 'Z'):
+                    steps[role] = _normalize_czi_step(role, fval, u)
+                else:
+                    steps[role] = (fval, u or DEFAULT_UNITS[role])
+
+        # Fallback: compute time interval from <Plane DeltaT=.../> when TimeIncrement is absent
+        if 'T' not in steps:
+            grouped: dict[tuple[str, str], list[tuple[int, float, str | None]]] = {}
+            for pl in _find_children(pixels_el, 'Plane'):
+                dt = _float_attr(pl, 'DeltaT')
+                the_t = pl.get('TheT')
+                if dt is None or the_t is None:
+                    continue
+                try:
+                    t_idx = int(the_t)
+                except ValueError:
+                    continue
+                key_zc = (pl.get('TheZ') or '0', pl.get('TheC') or '0')
+                grouped.setdefault(key_zc, []).append((t_idx, dt, _unit(pl.get('DeltaTUnit')) or 's'))
+            if grouped:
+                best_key = max(grouped, key=lambda k: (len(grouped[k]), -int(k[0]) if k[0].isdigit() else 0))
+                pts = sorted(grouped[best_key], key=lambda item: item[0])
+                t_unit = pts[0][2] or 's'
+                diffs = []
+                for (t1, d1, u1), (t2, d2, u2) in zip(pts[:-1], pts[1:]):
+                    if t2 > t1:
+                        v1 = convert_unit(d1, u1, t_unit)
+                        v2 = convert_unit(d2, u2, t_unit)
+                        delta = (v2 - v1) / (t2 - t1)
+                        if delta > 0:
+                            diffs.append(delta)
+                if diffs:
+                    diffs.sort()
+                    mid = len(diffs) // 2
+                    med = diffs[mid] if len(diffs) % 2 else 0.5 * (diffs[mid - 1] + diffs[mid])
+                    steps['T'] = (float(med), t_unit)
+                    notes.append('time step from OME Plane DeltaT')
+
+        for ch_el in _find_children(pixels_el, 'Channel'):
+            cname = (ch_el.get('Name') or '').strip()
+            fluor = (ch_el.get('Fluor') or '').strip()
+            channel_names.append(cname or fluor)
+            rgb = None
+            raw_color = ch_el.get('Color')
+            if raw_color is not None:
+                try:
+                    u32 = int(raw_color) & 0xFFFFFFFF
+                    rgb_cand = ((u32 >> 24) & 0xFF, (u32 >> 16) & 0xFF, (u32 >> 8) & 0xFF)
+                    if rgb_cand != (0, 0, 0):
+                        rgb = rgb_cand
+                except ValueError:
+                    pass
+            channel_colors.append(rgb)
+            ch_info = {}
+            if cname:
+                ch_info['name'] = cname
+            if fluor:
+                ch_info['fluor'] = fluor
+            if rgb is not None:
+                ch_info['color_rgb'] = rgb
+            for attr_name, key_out in (
+                ('ExcitationWavelength', 'excitation_nm'),
+                ('EmissionWavelength', 'emission_nm'),
+                ('PinholeSize', 'pinhole_um'),
+            ):
+                fval = _float_attr(ch_el, attr_name)
+                if fval is not None:
+                    ch_info[key_out] = fval
+            for attr_name, key_out in (
+                ('AcquisitionMode', 'acquisition_mode'),
+                ('IlluminationType', 'illumination_type'),
+            ):
+                sval = (ch_el.get(attr_name) or '').strip()
+                if sval:
+                    ch_info[key_out] = sval
+            channels.append(ch_info)
+
+    acquisition: dict = {}
+    if series_name:
+        acquisition['image_name'] = series_name
+    acq_date = _find_child(img_el, 'AcquisitionDate')
+    if acq_date is not None and acq_date.text and acq_date.text.strip():
+        acquisition['acquisition_date'] = acq_date.text.strip()
+    desc_el = _find_child(img_el, 'Description')
+    if desc_el is not None and desc_el.text and desc_el.text.strip():
+        acquisition['description'] = desc_el.text.strip()
+    stage_el = _find_child(img_el, 'StageLabel')
+    if stage_el is not None:
+        stage = {}
+        if stage_el.get('Name'):
+            stage['name'] = stage_el.get('Name')
+        for axis_key in ('X', 'Y', 'Z'):
+            v = _float_attr(stage_el, axis_key)
+            if v is not None:
+                stage[axis_key.lower()] = v
+        if stage:
+            acquisition['stage_label'] = stage
+
+    instruments = _find_children(root, 'Instrument') or _find_all(root, 'Instrument')
+    inst_ref = _find_child(img_el, 'InstrumentRef')
+    inst_id = inst_ref.get('ID') if inst_ref is not None else None
+    inst_el = next((i for i in instruments if inst_id and i.get('ID') == inst_id), instruments[0] if instruments else None)
+    if inst_el is not None:
+        mic_el = _find_child(inst_el, 'Microscope')
+        if mic_el is not None:
+            mic = {
+                k: v
+                for k, attr in (('manufacturer', 'Manufacturer'), ('model', 'Model'), ('serial_number', 'SerialNumber'))
+                if (v := (mic_el.get(attr) or '').strip())
+            }
+            if mic:
+                acquisition['microscope'] = mic
+
+        objs = _find_children(inst_el, 'Objective')
+        obj_set = _find_child(img_el, 'ObjectiveSettings')
+        obj_id = obj_set.get('ID') if obj_set is not None else None
+        obj_el = next((o for o in objs if obj_id and o.get('ID') == obj_id), objs[0] if objs else None)
+        if obj_el is not None:
+            obj = {}
+            for k, attr in (('manufacturer', 'Manufacturer'), ('model', 'Model'), ('immersion', 'Immersion')):
+                v = (obj_el.get(attr) or '').strip()
+                if v:
+                    obj[k] = v
+            for k, attr in (
+                ('magnification', 'NominalMagnification'),
+                ('na', 'LensNA'),
+                ('working_distance', 'WorkingDistance'),
+            ):
+                v = _float_attr(obj_el, attr)
+                if v is not None:
+                    obj[k] = v
+            if obj:
+                acquisition['objective'] = obj
+
+        dets = _find_children(inst_el, 'Detector')
+        det_id = None
+        if pixels_el is not None:
+            for ch_el in _find_children(pixels_el, 'Channel'):
+                ds = _find_child(ch_el, 'DetectorSettings')
+                if ds is not None and ds.get('ID'):
+                    det_id = ds.get('ID')
+                    break
+        det_el = next((d for d in dets if det_id and d.get('ID') == det_id), dets[0] if dets else None)
+        if det_el is not None:
+            det = {}
+            for k, attr in (('manufacturer', 'Manufacturer'), ('model', 'Model'), ('type', 'Type')):
+                v = (det_el.get(attr) or '').strip()
+                if v:
+                    det[k] = v
+            gain = _float_attr(det_el, 'Gain')
+            if gain is not None:
+                det['gain'] = gain
+            if det:
+                acquisition['detector'] = det
+
+    if channels:
+        acquisition['channels'] = channels
+
+    return {
+        'steps': steps,
+        'notes': notes,
+        'series_name': series_name,
+        'channel_names': channel_names,
+        'channel_colors': channel_colors,
+        'channels': channels,
+        'acquisition': acquisition,
+    }
+
+
+def _ome_steps(tf, series_index: int = 0) -> dict:
     """PhysicalSizeX/Y/Z and TimeIncrement from OME-XML (with units)."""
-    xml = tf.ome_metadata or ''
-    out = {}
-    m = re.search(r'<Pixels\b[^>]*>', xml)
-    if not m:
-        return out
-    tag = m.group(0)
-
-    def attr(name):
-        a = re.search(rf'\b{name}="([^"]+)"', tag)
-        return a.group(1) if a else None
-
-    for role, key in (('X', 'PhysicalSizeX'), ('Y', 'PhysicalSizeY'), ('Z', 'PhysicalSizeZ'), ('T', 'TimeIncrement')):
-        val = attr(key)
-        if val:
-            try:
-                out[role] = (float(val), _unit(attr(key + 'Unit')) or DEFAULT_UNITS[role])
-            except ValueError:
-                pass
-    return out
+    return parse_ome_xml(tf.ome_metadata or '', series_index=series_index)['steps']
 
 
-def from_tiff(tf, data_shape: tuple) -> AxesInfo:
-    """Axes from an open ``tifffile.TiffFile`` whose first series gave ``data_shape``."""
-    series = tf.series[0]
+def _scanimage_fov_steps(fov, ny: int, nx: int) -> tuple[float | None, float | None]:
+    """Derive ``(step_y, step_x)`` in µm from ScanImage ``imagingFovUm`` corner coordinates."""
+    if fov is None or ny <= 0 or nx <= 0:
+        return None, None
+    try:
+        pts = [list(pt) for pt in fov]
+        if len(pts) < 2 or any(len(pt) < 2 for pt in pts):
+            return None, None
+        xs = [float(pt[0]) for pt in pts]
+        ys = [float(pt[1]) for pt in pts]
+    except (TypeError, ValueError):
+        return None, None
+    fov_x = max(xs) - min(xs)
+    fov_y = max(ys) - min(ys)
+    sx = fov_x / nx if fov_x > 0 else None
+    sy = fov_y / ny if fov_y > 0 else None
+    if sx is not None and not (0.001 <= sx <= 1000):
+        sx = None
+    if sy is not None and not (0.001 <= sy <= 1000):
+        sy = None
+    return sy, sx
+
+
+def from_tiff(tf, data_shape: tuple, series_index: int = 0) -> AxesInfo:
+    """Axes from an open ``tifffile.TiffFile`` whose series ``series_index`` gave ``data_shape``."""
+    series = tf.series[series_index]
     codes = series.axes
     notes = []
     if len(codes) != len(data_shape):
@@ -231,15 +531,20 @@ def from_tiff(tf, data_shape: tuple) -> AxesInfo:
 
     if tf.is_ome:
         info.source = 'OME metadata'
-        for role, (step, unit) in _ome_steps(tf).items():
+        parsed = parse_ome_xml(tf.ome_metadata or '', series_index=series_index)
+        for role, (step, unit) in parsed['steps'].items():
             i = info.index(role)
             if i is not None:
                 axes[i].step, axes[i].unit = step, unit
+        notes.extend(parsed['notes'])
     else:
         if tf.is_imagej:
             info.source = 'ImageJ metadata'
         elif tf.is_scanimage:
             info.source = 'ScanImage metadata'
+        elif getattr(tf, 'is_micromanager', False):
+            info.source = 'Micro-Manager metadata'
+
         if not tf.is_scanimage:  # ScanImage resolution tags are not a calibration
             step, unit, note = _xy_step(tf, ij)
             if note:
@@ -266,11 +571,69 @@ def from_tiff(tf, data_shape: tuple) -> AxesInfo:
         if ij.get('finterval') and info.index('T') is not None:
             axes[info.index('T')].step = float(ij['finterval'])
             axes[info.index('T')].unit = _unit(ij.get('tunit')) or 's'
-        if tf.is_scanimage and info.index('T') is not None:
+        if tf.is_scanimage:
             fd = (tf.scanimage_metadata or {}).get('FrameData', {})
-            period = fd.get('SI.hRoiManager.scanFramePeriod')
-            if period:
-                axes[info.index('T')].step, axes[info.index('T')].unit = float(period), 's'
+            if info.index('T') is not None:
+                period = fd.get('SI.hRoiManager.scanFramePeriod')
+                if not period and fd.get('SI.hRoiManager.scanFrameRate'):
+                    try:
+                        fr = float(fd['SI.hRoiManager.scanFrameRate'])
+                        period = 1.0 / fr if fr > 0 else None
+                    except (TypeError, ValueError):
+                        period = None
+                if period and float(period) > 0:
+                    axes[info.index('T')].step, axes[info.index('T')].unit = float(period), 's'
+            y_idx, x_idx = info.index('Y'), info.index('X')
+            if y_idx is not None and x_idx is not None:
+                sy, sx = _scanimage_fov_steps(
+                    fd.get('SI.hRoiManager.imagingFovUm'), axes[y_idx].size, axes[x_idx].size
+                )
+                if sy:
+                    axes[y_idx].step, axes[y_idx].unit = sy, 'µm'
+                if sx:
+                    axes[x_idx].step, axes[x_idx].unit = sx, 'µm'
+            z_idx = info.index('Z')
+            if z_idx is not None:
+                z_step = fd.get('SI.hStackManager.actualStackZStepSize') or fd.get('SI.hStackManager.stackZStepSize')
+                try:
+                    z_val = abs(float(z_step)) if z_step is not None else 0.0
+                except (TypeError, ValueError):
+                    z_val = 0.0
+                if z_val > 0:
+                    axes[z_idx].step, axes[z_idx].unit = z_val, 'µm'
+
+        if getattr(tf, 'is_micromanager', False):
+            summary = (getattr(tf, 'micromanager_metadata', None) or {}).get('Summary', {})
+            if isinstance(summary, dict):
+                px_um = summary.get('PixelSize_um')
+                try:
+                    if px_um and float(px_um) > 0:
+                        for r in 'YX':
+                            idx = info.index(r)
+                            if idx is not None and axes[idx].step is None:
+                                axes[idx].step, axes[idx].unit = float(px_um), 'µm'
+                except (TypeError, ValueError):
+                    pass
+                z_um = summary.get('z-step_um')
+                try:
+                    if z_um and float(z_um) > 0 and info.index('Z') is not None:
+                        z_idx = info.index('Z')
+                        if axes[z_idx].step is None:
+                            axes[z_idx].step, axes[z_idx].unit = float(z_um), 'µm'
+                except (TypeError, ValueError):
+                    pass
+                interval_ms = summary.get('Interval_ms')
+                try:
+                    if interval_ms and float(interval_ms) > 0 and info.index('T') is not None:
+                        t_idx = info.index('T')
+                        if axes[t_idx].step is None:
+                            ms = float(interval_ms)
+                            if ms >= 1000.0:
+                                axes[t_idx].step, axes[t_idx].unit = ms / 1000.0, 's'
+                            else:
+                                axes[t_idx].step, axes[t_idx].unit = ms, 'ms'
+                except (TypeError, ValueError):
+                    pass
 
     if '?' in info.roles[:-2]:
         info.confident = False
@@ -297,18 +660,22 @@ def _normalize_czi_step(role: str, step: float, unit: str | None) -> tuple[float
     return step, u or DEFAULT_UNITS.get(role)
 
 
-def from_czi_xml(xml: str) -> tuple[dict[str, tuple[float, str]], list[str]]:
-    """Extract ``({role: (step, unit)}, [channel_colors])`` from Zeiss CZI XML."""
+def parse_czi_metadata(xml: str) -> dict:
+    """Extract calibration steps, channel names/colors, and acquisition info from CZI XML."""
     import xml.etree.ElementTree as ET
 
-    steps: dict[str, tuple[float, str]] = {}
-    colors: list[str] = []
+    out: dict = {'steps': {}, 'colors': [], 'channel_names': [], 'acquisition': {}}
     if not xml:
-        return steps, colors
+        return out
     try:
         root = ET.fromstring(xml)
     except ET.ParseError:
-        return steps, colors
+        return out
+
+    steps: dict[str, tuple[float, str]] = {}
+    colors: list[str] = []
+    channel_names: list[str] = []
+    channels_info: list[dict] = []
 
     for dist in root.findall('.//Scaling/Items/Distance'):
         axis_id = (dist.get('Id') or '').upper()
@@ -338,13 +705,81 @@ def from_czi_xml(xml: str) -> tuple[dict[str, tuple[float, str]], list[str]]:
         color = (color_el.text if color_el is not None and color_el.text else ch.get('Color') or '').strip()
         if color:
             colors.append(color)
+        name = (ch.get('Name') or '').strip()
+        fluor_el = ch.find('Fluor')
+        fluor = (fluor_el.text if fluor_el is not None and fluor_el.text else ch.get('Fluor') or '').strip()
+        channel_names.append(name or fluor)
+        entry: dict = {}
+        if name:
+            entry['name'] = name
+        if fluor:
+            entry['fluor'] = fluor
+        if color:
+            entry['color'] = color
+        for tag, key_out in (
+            ('ExcitationWavelength', 'excitation_nm'),
+            ('EmissionWavelength', 'emission_nm'),
+            ('ExposureTime', 'exposure_ms'),
+        ):
+            sub = ch.find(tag)
+            if sub is not None and sub.text:
+                try:
+                    entry[key_out] = float(sub.text)
+                except ValueError:
+                    pass
+        if entry:
+            channels_info.append(entry)
+
     if not colors:
         for ch in root.findall('.//DisplaySetting/Channels/Channel'):
             color_el = ch.find('Color')
             color = (color_el.text if color_el is not None and color_el.text else '').strip()
             if color:
                 colors.append(color)
-    return steps, colors
+
+    acq: dict = {}
+    date_el = root.find('.//Information/Image/AcquisitionDateAndTime')
+    if date_el is not None and date_el.text and date_el.text.strip():
+        acq['acquisition_date'] = date_el.text.strip()
+    mic_el = root.find('.//Information/Instrument/Microscopes/Microscope')
+    if mic_el is not None:
+        mic_name = (mic_el.get('Name') or '').strip()
+        sys_el = mic_el.find('System')
+        sys_name = (sys_el.text or '').strip() if sys_el is not None and sys_el.text else ''
+        mic = {k: v for k, v in (('name', mic_name), ('system', sys_name)) if v}
+        if mic:
+            acq['microscope'] = mic
+    obj_el = root.find('.//Information/Instrument/Objectives/Objective')
+    if obj_el is not None:
+        obj: dict = {}
+        if obj_el.get('Name'):
+            obj['name'] = obj_el.get('Name').strip()
+        for tag, key_out in (('NominalMagnification', 'magnification'), ('LensNA', 'na')):
+            sub = obj_el.find(tag)
+            if sub is not None and sub.text:
+                try:
+                    obj[key_out] = float(sub.text)
+                except ValueError:
+                    pass
+        imm_el = obj_el.find('Immersion')
+        if imm_el is not None and imm_el.text and imm_el.text.strip():
+            obj['immersion'] = imm_el.text.strip()
+        if obj:
+            acq['objective'] = obj
+    if channels_info:
+        acq['channels'] = channels_info
+
+    out['steps'] = steps
+    out['colors'] = colors
+    out['channel_names'] = channel_names
+    out['acquisition'] = acq
+    return out
+
+
+def from_czi_xml(xml: str) -> tuple[dict[str, tuple[float, str]], list[str]]:
+    """Extract ``({role: (step, unit)}, [channel_colors])`` from Zeiss CZI XML."""
+    parsed = parse_czi_metadata(xml)
+    return parsed['steps'], parsed['colors']
 
 
 def from_czi(

@@ -1381,3 +1381,333 @@ def test_open_skimage_biology_samples(tiki):
 
     tiki._open_skimage('blobs')
     assert tiki.windows.active.layers[0].data.dtype == np.uint8
+
+
+def test_show_info_window_and_raw_metadata(tiki, tmp_path):
+    import tifffile
+
+    ome_xml = '''<?xml version="1.0" encoding="UTF-8"?>
+    <OME xmlns="http://www.openmicroscopy.org/Schemas/OME/2016-06">
+      <Instrument ID="Instrument:0">
+        <Objective ID="Objective:0" Manufacturer="Nikon" Model="Plan Apo 60x" LensNA="1.4"/>
+      </Instrument>
+      <Image ID="Image:0" Name="CalibStack">
+        <Pixels DimensionOrder="XYCZT" Type="uint16" SizeX="16" SizeY="12" SizeZ="2" SizeC="2" SizeT="1"
+                PhysicalSizeX="0.2" PhysicalSizeXUnit="&#181;m"
+                PhysicalSizeY="0.2" PhysicalSizeYUnit="&#181;m"
+                PhysicalSizeZ="1.0" PhysicalSizeZUnit="&#181;m">
+          <Channel ID="Channel:0:0" Name="DAPI" Color="-16711681"/>
+          <Channel ID="Channel:0:1" Name="GFP" Color="16711935"/>
+        </Pixels>
+      </Image>
+    </OME>'''
+    path = tmp_path / 'meta.ome.tif'
+    arr = np.zeros((2, 2, 12, 16), dtype=np.uint16)
+    with tifffile.TiffWriter(path) as tif:
+        tif.write(arr, photometric='minisblack', description=ome_xml)
+
+    tiki.open_paths([str(path)])
+    win = tiki.show_info()
+    summary_txt = win.text.toPlainText()
+    assert 'CalibStack' in summary_txt
+    assert 'Plan Apo 60x' in summary_txt
+    assert 'DAPI' in summary_txt and 'GFP' in summary_txt
+    assert win.raw_btn.isVisibleTo(win)
+    assert not win.raw_box.isVisibleTo(win)
+    win.raw_btn.setChecked(True)
+    assert win.raw_box.isVisibleTo(win)
+    assert 'OME-XML' in win.raw_box.toPlainText()
+    win.close()
+
+
+def test_multi_series_ome_and_channel_named_split(tiki, tmp_path):
+    import tifffile
+
+    ome_path = tmp_path / 'two_series.ome.tif'
+    s0 = np.zeros((2, 8, 8), dtype=np.uint16)
+    s1 = np.ones((2, 8, 8), dtype=np.uint16) * 5
+    with tifffile.TiffWriter(ome_path, ome=True) as tif:
+        tif.write(s0, photometric='minisblack', metadata={'axes': 'CYX', 'PhysicalSizeX': 0.25, 'PhysicalSizeY': 0.25})
+        tif.write(s1, photometric='minisblack', metadata={'axes': 'CYX', 'PhysicalSizeX': 0.5, 'PhysicalSizeY': 0.5})
+
+    before = len(tiki.windows.viewers)
+    tiki.open_paths([str(ome_path)])
+    assert len(tiki.windows.viewers) == before + 2
+
+    # Split Channels uses channel_names from metadata and Merge restores
+    from tiki import axes
+
+    arr = np.zeros((2, 10, 10), dtype=np.uint16)
+    arr[0] = 10
+    arr[1] = 200
+    info = axes.AxesInfo(
+        [axes.Axis('C', 2), axes.Axis('Y', 10, 0.5, 'µm'), axes.Axis('X', 10, 0.5, 'µm')],
+        'test', True,
+    )
+    v = tiki.open_data(arr, 'ch_named.tif', axes=info, metadata={'channel_names': ['DAPI', 'RFP']})
+    tiki.split_channels()
+    names = [ly.name for ly in v.layers if ly.__class__.__name__ == 'Image']
+    assert names == ['C1 (DAPI)-ch_named.tif', 'C2 (RFP)-ch_named.tif']
+    tiki.merge_channels()
+    assert [ly.name for ly in v.layers if ly.__class__.__name__ == 'Image'] == ['ch_named.tif']
+
+
+def test_calibrated_point_roi_manager_particles_summarize_and_unit_mismatch(tiki, tmp_path, monkeypatch):
+    from napari.layers import Labels
+    from qtpy.QtWidgets import QFileDialog
+    from tiki import axes
+
+    img = np.arange(20 * 20, dtype=np.float32).reshape(20, 20)
+    info = axes.AxesInfo(
+        [axes.Axis('Y', 20, 0.5, 'µm'), axes.Axis('X', 20, 0.5, 'µm')],
+        'test', True,
+    )
+    v = tiki.open_data(img, 'calib.tif', axes=info)
+
+    # Point tool records calibrated X/Y coordinates
+    tiki.set_tool('point')
+    pts = roi.points_layer(v)
+    pts.add(np.array([[4.0, 6.0]]))
+    tiki.measure()
+    assert tiki.results.rows[-1]['X'] == pytest.approx(3.0)
+    assert tiki.results.rows[-1]['Y'] == pytest.approx(2.0)
+    assert tiki.results.column_units.get('X') == 'µm'
+
+    # Line ROI in ROI Manager records calibrated Length
+    tiki.results.clear()
+    tiki.set_tool('rectangle')
+    tiki.roi_layer(v).add(np.array([[0.0, 0.0], [0.0, 10.0]]), shape_type='line')
+    mgr = tiki.show_roi_manager()
+    mgr.add_current()
+    mgr.measure()
+    assert tiki.results.rows[-1]['Length'] == pytest.approx(5.0)
+    assert tiki.results.column_units.get('Length') == 'µm'
+    assert 'Length (µm)' in tiki.results.as_text()
+
+    # ResultsTable.summarize produces Mean / SD / Min / Max
+    summary = tiki.results.summarize(show=False)
+    assert [s['Stat'] for s in summary] == ['Mean', 'SD', 'Min', 'Max']
+
+    # CSV save includes unit headers
+    csv_out = tmp_path / 'res.csv'
+    monkeypatch.setattr(QFileDialog, 'getSaveFileName', lambda *a, **kw: (str(csv_out), 'CSV (*.csv)'))
+    tiki.results.save_as()
+    assert 'Length (µm)' in csv_out.read_text().splitlines()[0]
+
+    # Unit mismatch (measuring an uncalibrated image) clears shared unit headers
+    tiki.open_data(np.ones((10, 10), np.float32), 'uncalib.tif')
+    tiki.measure()
+    assert tiki.results.column_units == {}
+
+    # 3D calibrated Analyze Particles (mixed nm in Z and µm in XY -> Volume in µm³ + max_size filter)
+    vol = np.zeros((6, 16, 16), dtype=np.float32)
+    lab = np.zeros((6, 16, 16), dtype=np.int32)
+    lab[1:3, 2:4, 2:4] = 1  # 8 voxels
+    lab[1:4, 8:12, 8:12] = 2  # 48 voxels
+    vol[lab > 0] = 50.0
+    info3 = axes.AxesInfo(
+        [axes.Axis('Z', 6, 500.0, 'nm'), axes.Axis('Y', 16, 0.5, 'µm'), axes.Axis('X', 16, 0.5, 'µm')],
+        'test', True,
+    )
+    v3 = tiki.open_data(vol, 'vol3d.tif', axes=info3)
+    ly_lab = v3.add_labels(lab, name='objs', scale=info3.scale)
+    # 500 nm = 0.5 µm -> voxel volume = 0.5 * 0.5 * 0.5 = 0.125 µm³; max_size=20 voxels keeps only label 1
+    n_kept = tiki.particles(v3, v3.layers['vol3d.tif'], ly_lab, max_size=20, scope='whole', three_d=True)
+    assert n_kept == 1
+    assert tiki.results.rows[0]['Volume'] == pytest.approx(8 * 0.125)
+    assert tiki.results.column_units['Volume'] == 'µm³'
+
+    # Send to Notebook saves axes + results_units into session.json
+    import json
+
+    tiki._quiet_export = True
+    tiki.send_to_notebook(str(tmp_path / 'nb'))
+    manifest = json.loads((tmp_path / 'nb' / 'session.json').read_text())
+    assert manifest['results_units']['Volume'] == 'µm³'
+    assert manifest['axes']['axes'][0]['unit'] == 'nm'
+    if isinstance(mgr, object):
+        mgr.close()
+
+
+def test_calibrated_profiles_traces_and_set_scale_options(tiki, qtbot, accept_dialogs):
+    from qtpy.QtWidgets import QCheckBox, QComboBox, QDoubleSpinBox, QPushButton
+    from tiki import axes, process
+
+    mov = np.arange(5 * 12 * 12, dtype=np.float32).reshape(5, 12, 12)
+    info = axes.AxesInfo(
+        [axes.Axis('T', 5, 0.5, 's'), axes.Axis('Y', 12, 0.25, 'µm'), axes.Axis('X', 12, 0.25, 'µm')],
+        'test', True,
+    )
+    v1 = tiki.open_data(mov, 't1.tif', axes=info)
+    v2 = tiki.open_data(np.ones((8, 8), np.float32), 't2.tif')
+
+    # Calibrated Z/T profile
+    tiki.windows.activate(v1)
+    _rect(tiki.roi_layer(v1), 2, 6, 2, 6)
+    tiki.plot_z_profile()
+    prof = tiki.profiles[-1]
+    assert prof.unit == 's'
+    np.testing.assert_allclose(prof.x, np.arange(5) * 0.5)
+    assert '(s)' in prof.ax.get_xlabel()
+
+    # Calibrated TracesWindow
+    mask = np.zeros((12, 12), bool)
+    mask[2:6, 2:6] = True
+    tw = tiki.show_traces(v1, v1.layers['t1.tif'], ['ROI 1'], masks=[mask])
+    assert tw.unit == 's' and tw.step == pytest.approx(0.5)
+    assert '(s)' in tw.ax.get_xlabel()
+    assert tw.table_text().splitlines()[0].startswith('t (s)')
+
+    # Calibrated cursor readout includes t step in seconds
+    tiki._message_until = 0.0
+    tiki._on_cursor(v1, (2.0 * 0.5, 4.0 * 0.25, 4.0 * 0.25))
+    assert '1 s' in tiki.status_label.text()
+
+    # Set Scale: aspect ratio + Global across v1 and v2, then Remove Scale
+    def cfg_global(dlg):
+        spins = dlg.findChildren(QDoubleSpinBox)
+        spins[0].setValue(10.0)   # dist px
+        spins[1].setValue(5.0)    # known -> sx = 0.5
+        spins[2].setValue(2.0)    # aspect -> sy = 1.0
+        dlg.findChild(QComboBox).setCurrentText('nm')
+        dlg.findChild(QCheckBox).setChecked(True)  # Global
+
+    accept_dialogs['configure'] = cfg_global
+    tiki.windows.activate(v2)
+    process.set_scale_dialog(tiki)
+    i1 = axes.get(v1.layers['t1.tif'])
+    i2 = axes.get(v2.layers['t2.tif'])
+    assert i1.axes[-1].step == pytest.approx(0.5) and i1.axes[-2].step == pytest.approx(1.0) and i1.axes[-1].unit == 'nm'
+    assert i2.axes[-1].step == pytest.approx(0.5) and i2.axes[-2].step == pytest.approx(1.0)
+
+    def cfg_remove(dlg):
+        spins = dlg.findChildren(QDoubleSpinBox)
+        spins[0].setValue(10.0)
+        spins[1].setValue(5.0)
+        for btn in dlg.findChildren(QPushButton):
+            if 'Remove' in btn.text():
+                btn.click()
+                break
+
+    accept_dialogs['configure'] = cfg_remove
+    process.set_scale_dialog(tiki)
+    i2_after = axes.get(v2.layers['t2.tif'])
+    assert i2_after.axes[-1].step is None and i2_after.axes[-1].unit is None
+
+
+def test_new_image_stack_and_process_commands(tiki, accept_dialogs):
+    from qtpy.QtWidgets import QCheckBox, QComboBox, QDoubleSpinBox, QLineEdit, QListWidget, QSpinBox
+    from tiki import axes, filters, process
+
+    # 1. Edit ▸ Invert
+    arr = np.array([[0, 50, 255]], dtype=np.uint8)
+    v = tiki.open_data(arr, 'base.tif')
+    v_inv = tiki.invert()
+    np.testing.assert_array_equal(v_inv.layers[0].data, np.array([[255, 205, 0]], dtype=np.uint8))
+
+    # 2. Image ▸ Adjust ▸ Size… updates pixels and physical pixel step
+    info_cal = axes.AxesInfo([axes.Axis('Y', 8, 1.0, 'µm'), axes.Axis('X', 10, 1.0, 'µm')], 'test', True)
+    v_sz = tiki.open_data(np.arange(80, dtype=np.uint16).reshape(8, 10), 'res.tif', axes=info_cal)
+
+    def cfg_resize(dlg):
+        spins = dlg.findChildren(QDoubleSpinBox)
+        spins[0].setValue(2.0)  # X scale -> 20x16, step 0.5 µm
+
+    accept_dialogs['configure'] = cfg_resize
+    v_resized = process.resize_dialog(tiki)
+    assert v_resized.layers[0].data.shape == (16, 20)
+    assert axes.get(v_resized.layers[0]).axes[-1].step == pytest.approx(0.5)
+
+    # 3. Process ▸ Math… & Process ▸ Filters ▸ Find Edges + mean/unsharp
+    tiki.windows.activate(v_sz)
+
+    def cfg_math(dlg):
+        _combo(dlg, 'Add').setCurrentText('Add')
+        dlg.findChild(QDoubleSpinBox).setValue(5.0)
+
+    accept_dialogs['configure'] = cfg_math
+    math_ly = process.math_dialog(tiki)
+    np.testing.assert_allclose(math_ly.data, v_sz.layers['res.tif'].data + 5.0)
+
+    tiki.windows.activate(v_sz)
+    edge_ly = process.find_edges_command(tiki)
+    assert 'edges' in edge_ly.name and edge_ly.data.dtype == np.float32
+
+    mean_ly = filters.run_filter(tiki, 'mean', v_sz, v_sz.layers['res.tif'], {'radius': 1.0}, whole_stack=False)
+    sharp_ly = filters.run_filter(tiki, 'unsharp', v_sz, v_sz.layers['res.tif'], {'sigma': 1.0, 'weight': 0.5}, whole_stack=False)
+    assert 'mean' in mean_ly.name and 'unsharp' in sharp_ly.name
+
+    # Physical readout check in FilterDialog
+    fdlg = filters.FilterDialog(tiki, 'mean', v_sz, v_sz.layers['res.tif'])
+    assert 'µm' in fdlg.info.text()
+    fdlg.reject()
+
+    # 4. Process ▸ Labels ▸ Morphology…
+    lab = np.zeros((10, 10), dtype=np.int32)
+    lab[3:7, 3:7] = 1
+    lab[0, 0] = 2
+    v_sz.add_labels(lab, name='seg')
+
+    def cfg_morph(dlg):
+        _combo(dlg, 'Open').setCurrentText('Open')
+
+    accept_dialogs['configure'] = cfg_morph
+    morph_ly = process.morphology_dialog(tiki)
+    assert morph_ly.data[0, 0] == 0 and morph_ly.data[5, 5] == 1
+
+    # 5. Images to Stack, Concatenate, Reverse, Remove Slices, Hyperstack to Stack, Merge Channels
+    p1 = np.zeros((8, 8), dtype=np.uint16)
+    p2 = np.ones((8, 8), dtype=np.uint16) * 7
+    vp1 = tiki.open_data(p1, 'plane1.tif')
+    vp2 = tiki.open_data(p2, 'plane2.tif')
+
+    accept_dialogs['configure'] = lambda dlg: None
+    v_stk = process.images_to_stack_dialog(tiki)
+    assert v_stk.layers[0].data.shape[0] >= 2
+
+    # Concatenate explicitly checked stacks vp1 & vp2 along new T axis
+    def cfg_concat(dlg):
+        lw = dlg.findChild(QListWidget)
+        for i in range(lw.count()):
+            it = lw.item(i)
+            ly = it.data(0x0100)[1] if hasattr(it.data(0x0100), '__getitem__') else None
+            from qtpy.QtCore import Qt
+
+            it.setCheckState(Qt.Checked if ly in (vp1.layers[0], vp2.layers[0]) else Qt.Unchecked)
+
+    accept_dialogs['configure'] = cfg_concat
+    v_cat = process.concatenate_dialog(tiki)
+    assert v_cat.layers[0].data.shape == (2, 8, 8)
+    assert v_cat.layers[0].data[1].min() == 7
+
+    # Reverse + Remove Slices on a 4-frame stack
+    stk4 = np.arange(4 * 6 * 6, dtype=np.uint16).reshape(4, 6, 6)
+    tiki.open_data(stk4, 'stk4.tif', axes=axes.AxesInfo([axes.Axis('T', 4, 1.0, 's'), axes.Axis('Y', 6), axes.Axis('X', 6)], 'test', True))
+    v_rev = process.reverse_stack_command(tiki)
+    np.testing.assert_array_equal(v_rev.layers[0].data[0], stk4[-1])
+
+    accept_dialogs['configure'] = lambda dlg: dlg.findChild(QLineEdit).setText('1, 4')
+    tiki.windows.activate(v_rev)
+    v_trim = process.remove_slices_dialog(tiki)
+    assert v_trim.layers[0].data.shape == (2, 6, 6)
+
+    # Hyperstack to Stack
+    hs = np.zeros((2, 3, 6, 6), dtype=np.uint16)
+    tiki.open_data(hs, 'hs.tif', axes=axes.AxesInfo([axes.Axis('C', 2), axes.Axis('Z', 3, 1.0, 'µm'), axes.Axis('Y', 6), axes.Axis('X', 6)], 'test', True))
+    v_flat = process.hyperstack_to_stack_command(tiki)
+    assert v_flat.layers[0].data.shape == (6, 6, 6)
+
+    # Multi-window Merge Channels when no split layers exist in active viewer
+    def cfg_merge(dlg):
+        combos = dlg.findChildren(QComboBox)
+        combos[0].setCurrentIndex(combos[0].findData(vp1.layers[0]))
+        combos[1].setCurrentIndex(combos[1].findData(vp2.layers[0]))
+        for cb in combos[2:]:
+            cb.setCurrentIndex(0)
+        dlg.findChild(QCheckBox).setChecked(False)
+
+    accept_dialogs['configure'] = cfg_merge
+    tiki.windows.activate(vp1)
+    v_comp = tiki.merge_channels()
+    assert v_comp.layers[0].data.shape == (2, 8, 8)
+

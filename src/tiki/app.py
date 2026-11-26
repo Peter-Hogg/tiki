@@ -19,6 +19,7 @@ from qtpy.QtWidgets import (
     QComboBox,
     QDialog,
     QDialogButtonBox,
+    QDoubleSpinBox,
     QFileDialog,
     QFormLayout,
     QHBoxLayout,
@@ -198,6 +199,8 @@ class Tiki(QMainWindow):
         m.addSeparator()
         self._add(m, 'Clear', lambda: self._process('clear_selection', outside=False))
         self._add(m, 'Clear Outside', lambda: self._process('clear_selection', outside=True))
+        m.addSeparator()
+        self._add(m, 'Invert', self.invert)
 
         m = mb.addMenu('&Image')
         img_type = m.addMenu('Type')
@@ -210,6 +213,8 @@ class Tiki(QMainWindow):
         self._add(adjust, 'Threshold…', self.threshold, 'Ctrl+Shift+T')
         self._add(adjust, 'Enhance Contrast', self.enhance_contrast, 'Ctrl+Shift+E')
         self._add(adjust, 'Reset Display Range', self.reset_contrast)
+        adjust.addSeparator()
+        self._add(adjust, 'Size…', lambda: self._process('resize_dialog'))
         luts = m.addMenu('Lookup Tables')
         for lut_name in LUTS:
             self._add(luts, lut_name, lambda n=lut_name: self.set_lut(n))
@@ -232,20 +237,32 @@ class Tiki(QMainWindow):
         self._add(stacks, 'Z Project…', self.z_project_dialog)
         self._add(stacks, 'Make Substack…', lambda: self._process('duplicate_dialog', substack_only=True))
         self._add(stacks, 'Stack to Hyperstack…', lambda: self._process('stack_to_hyperstack_dialog'))
+        self._add(stacks, 'Hyperstack to Stack', lambda: self._process('hyperstack_to_stack_command'))
         self._add(stacks, 'Make Montage…', lambda: self._publish('make_montage_dialog'))
         self._add(stacks, 'Orthogonal Views', lambda: self._publish('orthogonal_views'), 'Ctrl+Shift+H')
         self._add(stacks, 'Bin…', lambda: self._process('bin_dialog'))
         self._add(stacks, 'Plot Z-axis Profile', self.plot_z_profile, 'Ctrl+Shift+Y')
         self._add(stacks, 'Kymograph / Reslice…', lambda: self._process('kymograph_dialog'))
         self._add(stacks, 'Correlation Image', lambda: self._process('correlation_image'))
+        self._add(stacks, 'Concatenate…', lambda: self._process('concatenate_dialog'))
+        self._add(stacks, 'Images to Stack…', lambda: self._process('images_to_stack_dialog'))
+        self._add(stacks, 'Reverse', lambda: self._process('reverse_stack_command'))
+        self._add(stacks, 'Remove Slices…', lambda: self._process('remove_slices_dialog'))
         stacks.addSeparator()
         self._add(stacks, 'Split Channels ', self.split_channels)  # same command as Image ▸ Color
 
         m = mb.addMenu('&Process')
         filt = m.addMenu('Filters')
         self._add(filt, 'Gaussian Blur…', lambda: self.filter_dialog('gaussian'))
+        self._add(filt, 'Mean…', lambda: self.filter_dialog('mean'))
         self._add(filt, 'Median…', lambda: self.filter_dialog('median'))
+        self._add(filt, 'Minimum…', lambda: self.filter_dialog('minimum'))
+        self._add(filt, 'Maximum…', lambda: self.filter_dialog('maximum'))
+        self._add(filt, 'Unsharp Mask…', lambda: self.filter_dialog('unsharp'))
+        filt.addSeparator()
+        self._add(filt, 'Find Edges', lambda: self._process('find_edges_command'))
         self._add(m, 'Subtract Background…', lambda: self.filter_dialog('background'))
+        self._add(m, 'Math…', lambda: self._process('math_dialog'))
         m.addSeparator()
         self._add(m, 'ΔF/F…', lambda: self._process('dff_dialog'))
         self._add(m, 'Bleach Correction…', lambda: self._process('bleach_dialog'))
@@ -254,6 +271,7 @@ class Tiki(QMainWindow):
         labels_menu = m.addMenu('Labels')
         self._add(labels_menu, 'Watershed…', lambda: self._process('watershed_dialog'))
         self._add(labels_menu, 'Fill Holes', lambda: self._process('fill_holes_command'))
+        self._add(labels_menu, 'Morphology…', lambda: self._process('morphology_dialog'))
 
         m = mb.addMenu('&Analyze')
         self._add(m, 'Measure', self.measure, 'Ctrl+M')
@@ -392,7 +410,12 @@ class Tiki(QMainWindow):
         y_str = f'y={idx[-2]} ({idx[-2] * y_ax.step:.4g} {y_ax.unit})' if (y_ax.step and y_ax.unit) else f'y={idx[-2]}'
         parts = [x_str, y_str]
         for d in range(ndim - 2):
-            parts.append(f'{roi_mod.axis_name(viewer, image, d)}={idx[d]}')
+            ax = info.axes[d]
+            name = roi_mod.axis_name(viewer, image, d)
+            if ax.role in ('T', 'Z') and ax.step and ax.unit:
+                parts.append(f'{name}={idx[d]} ({idx[d] * ax.step:.4g} {ax.unit})')
+            else:
+                parts.append(f'{name}={idx[d]}')
         if all(0 <= i < s for i, s in zip(idx, shape)):
             value = np.asarray(image.data[idx])
             if value.ndim == 0:
@@ -598,8 +621,9 @@ class Tiki(QMainWindow):
                 continue
             for data, meta in loaded:
                 metadata = {'path': meta['path']}
-                if meta.get('imagej_luts') is not None:
-                    metadata['imagej_luts'] = meta['imagej_luts']
+                for key in ('imagej_luts', 'channel_names', 'acquisition', 'raw_metadata'):
+                    if meta.get(key) is not None:
+                        metadata[key] = meta[key]
                 info = meta['axes']
                 open_kw: dict = {'axes': info, 'metadata': metadata}
                 rgb = data.ndim == len(info.axes) + 1 and data.shape[-1] in (3, 4)
@@ -765,7 +789,14 @@ class Tiki(QMainWindow):
             else:
                 data = np.stack([np.asarray(ly.data) for ly in parts], axis=c)
             luts = [contrast.layer_lut_bytes(ly) for ly in parts]
-            io.save_tiff(path, data, axes=info, luts=luts)
+            ch_names = [ly.metadata.get('channel_name') or '' for ly in parts]
+            io.save_tiff(
+                path,
+                data,
+                axes=info,
+                luts=luts,
+                channel_names=ch_names if any(ch_names) else None,
+            )
             self.status(f'Saved hyperstack {path}')
             return Path(path)
 
@@ -806,7 +837,10 @@ class Tiki(QMainWindow):
         luts = None
         if info.index('C') is None and not layer.rgb and layer.colormap.name != 'gray':
             luts = [contrast.layer_lut_bytes(layer)]
-        io.save_tiff(path, layer.data, axes=info, luts=luts)
+        ch_names = layer.metadata.get('channel_names')
+        if not ch_names and layer.metadata.get('channel_name'):
+            ch_names = [layer.metadata['channel_name']]
+        io.save_tiff(path, layer.data, axes=info, luts=luts, channel_names=ch_names)
         self.status(f'Saved {path}')
         return Path(path)
 
@@ -895,6 +929,22 @@ class Tiki(QMainWindow):
         layer.data = []
         layer.add(verts, shape_type=kind)
         self.status(f'Restored {kind} selection')
+
+    def invert(self):
+        viewer, image = self.require_image()
+        total = int(np.prod(image.data.shape[: image.ndim - 2])) if image.ndim > 2 else 1
+        with self.progress('Invert', total) as tick:
+            out = ops.invert_image(image.data, rgb=bool(image.rgb), progress=tick)
+        if tick.cancelled:
+            self.status('Invert cancelled')
+            return None
+        info = axes_mod.fit(axes_mod.get(image), out.shape[:-1] if image.rgb else out.shape)
+        kw: dict = {'axes': info, 'rgb': bool(image.rgb)}
+        if not image.rgb:
+            kw['colormap'] = image.colormap
+        v = self.open_data(out, f'Inv_{image.name}', **kw)
+        self.status(f'Inverted {image.name}')
+        return v
 
     # ------------------------------------------------------------- Image
 
@@ -1017,14 +1067,19 @@ class Tiki(QMainWindow):
         self._refresh_channels_tool(viewer)
         self.status(f'Split {image.name} into {len(layers)} channel layers (run Split Channels again for separate windows)')
 
-    def merge_channels(self) -> None:
+    def merge_channels(self):
         from . import channels
 
-        viewer, _ = self.require_image()
-        layer = channels.merge(viewer)
-        self.reapply_tool(viewer)
-        self._refresh_channels_tool(viewer)
-        self.status(f'Merged channels back into {layer.name}')
+        viewer = self.windows.active
+        if viewer is not None and any(
+            isinstance(ly, Image) and 'split_from' in ly.metadata for ly in viewer.layers
+        ):
+            layer = channels.merge(viewer)
+            self.reapply_tool(viewer)
+            self._refresh_channels_tool(viewer)
+            self.status(f'Merged channels back into {layer.name}')
+            return layer
+        return self._process('merge_channels_dialog')
 
     def channels_tool(self) -> None:
         from .channels import ChannelsTool
@@ -1086,21 +1141,15 @@ class Tiki(QMainWindow):
         viewer, image = self.require_image()
         image.reset_contrast_limits()
 
-    def show_info(self) -> None:
+    def show_info(self):
+        from .widgets import InfoWindow
+
         viewer, image = self.require_image()
-        data = image.data
-        plane = roi_mod.current_plane(viewer, image)
-        lines = [
-            f'Title: {image.name}',
-            f'Path: {image.metadata.get("path", "(not saved)")}',
-            f'Shape: {data.shape}',
-            f'Type: {data.dtype}',
-            f'Size: {data.nbytes / 2**20:.1f} MB' + (' (memory-mapped)' if isinstance(data, np.memmap) else ''),
-            f'Scale: {tuple(float(s) for s in image.scale)}',
-            f'Current slice: {roi_mod.current_index(viewer, image)[:-2]}',
-            f'Slice min/max: {plane.min():.4g} / {plane.max():.4g}',
-        ]
-        QMessageBox.information(self, f'Info for {image.name}', '\n'.join(lines))
+        win = InfoWindow(viewer, image)
+        self.keep_window(win)
+        win.show()
+        win.raise_()
+        return win
 
     def _roi_box(self, viewer, image):
         current = self.current_roi(viewer)
@@ -1240,6 +1289,24 @@ class Tiki(QMainWindow):
 
     # ----------------------------------------------------------- Analyze
 
+    def _sync_result_units(self, units: dict[str, str], reset: bool = False) -> None:
+        if reset or not self.results.rows:
+            self.results.set_units(units, replace=True)
+            return
+        if not units:
+            if self.results.column_units:
+                self.results.clear_units()
+            return
+        prev_x = self.results.column_units.get('X')
+        new_x = units.get('X')
+        if prev_x is None:
+            self.results.clear_units()
+        elif prev_x != new_x:
+            self.results.clear_units()
+            self.status(f'Note: Results mix {prev_x} and {new_x}; column units cleared')
+        else:
+            self.results.set_units(units, replace=False)
+
     def measure(self) -> None:
         viewer, image = self.require_image()
         plane = roi_mod.current_plane(viewer, image)
@@ -1248,27 +1315,30 @@ class Tiki(QMainWindow):
         if image.ndim > 2:
             base['Slice'] = ','.join(str(i + 1) for i in index[:-2])
 
+        info = axes_mod.get(image)
+        scale_yx = (float(image.scale[-2]), float(image.scale[-1]))
+        unit = axes_mod.spatial_unit(info)
+        new_units = {'Area': f'{unit}²', 'Length': unit, 'X': unit, 'Y': unit, 'Perim.': unit, 'Feret': unit} if unit else {}
+        self._sync_result_units(new_units)
+
         points = roi_mod.points_layer(viewer, create=False)
         if self.tool == 'point' and points is not None and len(points.data):
+            sy, sx = scale_yx
             for p in points.data:
                 y, x = (int(np.floor(c + 0.5)) for c in p[-2:])
                 if 0 <= y < plane.shape[0] and 0 <= x < plane.shape[1]:
-                    self.results.add_row(base | {'X': x, 'Y': y, 'Value': float(plane[y, x])})
+                    x_val = x if (unit is None and sx == 1.0) else float(x * sx)
+                    y_val = y if (unit is None and sy == 1.0) else float(y * sy)
+                    self.results.add_row(base | {'X': x_val, 'Y': y_val, 'Value': float(plane[y, x])})
             self.show_results()
             return
 
         current = self.current_roi(viewer)
         mask = None if current is None else roi_mod.shape_mask(*current, plane.shape)
-        scale_yx = (float(image.scale[-2]), float(image.scale[-1]))
         row = base | ops.mask_stats(plane, mask, roi_mod.pixel_area(image), scale=scale_yx, include=self.measurements)
         if current is not None and current[1] in ('line', 'path'):
-            verts = np.asarray(current[0])[:, -2:] * np.asarray(image.scale[-2:])
+            verts = np.asarray(current[0])[:, -2:] * np.asarray(scale_yx)
             row['Length'] = float(np.linalg.norm(np.diff(verts, axis=0), axis=1).sum())
-        info = axes_mod.get(image)
-        y_ax = info.axes[info.index('Y')] if info.index('Y') is not None else None
-        if y_ax is not None and y_ax.step and y_ax.unit:
-            u = y_ax.unit
-            self.results.set_units({'Area': f'{u}²', 'Length': u, 'X': u, 'Y': u, 'Perim.': u, 'Feret': u})
         self.results.add_row(row)
         self.show_results()
 
@@ -1361,8 +1431,12 @@ class Tiki(QMainWindow):
             return None
         if len(names) == 0:
             raise TikiError('nothing to plot')
-        win = TracesWindow(f'Traces — {image.name}', names, traces, viewer, image, axis,
-                           xlabel=roi_mod.axis_name(viewer, image, axis))
+        info = axes_mod.get(image)
+        win = TracesWindow(
+            f'Traces — {image.name}', names, traces, viewer, image, axis,
+            xlabel=roi_mod.axis_name(viewer, image, axis),
+            step=info.axes[axis].step, unit=info.display_unit(axis),
+        )
         win.setAttribute(Qt.WA_DeleteOnClose)
         self.traces.append(win)
         self.profiles.append(win)
@@ -1398,9 +1472,15 @@ class Tiki(QMainWindow):
         form.addRow('Measure intensity in:', image_box)
         scope = QComboBox()
         three_d = QCheckBox('Measure objects in 3D (volume, z centroid)', checked=True)
-        state = {'has_z': False}  # not widget visibility: a closed dialog reports all widgets hidden
-        min_size = QSpinBox()
-        min_size.setRange(0, 10**7)
+        min_size = QDoubleSpinBox()
+        min_size.setRange(0.0, 1e9)
+        min_size.setDecimals(0)
+        max_size = QDoubleSpinBox()
+        max_size.setRange(0.0, 1e9)
+        max_size.setDecimals(0)
+        max_size.setSpecialValueText('∞')
+        phys_box = QCheckBox('Use physical units for size filter', checked=True)
+        state = {'has_z': False, 'unit': None, 'unit_size': 1.0}
 
         def refresh_scopes(_=None):
             img = image_box.layer()
@@ -1413,19 +1493,36 @@ class Tiki(QMainWindow):
                 scope.setCurrentIndex(scope.findData(current))
             state['has_z'] = info is not None and info.index('Z') is not None
             three_d.setVisible(state['has_z'])
+            state['unit'] = axes_mod.spatial_unit(info) if info is not None else None
+            phys_box.setVisible(bool(state['unit']))
             update_units()
 
         def update_units(_=None):
-            min_size.setSuffix(' voxels' if state['has_z'] and three_d.isChecked()
-                               and scope.currentData() != nd.PLANE else ' px')
+            img = image_box.layer()
+            is_3d = state['has_z'] and three_d.isChecked() and scope.currentData() != nd.PLANE
+            u = state['unit']
+            if img is not None and u:
+                (sz, sy, sx), _, _ = axes_mod.physical_scale_3d(axes_mod.get(img))
+                state['unit_size'] = (sz * sy * sx) if is_3d else (sy * sx)
+            else:
+                state['unit_size'] = 1.0
+            use_phys = bool(u and phys_box.isChecked())
+            suffix = (f' {u}³' if is_3d else f' {u}²') if use_phys else (' voxels' if is_3d else ' px')
+            decimals = 4 if use_phys else 0
+            for spin in (min_size, max_size):
+                spin.setSuffix(suffix)
+                spin.setDecimals(decimals)
 
         image_box.layer_changed.connect(refresh_scopes)
         scope.currentIndexChanged.connect(update_units)
         three_d.toggled.connect(update_units)
+        phys_box.toggled.connect(update_units)
         refresh_scopes()
         form.addRow('Measure:', scope)
         form.addRow(three_d)
+        form.addRow(phys_box)
         form.addRow('Min size:', min_size)
+        form.addRow('Max size:', max_size)
         exclude = QCheckBox('Exclude on edges')
         clear = QCheckBox('Clear results', checked=True)
         form.addRow(exclude)
@@ -1438,12 +1535,16 @@ class Tiki(QMainWindow):
             return
         if labels_box.layer() is None or image_box.layer() is None:
             raise TikiError('choose a Labels layer and an image')
-        self.particles(viewer, image_box.layer(), labels_box.layer(), min_size.value(), exclude.isChecked(),
+        unit_size = state['unit_size'] if (state['unit'] and phys_box.isChecked()) else 1.0
+        min_px = (min_size.value() / unit_size) if min_size.value() > 0 else 0
+        max_px = (max_size.value() / unit_size) if max_size.value() > 0 else None
+        self.particles(viewer, image_box.layer(), labels_box.layer(), min_px, exclude.isChecked(),
                        clear.isChecked(), scope.currentData() or nd.PLANE,
-                       state['has_z'] and three_d.isChecked())
+                       state['has_z'] and three_d.isChecked(), max_size=max_px)
 
     def particles(self, viewer, image, layer, min_size=0, exclude_edges=False, clear=True,
-                  scope: str = 'plane', three_d: bool = True, whole_stack: bool | None = None):
+                  scope: str = 'plane', three_d: bool = True, whole_stack: bool | None = None,
+                  max_size: float | None = None):
         """Measure every object of Labels ``layer`` in ``image`` (plane, volume or whole stack)."""
         from skimage.segmentation import clear_border
 
@@ -1464,8 +1565,19 @@ class Tiki(QMainWindow):
             raise TikiError(f'"{layer.name}" is a single plane; measure "This plane" or threshold the volume')
         shape = tuple(image.data.shape[:ndim])
         blocks = nd.blocks(info, shape, roi_mod.current_index(viewer, image), scope, by_volume)
+        phys_3d, phys_unit, _ = axes_mod.physical_scale_3d(info)
         if clear:
             self.results.clear()
+        p_units: dict[str, str] = {}
+        if phys_unit:
+            if by_volume:
+                p_units = {'Volume': f'{phys_unit}³', 'X': phys_unit, 'Y': phys_unit, 'Z': phys_unit}
+            else:
+                p_units = {
+                    'Area': f'{phys_unit}²', 'X': phys_unit, 'Y': phys_unit,
+                    'Perim.': phys_unit, 'Feret': phys_unit,
+                }
+        self._sync_result_units(p_units, reset=clear)
         total = 0
         with self.progress('Analyze Particles', len(blocks)) as tick:
             for n, block in enumerate(blocks):
@@ -1479,17 +1591,27 @@ class Tiki(QMainWindow):
                     lab = ops.label_objects(lab > 0)
                 if exclude_edges:
                     lab = clear_border(lab)
-                if min_size > 1:
+                if min_size > 1 or (max_size is not None and max_size > 0):
                     sizes = np.bincount(lab.ravel())
-                    lab = np.where(sizes[lab] >= min_size, lab, 0)
+                    keep = np.ones_like(sizes, dtype=bool)
+                    keep[0] = False
+                    if min_size > 1 or (0 < min_size <= 1 and phys_unit):
+                        keep &= sizes >= min_size
+                    if max_size is not None and max_size > 0:
+                        keep &= sizes <= max_size
+                    lab = np.where(keep[lab], lab, 0)
                 block_scale = [image.scale[d] for d, b in enumerate(block) if not isinstance(b, int)]
+                if phys_unit:
+                    scale_arg = phys_3d if (lab.ndim == 3 and by_volume) else phys_3d[1:]
+                else:
+                    scale_arg = block_scale[-2:] if (lab.ndim == 3 and not by_volume) else block_scale
                 if lab.ndim == 3 and not by_volume:  # labels with Z, measured slice by slice
                     rows = []
                     for k in range(lab.shape[0]):
-                        for row in ops.particle_table(lab[k], img[k], block_scale[-2:]):
+                        for row in ops.particle_table(lab[k], img[k], scale_arg[-2:]):
                             rows.append({'z': k + 1} | row)
                 else:
-                    rows = ops.particle_table(lab, img, block_scale)
+                    rows = ops.particle_table(lab, img, scale_arg)
                 where = nd.block_label(info, block)
                 for row in rows:
                     if where:
@@ -1530,7 +1652,8 @@ class Tiki(QMainWindow):
         manager = self.roi_manager.rois if self.roi_manager is not None else []
         traces = [(w.windowTitle(), w.names, w.traces) for w in self.traces if w.viewer is viewer]
         out, snippet = export_session(folder, viewer, image, manager, traces,
-                                      self.results.rows, self.results.columns)
+                                      self.results.rows, self.results.columns,
+                                      results_units=self.results.column_units)
         quiet = getattr(self, '_quiet_export', False)
         # Clipboard access can block indefinitely on headless Linux. Quiet
         # mode is used by tests and programmatic callers, which already get
@@ -1789,7 +1912,8 @@ class Tiki(QMainWindow):
         self.windows.close_all()
         self.results.close()
         for w in (self.contrast_window, self.threshold_window, self.roi_manager, self.console_window,
-                  getattr(self, 'channels_window', None), getattr(self, 'log_window', None)):
+                  getattr(self, 'channels_window', None), getattr(self, 'log_window', None),
+                  getattr(self.results, '_summary_win', None)):
             if w is not None:
                 w.close()
         for w in list(self.profiles):

@@ -25,6 +25,7 @@ from qtpy.QtWidgets import (
     QWidget,
 )
 
+from . import axes as axes_mod
 from . import ops, style
 from . import roi as roi_mod
 from . import rois as R
@@ -169,12 +170,26 @@ class RoiManager(QWidget):
             self._error('the ROI Manager is empty')
         plane = roi_mod.current_plane(viewer, image)
         index = roi_mod.current_index(viewer, image)
+        scale_yx = (float(image.scale[-2]), float(image.scale[-1]))
+        info = axes_mod.get(image)
+        u = axes_mod.spatial_unit(info)
+        new_units = {'Area': f'{u}²', 'Length': u, 'X': u, 'Y': u, 'Perim.': u, 'Feret': u} if u else {}
+        self.tiki._sync_result_units(new_units)
         for i in self._targets():
             roi = self.rois[i]
             row = {'Label': image.name, 'ROI': roi.name}
             if image.ndim > 2:
                 row['Slice'] = ','.join(str(j + 1) for j in index[:-2])
-            row |= ops.mask_stats(plane, roi.mask(plane.shape), roi_mod.pixel_area(image))
+            row |= ops.mask_stats(
+                plane,
+                roi.mask(plane.shape),
+                roi_mod.pixel_area(image),
+                scale=scale_yx,
+                include=self.tiki.measurements,
+            )
+            if roi.kind in ('line', 'path'):
+                verts = np.asarray(roi.yx)[:, -2:] * np.asarray(scale_yx)
+                row['Length'] = float(np.linalg.norm(np.diff(verts, axis=0), axis=1).sum())
             self.tiki.results.add_row(row)
         self.tiki.show_results()
 

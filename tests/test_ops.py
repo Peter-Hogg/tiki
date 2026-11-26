@@ -517,3 +517,118 @@ def test_stack_to_hyperstack_block_and_interleaved():
 
     with pytest.raises(ValueError):
         ops.stack_to_hyperstack(flat_blocks, channels=3, slices=1, frames=3, order='xytzc')
+
+
+def test_anisotropic_mask_stats_and_particle_table():
+    plane = np.ones((20, 20), dtype=np.float32) * 10.0
+    mask = np.zeros((20, 20), dtype=bool)
+    mask[4:10, 4:14] = True  # 6 px tall x 10 px wide
+    # Anisotropic scaling: sy=2.0 µm/px, sx=0.5 µm/px => physical 12 µm tall x 5 µm wide
+    stats = ops.mask_stats(plane, mask, pixel_area=1.0, scale=(2.0, 0.5), include=ops.MEASUREMENT_KEYS)
+    assert stats['Area'] == pytest.approx(60.0)
+    assert stats['X'] == pytest.approx(8.5 * 0.5)
+    assert stats['Y'] == pytest.approx(6.5 * 2.0)
+    assert stats['Perim.'] > 20.0
+    assert stats['Feret'] > 10.0
+
+    labels = np.zeros((20, 20), dtype=np.int32)
+    labels[4:10, 4:14] = 1
+    rows = ops.particle_table(labels, plane, scale=(2.0, 0.5))
+    assert len(rows) == 1
+    r = rows[0]
+    assert r['Area'] == pytest.approx(60.0)
+    assert r['X'] == pytest.approx(8.5 * 0.5)
+    assert r['Y'] == pytest.approx(6.5 * 2.0)
+    assert 'Feret' in r and r['Feret'] == pytest.approx(stats['Feret'])
+
+
+def test_invert_math_resize_and_edge_filters():
+    # Invert uint8, float32, RGBA (alpha preserved)
+    u8 = np.array([[0, 100, 255]], dtype=np.uint8)
+    np.testing.assert_array_equal(ops.invert_image(u8), np.array([[255, 155, 0]], dtype=np.uint8))
+
+    f32 = np.array([[1.0, 3.0, 5.0]], dtype=np.float32)
+    np.testing.assert_allclose(ops.invert_image(f32), np.array([[5.0, 3.0, 1.0]], dtype=np.float32))
+
+    rgba = np.array([[[10, 20, 30, 128]]], dtype=np.uint8)
+    inv_rgba = ops.invert_image(rgba, rgb=True)
+    np.testing.assert_array_equal(inv_rgba, np.array([[[245, 235, 225, 128]]], dtype=np.uint8))
+
+    # Math ops
+    arr = np.array([[1.0, 4.0], [-9.0, 16.0]], dtype=np.float32)
+    np.testing.assert_allclose(ops.math_op(arr, 'Add', 2.0), arr + 2.0)
+    np.testing.assert_allclose(ops.math_op(arr, 'Multiply', 3.0), arr * 3.0)
+    np.testing.assert_allclose(ops.math_op(arr, 'Abs'), np.abs(arr))
+    np.testing.assert_allclose(ops.math_op(np.array([[4.0, 9.0]], np.float32), 'Square Root'), np.array([[2.0, 3.0]], np.float32))
+    # NaN on <= 0 in Log, non-finite ignored in Divide by 0 -> nan
+    div0 = ops.math_op(arr, 'Divide', 0.0)
+    assert np.all(np.isnan(div0))
+
+    # Resize stack & RGB
+    stack = np.arange(2 * 8 * 10, dtype=np.uint16).reshape(2, 8, 10)
+    resized = ops.resize_image(stack, (16, 20), order=1)
+    assert resized.shape == (2, 16, 20) and resized.dtype == np.uint16
+    rgb_img = np.zeros((3, 8, 10, 3), dtype=np.uint8)
+    assert ops.resize_image(rgb_img, (4, 5), order=0, rgb=True).shape == (3, 4, 5, 3)
+
+    # Mean, Minimum, Maximum, Unsharp Mask (2D & 3D), Find Edges
+    plane = np.zeros((11, 11), dtype=np.float32)
+    plane[5, 5] = 100.0
+    assert ops.maximum_filter(plane, 1.0)[5, 6] == pytest.approx(100.0)
+    assert ops.minimum_filter(np.pad(np.ones((5, 5)), 2), 1.0)[2, 2] == pytest.approx(0.0)
+    assert 0.0 < ops.mean_filter(plane, 1.0)[5, 5] < 100.0
+    sharp = ops.unsharp_mask(plane, sigma=1.0, weight=0.6)
+    assert sharp[5, 5] > plane[5, 5]
+    edges = ops.find_edges(np.pad(np.ones((5, 5), dtype=np.float32), 3))
+    assert edges.shape == (11, 11) and edges[3, 3] > 0.0 and edges[0, 0] == 0.0
+
+    vol = np.zeros((5, 9, 9), dtype=np.float32)
+    vol[2, 4, 4] = 50.0
+    assert ops.mean_3d(vol, 1.0, z_ratio=2.0).shape == vol.shape
+    assert ops.maximum_3d(vol, 1.0, z_ratio=2.0)[2, 4, 5] == pytest.approx(50.0)
+    assert ops.minimum_3d(vol + 10.0, 1.0, z_ratio=2.0).min() == pytest.approx(10.0)
+    assert ops.unsharp_mask_3d(vol, sigma=1.0, weight=0.5, z_ratio=2.0)[2, 4, 4] > vol[2, 4, 4]
+
+
+def test_morphology_and_stack_manipulation_ops():
+    # Binary morphology
+    bin_mask = np.zeros((15, 15), dtype=np.uint8)
+    bin_mask[4:11, 4:11] = 1
+    bin_mask[4, 4] = 0
+    bin_mask[0, 0] = 1  # single-pixel noise
+    opened = ops.morphology_labels(bin_mask, op='open', radius=1.0)
+    assert opened.dtype == np.uint8 and opened[0, 0] == 0 and opened[7, 7] == 1
+
+    # Multi-label 3D morphology keeps distinct label IDs
+    lab3d = np.zeros((7, 15, 15), dtype=np.int32)
+    lab3d[1:6, 2:7, 2:7] = 1
+    lab3d[1:6, 8:13, 8:13] = 2
+    dil = ops.morphology_labels(lab3d, op='dilate', radius=1.0, z_ratio=1.0)
+    assert set(np.unique(dil)) == {0, 1, 2}
+    assert dil[3, 1, 4] == 1 and dil[3, 13, 10] == 2
+
+    # Concatenate, Images to Stack, Reverse, Remove Slices, Hyperstack to Stack
+    a = np.ones((2, 4, 5), dtype=np.uint8)
+    b = np.full((3, 4, 5), 2, dtype=np.float32)
+    cat = ops.concatenate_stacks([a, b], axis=0)
+    assert cat.shape == (5, 4, 5) and cat.dtype == np.float32
+    assert np.all(cat[:2] == 1) and np.all(cat[2:] == 2)
+
+    p1 = np.zeros((4, 5), dtype=np.uint16)
+    p2 = np.ones((4, 5), dtype=np.uint16)
+    stk = ops.images_to_stack([p1, p2])
+    assert stk.shape == (2, 4, 5) and stk[1].min() == 1
+
+    rev = ops.reverse_stack(np.arange(4 * 3 * 3).reshape(4, 3, 3), axis=0)
+    assert rev[0, 0, 0] == 3 * 9
+
+    trimmed = ops.remove_slices(np.arange(6 * 2 * 2).reshape(6, 2, 2), axis=0, spec='1, 3-5')
+    assert trimmed.shape == (2, 2, 2)
+    assert trimmed[0, 0, 0] == 4 and trimmed[1, 0, 0] == 20
+
+    hs = np.arange(2 * 3 * 4 * 4).reshape(2, 3, 4, 4)
+    flat = ops.hyperstack_to_stack(hs)
+    assert flat.shape == (6, 4, 4)
+    np.testing.assert_array_equal(flat[0], hs[0, 0])
+    np.testing.assert_array_equal(flat[5], hs[1, 2])
+

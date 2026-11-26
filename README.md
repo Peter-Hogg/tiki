@@ -143,9 +143,11 @@ pixel value.
   multiple selections, or press <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>R</kbd> to
   restore the previous selection
 - **Edit ▸ Selection**: Enlarge / Shrink, Make Band (annulus/neuropil ring),
-  Wand Tolerance, plus non-destructive **Edit ▸ Clear / Clear Outside**
+  Wand Tolerance, **Edit ▸ Invert**, plus non-destructive **Edit ▸ Clear / Clear Outside**
+- **Image ▸ Adjust ▸ Size…**: resize images/stacks with selectable interpolation and automatic physical pixel spacing updates
 - **Image ▸ Transform** (Flip, Rotate 90°, Rotate…) and **Image ▸ Type**
   (8-bit, 16-bit, 32-bit, RGB Color composite flatten)
+- **Image ▸ Show Info…** (<kbd>Ctrl</kbd>+<kbd>I</kbd>): scrollable image, axis, calibration, and parsed acquisition metadata viewer with toggleable raw OME/CZI/ScanImage/Micro-Manager headers, Copy, and `.txt` export
 - Application-wide shortcuts that continue to work when a napari image window
   has focus
 
@@ -154,8 +156,18 @@ pixel value.
 - Maximum, average, sum, standard-deviation, median and minimum projections
 - Selectable projection range
 - Chunked projection operations for memory-mapped movies
-- **Duplicate…** (<kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>D</kbd>) and **Make Substack…** with 1-based slice ranges (`1-50`, `1-100-2`, `1, 4, 7`), single-plane extraction and optional ROI crop (zero-copy views on memory-mapped/Dask stacks)
-- **Image ▸ Stacks ▸ Bin…**: temporal and XY binning (`Average`, `Max`, `Min`, `Median`, `Sum`) with updated physical scale
+- **Image ▸ Stacks**: **Z Project…**, **Duplicate…** / **Make Substack…**,
+  **Stack to Hyperstack…**, **Hyperstack to Stack**, **Concatenate…**,
+  **Images to Stack…**, **Reverse**, **Remove Slices…**, and **Bin…** with
+  updated physical calibration
+- **Process ▸ Filters**: Gaussian Blur, Mean, Median, Minimum, Maximum, Unsharp
+  Mask (with live preview and physical kernel readout), Sobel **Find Edges**,
+  and rolling-ball **Subtract Background…**
+- **Process ▸ Math…**: non-destructive scalar/unary math (`Add`, `Subtract`,
+  `Multiply`, `Divide`, `Min`, `Max`, `Gamma`, `Log`, `Exp`, `Square`, `Sqrt`,
+  `Abs`) on the current plane or whole stack
+- **Process ▸ Labels**: **Watershed…**, **Fill Holes**, and **Morphology…**
+  (`Erode`, `Dilate`, `Open`, `Close` on binary or multi-label 2D/3D masks)
 - Crop, enhance contrast and reset contrast
 - **Brightness/Contrast…** (<kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>C</kbd>): floating histogram with transfer ramp, Min/Max sliders and spinboxes, **Auto** saturation cycling, **Reset**, exact **Set…** and **Propagate** across windows
 - **Image ▸ Lookup Tables**: `Grays`, `Inverted Grays`, `Fire`, `Cyan Hot`, `HiLo`, channel colors and scientific colormaps, plus per-channel contrast sliders and `Auto` buttons in **Channels Tool…**
@@ -166,18 +178,27 @@ pixel value.
 
 - Results table with configurable **Analyze ▸ Set Measurements…** (Area, Mean,
   StdDev, Min, Max, Median, IntDen, RawIntDen, Centroid, Perimeter, Circularity,
-  Feret, AR, Solidity) and unit-labelled headers for calibrated images
-- Copy results or save them as CSV
+  Feret, AR, Solidity), physical unit column headers (`Area (µm²)`, etc.), and a
+  **Summarize** button (Mean / SD / Min / Max)
+- Calibrated point coordinates, line/polyline lengths, anisotropic contour
+  perimeter/Feret metrics, 2D/3D particle analysis with physical Min/Max size
+  filters, and mixed-unit guards
 - Live straight-line and polyline intensity profiles (<kbd>Ctrl</kbd>+<kbd>K</kbd>)
-  with adjustable line width
-- Live ROI intensity profile through a stack, with current-frame indicator
-- Copy profiles or save them as CSV
+  and stack Z/T profiles and multi-ROI traces plotted with calibrated physical axes
+  (and cursor readout)
 
 ### Multidimensional data (T, Z, C)
 
-- Axis meanings, pixel size, z-step and frame interval are read from ImageJ
-  hyperstack, OME and ScanImage metadata; sliders are labelled `t`, `z`, `c`
-  and measurements, the scale bar and 3D scaling use physical units
+- Axis meanings, pixel size, z-step, frame interval, channel names/colors, and
+  acquisition metadata are read from OME-TIFF/OME-XML (including multi-series
+  files, Greek `μm`, and `<Plane DeltaT>` timestamps), ImageJ hyperstacks,
+  ScanImage, Micro-Manager, Zeiss `.czi`, Nikon `.nd2`, Leica `.lif`, and OME-Zarr;
+  sliders and measurements use physical units and normalise mixed Z/XY units
+  automatically
+- **Analyze ▸ Set Scale…** supports pixel aspect ratio (`Y/X`), **Global**
+  application across windows, and **Remove Scale**
+- **Merge Channels** restores split channels or combines separate greyscale
+  windows into a composite stack
 - Data is never rearranged, only labelled. Files without metadata (`.npy`,
   generic TIFF sequences) open with unknown stack axes (`dim0`) and a status-bar
   hint rather than a wrong guess
@@ -332,22 +353,24 @@ pixel value.
 | File | Close / Close All | <kbd>Ctrl</kbd>+<kbd>W</kbd> / <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>W</kbd> |
 | File | Save As TIFF… | <kbd>Ctrl</kbd>+<kbd>S</kbd> |
 | Edit → Selection | Select All / Select None | <kbd>Ctrl</kbd>+<kbd>A</kbd> / <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>A</kbd> |
+| Edit | Invert | |
 | Image → Adjust | Brightness/Contrast… | <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>C</kbd> |
+| Image → Adjust | Size… | |
 | Image → Adjust | Threshold… (preview and result are napari Labels) | <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>T</kbd> |
 | Image → Adjust | Enhance Contrast | <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>E</kbd> |
 | Image → Lookup Tables | Grays, Fire, Cyan Hot, HiLo, channel colors… | |
 | Image | Properties… (axis meanings, steps, units) | <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>P</kbd> |
 | Image → Color | Split Channels / Merge Channels / Channels Tool… | — / — / <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>Z</kbd> |
-| Image | Show Info | <kbd>Ctrl</kbd>+<kbd>I</kbd> |
+| Image | Show Info… | <kbd>Ctrl</kbd>+<kbd>I</kbd> |
 | Image | Crop | <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>X</kbd> |
 | Image | Duplicate… | <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>D</kbd> |
-| Image → Stacks | Z Project… / Make Substack… / Bin… | |
-| Process → Filters | Gaussian Blur…, Median… (live preview, result as new layer) | |
-| Process | Subtract Background… (rolling ball, light background) | |
+| Image → Stacks | Z Project… / Make Substack… / Bin… / Hyperstack to Stack / Concatenate… / Images to Stack… / Reverse / Remove Slices… | |
+| Process → Filters | Gaussian Blur…, Mean…, Median…, Minimum…, Maximum…, Unsharp Mask…, Find Edges | |
+| Process | Subtract Background… / Math… | |
 | Image → Stacks | Plot Z-axis Profile | <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>Y</kbd> |
 | Analyze | Measure | <kbd>Ctrl</kbd>+<kbd>M</kbd> |
 | Process | ΔF/F…, Bleach Correction…, Motion Correction…, Image Calculator… | |
-| Process → Labels | Watershed…, Fill Holes | |
+| Process → Labels | Watershed…, Fill Holes, Morphology… | |
 | Image → Stacks | Kymograph / Reslice… (from a line or path) | |
 | Analyze | Histogram / Set Scale… | <kbd>Ctrl</kbd>+<kbd>H</kbd> / — |
 | File | Open Recent | |
@@ -405,10 +428,10 @@ src/tiki/
 
 ## Roadmap
 
-- Better OME and acquisition metadata handling
-- Calibration-aware measurements in physical units
-- More everyday ImageJ stack and image commands
-- Packaging and installation documentation for non-developers
+- [x] **Better OME and acquisition metadata handling** — namespace-agnostic OME-XML parser (`μm`, `<Plane DeltaT>` timestamps, channel names/colors/wavelengths, `<Instrument>`/`<Objective>`/`<Detector>`/`<StageLabel>`), multi-series OME-TIFF loading, ScanImage & Micro-Manager tags, CZI/ND2/LIF/OME-Zarr acquisition metadata, OME channel roundtrip on save, and scrollable `Image ▸ Show Info…` with raw metadata drawer
+- [x] **Calibration-aware measurements in physical units** — shared unit normalization (`convert_unit`, `physical_scale_3d`), anisotropic contour perimeter & `Feret` diameter, unit column headers + `Summarize` in Results, calibrated point/ROI Manager/2D & 3D Analyze Particles (with physical Min/Max size filters), calibrated profile/traces/bleach/drift axes, physical radius readouts in filters/labels/selections, and aspect/Global/Remove Scale in `Set Scale…`
+- [x] **More everyday ImageJ stack and image commands** — `Edit ▸ Invert`, `Image ▸ Adjust ▸ Size…`, `Process ▸ Math…`, `Mean` / `Minimum` / `Maximum` / `Unsharp Mask` (2D & 3D) / `Find Edges`, `Labels ▸ Morphology…`, `Concatenate…`, `Images to Stack…`, `Hyperstack to Stack`, `Reverse`, `Remove Slices…`, and multi-window `Merge Channels`
+- [x] **Packaging and installation documentation for non-developers** — Windows SmartScreen / macOS Gatekeeper / Linux standalone installer walkthrough in [Getting Started](docs/getting-started.md), method comparison & troubleshooting guides, `installer/README.md` recipe documentation, and dynamic docs release versioning
 
 ## Name
 

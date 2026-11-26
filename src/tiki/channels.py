@@ -70,6 +70,7 @@ def split(viewer, image: Image) -> list[Image]:
         raise TikiError(f'the C axis has {n} entries; is it really channels? Check Image ▸ Properties.',
                         fix='properties')
     colormaps = _imagej_colormaps(image.metadata.get('imagej_luts'), n) or DEFAULT_COLORS.get(n, ['gray'] * n)
+    ch_names = image.metadata.get('channel_names')
     rest = info.without(c)
     stem = image.name
     position = viewer.layers.index(image)
@@ -77,10 +78,22 @@ def split(viewer, image: Image) -> list[Image]:
     for k in range(n):
         index = (slice(None),) * c + (k,)
         data = image.data[index]  # a view: memory-mapped files stay on disk
-        layer = Image(data, name=f'C{k + 1}-{stem}', colormap=colormaps[k], blending='additive',
-                      **axes_mod.geometry(image, drop=c),
-                      metadata={'axes': rest.to_dict(), 'path': image.metadata.get('path'),
-                                'split_from': image, 'channel': k})
+        cname = str(ch_names[k]).strip() if (isinstance(ch_names, (list, tuple)) and k < len(ch_names) and ch_names[k]) else ''
+        layer_name = f'C{k + 1} ({cname})-{stem}' if cname else f'C{k + 1}-{stem}'
+        meta = {
+            'axes': rest.to_dict(),
+            'path': image.metadata.get('path'),
+            'split_from': image,
+            'channel': k,
+        }
+        if cname:
+            meta['channel_name'] = cname
+        if 'acquisition' in image.metadata:
+            meta['acquisition'] = image.metadata['acquisition']
+        if 'raw_metadata' in image.metadata:
+            meta['raw_metadata'] = image.metadata['raw_metadata']
+        layer = Image(data, name=layer_name, colormap=colormaps[k], blending='additive',
+                      **axes_mod.geometry(image, drop=c), metadata=meta)
         plane = np.asarray(data[(0,) * (data.ndim - 2)])
         layer.contrast_limits = ops.saturated_limits(plane)
         layers.append(layer)

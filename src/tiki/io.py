@@ -241,6 +241,7 @@ def read_czi_scenes(path: str | Path) -> list[tuple[np.ndarray, dict]]:
         if hasattr(czi, 'scenes') and czi.scenes:
             items = list(czi.scenes.items())
             multi = len(items) > 1
+            czi_meta = axes_mod.parse_czi_metadata(xml)
             for scene_idx, czi_img in items:
                 data = czi_img.asarray()
                 data, codes = _squeeze_czi(data, czi_img.axes)
@@ -264,9 +265,16 @@ def read_czi_scenes(path: str | Path) -> list[tuple[np.ndarray, dict]]:
                 luts = _czi_luts(getattr(czi_img, 'channels', None), xml, n_ch)
                 if luts is not None:
                     meta['imagej_luts'] = luts
+                if czi_meta['channel_names'] and len(czi_meta['channel_names']) == n_ch and any(czi_meta['channel_names']):
+                    meta['channel_names'] = czi_meta['channel_names']
+                if czi_meta['acquisition']:
+                    meta['acquisition'] = czi_meta['acquisition']
+                if xml:
+                    meta['raw_metadata'] = {'CZI XML': xml}
                 results.append((data, meta))
         else:
             # Compatibility with older czifile (<2026) without .scenes
+            czi_meta = axes_mod.parse_czi_metadata(xml)
             data = czi.asarray()
             data, codes = _squeeze_czi(data, getattr(czi, 'axes', ''))
             info = axes_mod.from_czi(codes, data.shape, xml=xml)
@@ -278,6 +286,12 @@ def read_czi_scenes(path: str | Path) -> list[tuple[np.ndarray, dict]]:
             luts = _czi_luts(None, xml, n_ch)
             if luts is not None:
                 meta['imagej_luts'] = luts
+            if czi_meta['channel_names'] and len(czi_meta['channel_names']) == n_ch and any(czi_meta['channel_names']):
+                meta['channel_names'] = czi_meta['channel_names']
+            if czi_meta['acquisition']:
+                meta['acquisition'] = czi_meta['acquisition']
+            if xml:
+                meta['raw_metadata'] = {'CZI XML': xml}
             results.append((data, meta))
     return results
 
@@ -323,15 +337,72 @@ def read_nd2_scenes(path: str | Path) -> list[tuple[object, dict]]:
             pass
 
         luts: list[np.ndarray] = []
+        channel_names: list[str] = []
+        nd2_channels: list[dict] = []
         meta_obj = getattr(f, 'metadata', None)
         for ch in getattr(meta_obj, 'channels', None) or []:
             c_info = getattr(ch, 'channel', ch)
+            cname = str(getattr(c_info, 'name', '') or '').strip()
+            channel_names.append(cname)
             rgb_int = getattr(c_info, 'colorRGB', None)
             if isinstance(rgb_int, int):
                 # Nikon stores 0x00BBGGRR
                 lut = _rgb_to_lut(rgb_int & 0xFF, (rgb_int >> 8) & 0xFF, (rgb_int >> 16) & 0xFF)
                 if lut is not None:
                     luts.append(lut)
+            entry: dict = {}
+            if cname:
+                entry['name'] = cname
+            for attr_name, key_out in (
+                ('emissionLambdaNm', 'emission_nm'),
+                ('excitationLambdaNm', 'excitation_nm'),
+            ):
+                val = getattr(c_info, attr_name, None)
+                if val is not None:
+                    try:
+                        entry[key_out] = float(val)
+                    except (TypeError, ValueError):
+                        pass
+            if entry:
+                nd2_channels.append(entry)
+
+        t_step_s: float | None = None
+        for loop in getattr(f, 'experiment', None) or ():
+            params = getattr(loop, 'parameters', None)
+            if params is None:
+                continue
+            period_ms = getattr(params, 'periodMs', None)
+            if not period_ms:
+                pdiff = getattr(params, 'periodDiff', None)
+                period_ms = getattr(pdiff, 'avg', None) if pdiff is not None else None
+            if period_ms:
+                try:
+                    val = float(period_ms)
+                    if val > 0:
+                        t_step_s = val / 1000.0
+                        break
+                except (TypeError, ValueError):
+                    pass
+
+        acq: dict = {}
+        if nd2_channels:
+            acq['channels'] = nd2_channels
+        for ch in getattr(meta_obj, 'channels', None) or []:
+            mic = getattr(ch, 'microscope', None)
+            if mic is not None:
+                obj: dict = {}
+                for attr_name, key_out in (
+                    ('objectiveName', 'model'),
+                    ('objectiveMagnification', 'magnification'),
+                    ('objectiveNumericAperture', 'na'),
+                    ('immersionRefractiveIndex', 'immersion_ri'),
+                ):
+                    val = getattr(mic, attr_name, None)
+                    if val is not None and val != '':
+                        obj[key_out] = val
+                if obj:
+                    acq['objective'] = obj
+                break
 
         def _build_entry(arr, ax_codes: str, name: str) -> tuple[object, dict]:
             if len(ax_codes) == arr.ndim:
@@ -339,7 +410,9 @@ def read_nd2_scenes(path: str | Path) -> list[tuple[object, dict]]:
                 for c, n in zip(ax_codes, arr.shape):
                     role = axes_mod.TIFF_ROLES.get(c, '?')
                     step, unit = None, None
-                    if voxel is not None:
+                    if role == 'T' and t_step_s:
+                        step, unit = t_step_s, 's'
+                    elif voxel is not None:
                         v = {'X': getattr(voxel, 'x', None), 'Y': getattr(voxel, 'y', None), 'Z': getattr(voxel, 'z', None)}.get(role)
                         if v and float(v) > 0:
                             step, unit = float(v), 'µm'
@@ -351,8 +424,14 @@ def read_nd2_scenes(path: str | Path) -> list[tuple[object, dict]]:
                 info = _axes_without_metadata(path, arr.shape)
             meta: dict = {'name': name, 'path': str(path), 'axes': info}
             c_idx = info.index('C')
-            if c_idx is not None and len(luts) == arr.shape[c_idx]:
-                meta['imagej_luts'] = luts
+            if c_idx is not None:
+                n_c = arr.shape[c_idx]
+                if len(luts) == n_c:
+                    meta['imagej_luts'] = luts
+                if len(channel_names) == n_c and any(channel_names):
+                    meta['channel_names'] = channel_names
+            if acq:
+                meta['acquisition'] = acq
             return arr, meta
 
         if 'P' in codes:
@@ -447,7 +526,17 @@ def read_lif_scenes(path: str | Path) -> list[tuple[object, dict]]:
         info = axes_mod.AxesInfo(axes_list, 'LIF metadata', True)
         series_name = getattr(img, 'name', '') or f'S{idx}'
         title = f'{path.name} [{series_name}]' if multi else path.name
-        out.append((arr, {'name': title, 'path': str(path), 'axes': info, 'first_plane': first}))
+        entry_meta: dict = {'name': title, 'path': str(path), 'axes': info, 'first_plane': first}
+        lif_acq: dict = {}
+        for attr_name in ('info', 'settings'):
+            raw = getattr(img, attr_name, None)
+            if isinstance(raw, dict) and raw:
+                clean = {str(k): v for k, v in raw.items() if isinstance(v, (str, int, float, bool))}
+                if clean:
+                    lif_acq[attr_name] = clean
+        if lif_acq:
+            entry_meta['acquisition'] = lif_acq
+        out.append((arr, entry_meta))
     return out
 
 
@@ -473,6 +562,8 @@ def read_zarr(path: str | Path) -> tuple[object, dict]:
     target = root
     info = None
     luts = None
+    channel_names: list[str] = []
+    acq: dict = {}
 
     if hasattr(root, 'keys') and 'multiscales' in attrs:
         ms = attrs['multiscales'][0]
@@ -485,6 +576,22 @@ def read_zarr(path: str | Path) -> tuple[object, dict]:
             parsed = [_czi_color_to_lut(c) for c in hex_colors]
             if all(p is not None for p in parsed):
                 luts = parsed
+        omero = attrs.get('omero') or {}
+        omero_chs = omero.get('channels') or []
+        if c_idx is not None and len(omero_chs) == arr.shape[c_idx]:
+            labels = [str(ch.get('label') or '').strip() if isinstance(ch, dict) else '' for ch in omero_chs]
+            if any(labels):
+                channel_names = labels
+        if isinstance(ms, dict):
+            if ms.get('name'):
+                acq['image_name'] = str(ms['name'])
+            if ms.get('version'):
+                acq['ome_ngff_version'] = str(ms['version'])
+        if omero_chs:
+            acq['channels'] = [
+                {k: ch[k] for k in ('label', 'color', 'active') if k in ch}
+                for ch in omero_chs if isinstance(ch, dict)
+            ]
     else:
         if hasattr(root, 'keys'):
             def _find_array(grp):
@@ -508,6 +615,10 @@ def read_zarr(path: str | Path) -> tuple[object, dict]:
     meta: dict = {'name': path.name, 'path': str(path), 'axes': info, 'first_plane': first_plane}
     if luts is not None:
         meta['imagej_luts'] = luts
+    if channel_names:
+        meta['channel_names'] = channel_names
+    if acq:
+        meta['acquisition'] = acq
     return arr, meta
 
 
@@ -607,9 +718,144 @@ def read_hdf5(path: str | Path, dataset: str | None = None) -> tuple[object, dic
     return data, meta
 
 
+def extract_tiff_metadata(tf, series_index: int = 0) -> dict:
+    """Extract channel names, LUTs, acquisition fields, and raw metadata from an open TiffFile."""
+    out: dict = {}
+    raw: dict[str, str] = {}
+    acq: dict = {}
+
+    ij = tf.imagej_metadata or {}
+    luts = ij.get('LUTs')
+    if luts is not None:
+        luts_arr = np.asarray(luts)
+        if luts_arr.ndim == 2 and luts_arr.shape == (3, 256):
+            out['imagej_luts'] = [luts_arr]
+        else:
+            out['imagej_luts'] = [np.asarray(lut) for lut in luts]
+    if ij.get('Info'):
+        raw['ImageJ Info'] = str(ij['Info'])
+
+    if tf.is_ome and tf.ome_metadata:
+        parsed = axes_mod.parse_ome_xml(tf.ome_metadata, series_index=series_index)
+        if parsed['series_name']:
+            out['series_name'] = parsed['series_name']
+        if parsed['channel_names'] and any(parsed['channel_names']):
+            out['channel_names'] = parsed['channel_names']
+        if 'imagej_luts' not in out and parsed['channel_colors']:
+            c_luts = [_rgb_to_lut(*rgb) if rgb is not None else None for rgb in parsed['channel_colors']]
+            if all(lut is not None for lut in c_luts):
+                out['imagej_luts'] = c_luts
+        if parsed['acquisition']:
+            acq.update(parsed['acquisition'])
+        raw['OME-XML'] = tf.ome_metadata
+
+    if tf.is_scanimage:
+        fd = (tf.scanimage_metadata or {}).get('FrameData', {})
+        if isinstance(fd, dict) and fd:
+            si_acq: dict = {}
+            for key, label in (
+                ('SI.hRoiManager.scanZoomFactor', 'zoom'),
+                ('SI.hRoiManager.scanFrameRate', 'frame_rate_hz'),
+                ('SI.hRoiManager.scanFramePeriod', 'frame_period_s'),
+                ('SI.hRoiManager.imagingFovUm', 'fov_um'),
+                ('SI.hStackManager.actualStackZStepSize', 'z_step_um'),
+                ('SI.hBeams.powers', 'beam_powers'),
+                ('SI.hChannels.channelSave', 'channels_saved'),
+            ):
+                val = fd.get(key)
+                if val is not None:
+                    si_acq[label] = val.tolist() if hasattr(val, 'tolist') else val
+            if si_acq:
+                acq['scanimage'] = si_acq
+            lines = [f'{k} = {v}' for k, v in sorted(fd.items()) if v is not None]
+            if lines:
+                raw['ScanImage'] = '\n'.join(lines)
+
+    if getattr(tf, 'is_micromanager', False):
+        summary = (getattr(tf, 'micromanager_metadata', None) or {}).get('Summary', {})
+        if isinstance(summary, dict) and summary:
+            mm_acq = {
+                k: summary[k]
+                for k in ('Microscope', 'Time', 'PixelSize_um', 'z-step_um', 'Interval_ms', 'ChNames')
+                if k in summary and summary[k] is not None
+            }
+            if mm_acq:
+                acq['micromanager'] = mm_acq
+            ch_names = summary.get('ChNames')
+            if isinstance(ch_names, (list, tuple)) and any(str(c).strip() for c in ch_names):
+                out.setdefault('channel_names', [str(c).strip() for c in ch_names])
+
+    if tf.pages:
+        page = tf.pages[0]
+        for tag_name, key_out in (('DateTime', 'acquisition_date'), ('Software', 'software'), ('Artist', 'artist')):
+            tag = page.tags.get(tag_name)
+            if tag is not None and tag.value and key_out not in acq:
+                val = str(tag.value).strip()
+                if val:
+                    acq[key_out] = val
+
+    if acq:
+        out['acquisition'] = acq
+    if raw:
+        out['raw_metadata'] = raw
+    return out
+
+
+def read_tiff_scenes(path: str | Path) -> list[tuple[object, dict]]:
+    """Open a ``.tif`` / ``.tiff`` / ``.ome.tif`` file, returning one entry per series."""
+    path = Path(path)
+    # tifffile logs (rather than raises) when the header promises more
+    # frames than the file holds; report that ourselves instead.
+    tif_log = logging.getLogger('tifffile')
+    level = tif_log.level
+    tif_log.setLevel(logging.ERROR + 10)
+    scenes: list[tuple[object, dict]] = []
+    try:
+        with tifffile.TiffFile(path) as tf:
+            multi_ome = bool(tf.is_ome and len(tf.series) > 1)
+            indices = [idx for idx, s in enumerate(tf.series) if len(s.shape) >= 2] if multi_ome else [0]
+            if not indices:
+                indices = [0]
+            multi = len(indices) > 1
+
+            for idx in indices:
+                series = tf.series[idx]
+                expected = series.shape
+                try:
+                    data = tf.asarray(out='memmap') if not multi else series.asarray(out='memmap')
+                except Exception:
+                    data = tf.asarray() if not multi else series.asarray()
+                try:
+                    info = axes_mod.from_tiff(tf, data.shape) if idx == 0 else axes_mod.from_tiff(
+                        tf, data.shape, series_index=idx
+                    )
+                except Exception as exc:  # odd metadata must never block opening
+                    info = axes_mod.guess(data.shape)
+                    info.notes.append(f'could not read axis metadata ({type(exc).__name__}: {exc})')
+                if not info.confident:
+                    info = axes_mod.recall(path, data.shape) or info
+
+                extra = extract_tiff_metadata(tf, series_index=idx)
+                series_name = extra.pop('series_name', None)
+                title = f'{path.name} [{series_name or f"S{idx}"}]' if multi else path.name
+                meta: dict = {'name': title, 'path': str(path), 'axes': info}
+                meta.update(extra)
+                if data.shape != tuple(expected):
+                    meta['warning'] = (
+                        f'header says {expected} but the file holds {data.shape}; '
+                        'opened what is there (acquisition stopped early, or split across files?)'
+                    )
+                scenes.append((data, meta))
+    finally:
+        tif_log.setLevel(level)
+    return scenes
+
+
 def read_multi(path: str | Path) -> list[tuple[object, dict]]:
     """Open ``path`` and return one or more ``(data, meta)`` pairs (multi-scene formats)."""
     suffix = Path(path).suffix.lower()
+    if suffix in ('.tif', '.tiff'):
+        return read_tiff_scenes(path)
     if suffix == '.czi':
         return read_czi_scenes(path)
     if suffix == '.nd2':
@@ -643,41 +889,7 @@ def read_image(path: str | Path) -> tuple[np.ndarray, dict]:
     if suffix in ('.h5', '.hdf5', '.mat'):
         return read_hdf5(path)
     if suffix in ('.tif', '.tiff'):
-        # tifffile logs (rather than raises) when the header promises more
-        # frames than the file holds; report that ourselves instead.
-        tif_log = logging.getLogger('tifffile')
-        level = tif_log.level
-        tif_log.setLevel(logging.ERROR + 10)
-        try:
-            with tifffile.TiffFile(path) as tf:
-                expected = tf.series[0].shape
-                try:
-                    data = tf.asarray(out='memmap')
-                except Exception:
-                    data = tf.asarray()
-                try:
-                    info = axes_mod.from_tiff(tf, data.shape)
-                except Exception as exc:  # odd metadata must never block opening
-                    info = axes_mod.guess(data.shape)
-                    info.notes.append(f'could not read axis metadata ({type(exc).__name__}: {exc})')
-                if not info.confident:
-                    info = axes_mod.recall(path, data.shape) or info
-                luts = (tf.imagej_metadata or {}).get('LUTs')
-                if luts is not None:
-                    luts_arr = np.asarray(luts)
-                    if luts_arr.ndim == 2 and luts_arr.shape == (3, 256):
-                        meta['imagej_luts'] = [luts_arr]
-                    else:
-                        meta['imagej_luts'] = [np.asarray(lut) for lut in luts]
-        finally:
-            tif_log.setLevel(level)
-        if data.shape != tuple(expected):
-            meta['warning'] = (
-                f'header says {expected} but the file holds {data.shape}; '
-                'opened what is there (acquisition stopped early, or split across files?)'
-            )
-        meta['axes'] = info
-        return data, meta
+        return read_tiff_scenes(path)[0]
     from skimage.io import imread
 
     data = imread(path)
@@ -686,17 +898,20 @@ def read_image(path: str | Path) -> tuple[np.ndarray, dict]:
     return data, meta
 
 
-_METRIC_UNITS = {'nm': 1e-9, 'µm': 1e-6, 'um': 1e-6, 'mm': 1e-3}
-
-
 def _convert_unit(value: float, src: str | None, dst: str | None) -> float:
-    if src in _METRIC_UNITS and dst in _METRIC_UNITS:
-        return value * (_METRIC_UNITS[src] / _METRIC_UNITS[dst])
-    return value
+    return axes_mod.convert_unit(value, src, dst)
 
 
 def _ij_unit(unit: str | None) -> str:
     return 'um' if unit == 'µm' else (unit or 'um')
+
+
+def _lut_to_ome_color(lut: np.ndarray) -> int:
+    """Pack a ``(3, 256)`` uint8 LUT peak color into OME-XML signed 32-bit RGBA."""
+    arr = np.asarray(lut, dtype=np.uint8)
+    r, g, b = int(arr[0, -1]), int(arr[1, -1]), int(arr[2, -1])
+    rgba = (r << 24) | (g << 16) | (b << 8) | 0xFF
+    return rgba - (1 << 32) if rgba >= (1 << 31) else rgba
 
 
 def save_tiff(
@@ -705,6 +920,7 @@ def save_tiff(
     scale: tuple | None = None,
     axes: axes_mod.AxesInfo | None = None,
     luts: list[np.ndarray] | None = None,
+    channel_names: list[str] | None = None,
 ) -> None:
     """Write a calibrated ImageJ hyperstack or OME-TIFF."""
     arr = np.asarray(data)
@@ -769,7 +985,20 @@ def save_tiff(
             ome_meta['TimeIncrement'] = float(t_ax.step)
             if t_ax.unit:
                 ome_meta['TimeIncrementUnit'] = t_ax.unit
-        tifffile.imwrite(path, arr, ome=True, metadata=ome_meta)
+        c_idx = axes.index('C')
+        if c_idx is not None and not rgb:
+            n_ch = arr.shape[c_idx]
+            ch_dict: dict = {}
+            if channel_names and len(channel_names) == n_ch:
+                ch_dict['Name'] = [str(n) for n in channel_names]
+            if luts and len(luts) == n_ch:
+                valid = [np.asarray(lut, dtype=np.uint8) for lut in luts if np.asarray(lut).shape == (3, 256)]
+                if len(valid) == n_ch:
+                    ch_dict['Color'] = [_lut_to_ome_color(lut) for lut in valid]
+            if ch_dict:
+                ome_meta['Channel'] = ch_dict
+        ome_kwargs = {'photometric': 'minisblack'} if not rgb else {}
+        tifffile.imwrite(path, arr, ome=True, metadata=ome_meta, **ome_kwargs)
         return
 
     if '?' in axes.roles[:-2]:

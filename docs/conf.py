@@ -1,15 +1,19 @@
 from __future__ import annotations
 
 import sys
+import tomllib
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
+with open(ROOT / "pyproject.toml", "rb") as _f:
+    _pyproject = tomllib.load(_f)
+
 project = "TIKI"
 author = "Peter Hogg"
 copyright = "2026, Peter Hogg"
-release = "0.0.1"
+release = _pyproject["project"]["version"]
 
 extensions = [
     "myst_parser",

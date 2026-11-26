@@ -50,7 +50,7 @@ may change as it is tested across more microscopes and operating systems.
 :::{grid-item-card} Install and launch
 :link: getting-started
 :link-type: doc
-Create an environment, start TIKI, and open your first image.
+Download the one-click desktop installer (Windows, macOS, Linux) or install with uv / pip.
 :::
 
 :::{grid-item-card} Everyday workflows

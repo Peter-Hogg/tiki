@@ -63,11 +63,39 @@ FILTERS = {
         lambda plane, sigma: ops.gaussian_blur(plane, sigma),
         lambda vol, z_ratio, sigma: ops.gaussian_3d(vol, sigma, z_ratio),
     ),
+    'mean': FilterSpec(
+        'Mean', 'mean',
+        [Param('radius', 'Radius:', 2.0, 0.5, 50, 0.5, 1, ' px')], [],
+        lambda plane, radius: ops.mean_filter(plane, radius),
+        lambda vol, z_ratio, radius: ops.mean_3d(vol, radius, z_ratio),
+    ),
     'median': FilterSpec(
         'Median', 'median',
         [Param('radius', 'Radius:', 2.0, 0.5, 50, 0.5, 1, ' px')], [],
         lambda plane, radius: ops.median_filter(plane, radius),
         lambda vol, z_ratio, radius: ops.median_3d(vol, radius, z_ratio),
+    ),
+    'minimum': FilterSpec(
+        'Minimum', 'min',
+        [Param('radius', 'Radius:', 2.0, 0.5, 50, 0.5, 1, ' px')], [],
+        lambda plane, radius: ops.minimum_filter(plane, radius),
+        lambda vol, z_ratio, radius: ops.minimum_3d(vol, radius, z_ratio),
+    ),
+    'maximum': FilterSpec(
+        'Maximum', 'max',
+        [Param('radius', 'Radius:', 2.0, 0.5, 50, 0.5, 1, ' px')], [],
+        lambda plane, radius: ops.maximum_filter(plane, radius),
+        lambda vol, z_ratio, radius: ops.maximum_3d(vol, radius, z_ratio),
+    ),
+    'unsharp': FilterSpec(
+        'Unsharp Mask', 'unsharp',
+        [
+            Param('sigma', 'Radius (Sigma):', 2.0, 0.1, 100, 0.5, 2, ' px'),
+            Param('weight', 'Mask weight:', 0.6, 0.1, 0.9, 0.05, 2, ''),
+        ],
+        [],
+        lambda plane, sigma, weight: ops.unsharp_mask(plane, sigma, weight),
+        lambda vol, z_ratio, sigma, weight: ops.unsharp_mask_3d(vol, sigma, z_ratio, weight),
     ),
     'background': FilterSpec(
         'Subtract Background', 'bgsub',
@@ -137,6 +165,7 @@ class FilterDialog(QDialog):
         self._timer = QTimer(self, singleShot=True, interval=150)
         self._timer.timeout.connect(self.update_preview)
         viewer.dims.events.current_step.connect(self.schedule)
+        self._update_info()
         self.update_preview()
 
     def _update_options(self) -> None:
@@ -150,12 +179,31 @@ class FilterDialog(QDialog):
         self.whole_stack.setVisible(self.has_stack)
         self.whole_stack.setText(f'Process whole stack ({n} planes)')
 
+    def _update_info(self) -> None:
+        info = axes_mod.get(self.image)
+        u = axes_mod.spatial_unit(info)
+        if not u:
+            self.info.setText('')
+            return
+        y_ax = info.axes[-2]
+        x_ax = info.axes[-1]
+        sy = float(y_ax.step) if y_ax.step else 1.0
+        sx = float(x_ax.step) if x_ax.step else sy
+        step_xy = 0.5 * (sy + sx)
+        parts = []
+        for p in self.spec.params:
+            if 'px' in p.suffix:
+                val = self.inputs[p.key].value()
+                parts.append(f'{p.label.rstrip(":")} ≈ {val * step_xy:.4g} {u}')
+        self.info.setText('; '.join(parts))
+
     def _set_image(self, image) -> None:
         if image is None or image is self.image:
             return
         self._remove_preview()
         self.image = image
         self._update_options()
+        self._update_info()
         self.schedule()
 
     def use_3d(self) -> bool:
@@ -171,6 +219,7 @@ class FilterDialog(QDialog):
         return out
 
     def schedule(self, event=None) -> None:
+        self._update_info()
         if self.show_preview.isChecked():
             self._timer.start()
 

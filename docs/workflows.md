@@ -7,15 +7,25 @@
 3. Press {kbd}`Ctrl+M`.
 4. Copy the Results table or save it as CSV.
 
-Measurements include area, mean, standard deviation, minimum, maximum and
-integrated density. Calibrated images report spatial measurements in physical
-units.
+Measurements include area, mean, standard deviation, minimum, maximum,
+integrated density, centroid, perimeter, circularity, Feret diameter, aspect ratio,
+and solidity (selectable via **Analyze → Set Measurements…**). Calibrated images
+report spatial measurements in physical units (`µm²`, `µm`, etc.) directly in
+the column headers and exported CSVs; click **Summarize** in the Results window
+for Mean / SD / Min / Max across rows. Point measurements also record
+calibrated `(X, Y)` coordinates.
 
-## Project a stack
+## Project or reorder a stack
 
-Choose **Image → Stacks → Z Project…**, select the axis and slice range, then
-choose maximum, average, sum, standard deviation, median or minimum. T and C
-axes are retained; TIKI never averages channels implicitly.
+- **Image → Stacks → Z Project…**: choose the axis and slice range, then choose
+  maximum, average, sum, standard deviation, median or minimum. T and C axes are
+  retained; TIKI never averages channels implicitly.
+- **Image → Stacks → Stack to Hyperstack… / Hyperstack to Stack**: assign or
+  flatten `C × Z × T` hyperstack structure.
+- **Image → Stacks → Concatenate… / Images to Stack…**: join compatible stacks
+  or single planes into one stack.
+- **Image → Stacks → Reverse / Remove Slices…**: reverse slice order or drop
+  slices/frames (e.g. `1-5, 10, 12-20-2`) along any stack axis.
 
 ## Threshold and analyze particles
 
@@ -24,16 +34,28 @@ axes are retained; TIKI never averages channels implicitly.
 3. Adjust the limits or choose an automatic method.
 4. Enable 3D connectivity when objects should connect through Z.
 5. Apply to create a Labels layer.
-6. Choose **Analyze → Analyze Particles…** to produce an object table.
+6. Choose **Analyze → Analyze Particles…** to produce an object table (2D with
+   Area, centroid, Perim., Circ., Feret, AR, Solidity; or 3D Volume and Z using
+   voxel size), optionally filtered by physical Min/Max size.
 
 The threshold preview is temporary. Applying creates a new Labels layer and
 does not alter the image.
 
-## Filter an image
+Use **Process → Labels → Watershed…**, **Fill Holes**, or **Morphology…**
+(`Erode`, `Dilate`, `Open`, `Close` on binary or multi-label 2D/3D masks) to
+clean up segmented labels before measuring.
 
-Gaussian blur, median filtering and rolling-ball background subtraction show a
-live preview. Applying adds a new image layer. For a calibrated Z stack, 3D
-Gaussian and median kernels account for anisotropic voxel dimensions.
+## Filter, resize, and math
+
+Gaussian blur, Mean, Median, Minimum, Maximum, Unsharp Mask, and rolling-ball
+Subtract Background show a live preview and display kernel sizes in physical
+units alongside pixels when calibrated. **Process → Filters → Find Edges**
+runs a Sobel gradient filter, **Edit → Invert** inverts intensity non-destructively,
+**Process → Math…** applies scalar/unary math (`Add`, `Subtract`, `Multiply`,
+`Divide`, `Gamma`, `Log`, `Sqrt`, etc.), and **Image → Adjust → Size…**
+resizes stacks/planes while updating physical pixel spacing. Applying adds a
+new image layer or window. For a calibrated Z stack, 3D Gaussian, Mean, Median,
+Minimum, Maximum, and Unsharp kernels account for anisotropic voxel dimensions.
 
 ## Send a session to a notebook
 
@@ -63,7 +85,9 @@ line; a line width greater than one averages across the line.
 ## Calibrate from a known distance
 
 Draw a line across a feature of known length and choose **Analyze → Set
-Scale…**. The pixel length is filled in; enter the known distance and unit.
+Scale…**. The pixel length is filled in; enter the known distance, optional
+pixel aspect ratio (`Y/X`), and unit, check **Global** to calibrate all open
+windows, or click **Remove Scale** to clear spatial calibration.
 
 ## Find active cells in a calcium movie
 

@@ -8,11 +8,15 @@ import numpy as np
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
 from matplotlib.figure import Figure
 from qtpy.QtCore import Qt, QTimer
+from qtpy.QtGui import QFont
 from qtpy.QtWidgets import (
     QApplication,
     QCheckBox,
     QFileDialog,
     QHBoxLayout,
+    QHeaderView,
+    QMessageBox,
+    QPlainTextEdit,
     QPushButton,
     QTableWidget,
     QTableWidgetItem,
@@ -20,6 +24,7 @@ from qtpy.QtWidgets import (
     QWidget,
 )
 
+from . import axes as axes_mod
 from . import ops, style
 from . import roi as roi_mod
 
@@ -35,11 +40,17 @@ class ResultsTable(QWidget):
         self.columns: list[str] = []
         self.rows: list[dict] = []
         self.column_units: dict[str, str] = {}
+        self._summary_win = None
         self.table = QTableWidget(0, 0)
         self.table.setEditTriggers(QTableWidget.NoEditTriggers)
         self.table.setAlternatingRowColors(True)
         buttons = QHBoxLayout()
-        for text, slot in (('Copy', self.copy), ('Save As…', self.save_as), ('Clear', self.clear)):
+        for text, slot in (
+            ('Copy', self.copy),
+            ('Save As…', self.save_as),
+            ('Summarize', self.summarize),
+            ('Clear', self.clear),
+        ):
             b = QPushButton(text)
             b.clicked.connect(slot)
             buttons.addWidget(b)
@@ -51,8 +62,17 @@ class ResultsTable(QWidget):
     def _header_labels(self) -> list[str]:
         return [f'{k} ({self.column_units[k]})' if self.column_units.get(k) else k for k in self.columns]
 
-    def set_units(self, units: dict[str, str]) -> None:
-        self.column_units.update({k: u for k, u in units.items() if u})
+    def set_units(self, units: dict[str, str], replace: bool = False) -> None:
+        clean = {k: u for k, u in units.items() if u}
+        if replace:
+            self.column_units = clean
+        else:
+            self.column_units.update(clean)
+        if self.columns:
+            self.table.setHorizontalHeaderLabels(self._header_labels())
+
+    def clear_units(self) -> None:
+        self.column_units.clear()
         if self.columns:
             self.table.setHorizontalHeaderLabels(self._header_labels())
 
@@ -82,7 +102,7 @@ class ResultsTable(QWidget):
         self.table.setItem(r, c, item)
 
     def as_text(self, sep: str = '\t') -> str:
-        lines = [sep.join([' '] + self.columns)]
+        lines = [sep.join([' '] + self._header_labels())]
         for i, row in enumerate(self.rows, 1):
             lines.append(sep.join([str(i)] + [str(row.get(k, '')) for k in self.columns]))
         return '\n'.join(lines)
@@ -95,9 +115,94 @@ class ResultsTable(QWidget):
         if not path:
             return
         with open(path, 'w', newline='') as f:
-            writer = csv.DictWriter(f, fieldnames=self.columns)
-            writer.writeheader()
-            writer.writerows(self.rows)
+            writer = csv.writer(f)
+            writer.writerow(self._header_labels())
+            for row in self.rows:
+                writer.writerow([row.get(k, '') for k in self.columns])
+
+    def summary_rows(self) -> tuple[list[str], list[dict]]:
+        """Compute Mean, SD, Min, Max across numeric columns of ``self.rows``."""
+        num_cols: list[str] = []
+        col_vals: dict[str, np.ndarray] = {}
+        for k in self.columns:
+            vals = []
+            for row in self.rows:
+                v = row.get(k)
+                if isinstance(v, (int, float, np.number)) and not isinstance(v, bool) and np.isfinite(float(v)):
+                    vals.append(float(v))
+            if vals:
+                num_cols.append(k)
+                col_vals[k] = np.asarray(vals, dtype=np.float64)
+        if not num_cols:
+            return [], []
+        specs = (
+            ('Mean', lambda a: float(np.mean(a))),
+            ('SD', lambda a: float(np.std(a, ddof=1)) if a.size > 1 else 0.0),
+            ('Min', lambda a: float(np.min(a))),
+            ('Max', lambda a: float(np.max(a))),
+        )
+        out = []
+        for stat, fn in specs:
+            r = {'Stat': stat}
+            for k in num_cols:
+                r[k] = fn(col_vals[k])
+            out.append(r)
+        return num_cols, out
+
+    def summarize(self, show: bool = True) -> list[dict]:
+        """Compute summary statistics across Results rows and optionally open Summary window."""
+        num_cols, summary = self.summary_rows()
+        if not summary:
+            if show:
+                QMessageBox.information(self, 'Summary', 'No numeric measurements in Results to summarize.')
+            return []
+        if show:
+            if self._summary_win is not None:
+                self._summary_win.close()
+            headers = ['Stat'] + [
+                f'{k} ({self.column_units[k]})' if self.column_units.get(k) else k for k in num_cols
+            ]
+            win = QWidget(self, Qt.Window)
+            style.apply(win)
+            win.setWindowTitle(f'Summary of Results (N = {len(self.rows)})')
+            win.resize(620, 200)
+            tbl = QTableWidget(len(summary), len(headers))
+            tbl.setEditTriggers(QTableWidget.NoEditTriggers)
+            tbl.setAlternatingRowColors(True)
+            tbl.setHorizontalHeaderLabels(headers)
+            for r_i, srow in enumerate(summary):
+                for c_i, key in enumerate(['Stat'] + num_cols):
+                    val = srow[key]
+                    text = f'{val:.4g}' if isinstance(val, float) else str(val)
+                    item = QTableWidgetItem(text)
+                    if isinstance(val, float):
+                        item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+                    tbl.setItem(r_i, c_i, item)
+            tbl.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
+            copy_btn = QPushButton('Copy')
+            copy_btn.clicked.connect(
+                lambda: QApplication.clipboard().setText(
+                    '\n'.join(
+                        [
+                            '\t'.join(headers),
+                            *[
+                                '\t'.join(
+                                    f'{s[k]:.6g}' if isinstance(s[k], float) else str(s[k])
+                                    for k in ['Stat'] + num_cols
+                                )
+                                for s in summary
+                            ],
+                        ]
+                    )
+                )
+            )
+            lay = QVBoxLayout(win)
+            lay.addWidget(tbl)
+            lay.addWidget(copy_btn, alignment=Qt.AlignRight)
+            self._summary_win = win
+            win.show()
+            win.raise_()
+        return summary
 
     def clear(self) -> None:
         self.rows.clear()
@@ -124,6 +229,11 @@ class ProfileWindow(QWidget):
         self.roi = roi_mod.roi_layer(viewer, create=True)
         self._signature = None
         self.profile = np.array([])
+        self.x = np.array([])
+        ax_info = axes_mod.get(image).axes[axis]
+        self.step = float(ax_info.step) if (ax_info.step and ax_info.step > 0) else 1.0
+        self.unit = ax_info.unit if (ax_info.step and ax_info.unit) else None
+        self.axis_label = roi_mod.axis_name(viewer, image, axis)
         self.setWindowTitle(f'{image.name} — profile')
         self.resize(560, 320)
 
@@ -132,7 +242,7 @@ class ProfileWindow(QWidget):
         self.ax = self.figure.add_subplot()
         (self.line,) = self.ax.plot([], [], lw=1, color='k')
         self.cursor_line = self.ax.axvline(0, color='tab:red', lw=0.8)
-        self.ax.set_xlabel(roi_mod.axis_name(viewer, image, axis))
+        self.ax.set_xlabel(f'{self.axis_label} ({self.unit})' if self.unit else self.axis_label)
         self.ax.set_ylabel('mean in ROI')
 
         self.live = QCheckBox('Live')
@@ -189,8 +299,13 @@ class ProfileWindow(QWidget):
         if self.image.rgb:
             data = np.asarray(data)[..., :3].mean(axis=-1)
         self.profile = ops.axis_profile(data, self.axis, index, mask)
-        x = np.arange(self.profile.size)
-        self.line.set_data(x, self.profile)
+        ax_info = axes_mod.get(self.image).axes[self.axis]
+        self.step = float(ax_info.step) if (ax_info.step and ax_info.step > 0) else 1.0
+        self.unit = ax_info.unit if (ax_info.step and ax_info.unit) else None
+        self.axis_label = roi_mod.axis_name(self.viewer, self.image, self.axis)
+        self.ax.set_xlabel(f'{self.axis_label} ({self.unit})' if self.unit else self.axis_label)
+        self.x = np.arange(self.profile.size) * self.step
+        self.line.set_data(self.x, self.profile)
         self.ax.set_title('whole frame' if mask is None else f'{current[1]} ROI, {int(mask.sum())} px', fontsize=9)
         self.ax.relim()
         self.ax.autoscale_view()
@@ -200,17 +315,23 @@ class ProfileWindow(QWidget):
         if self.image not in self.viewer.layers:
             return
         index = roi_mod.current_index(self.viewer, self.image)
-        self.cursor_line.set_xdata([index[self.axis]] * 2)
+        self.cursor_line.set_xdata([index[self.axis] * self.step] * 2)
         self.canvas.draw_idle()
 
     def copy(self) -> None:
-        QApplication.clipboard().setText('\n'.join(f'{i}\t{v}' for i, v in enumerate(self.profile)))
+        x_vals = self.x if len(self.x) == len(self.profile) else np.arange(self.profile.size) * self.step
+        lines = [f'{x:.6g}\t{v}' if (self.unit or self.step != 1.0) else f'{int(round(x))}\t{v}'
+                 for x, v in zip(x_vals, self.profile)]
+        QApplication.clipboard().setText('\n'.join(lines))
 
     def save_csv(self) -> None:
         path, _ = QFileDialog.getSaveFileName(self, 'Save profile', f'{self.image.name}_profile.csv', 'CSV (*.csv)')
         if path:
-            np.savetxt(path, np.c_[np.arange(self.profile.size), self.profile], delimiter=',',
-                       header='frame,mean', comments='', fmt=['%d', '%.6g'])
+            x_vals = self.x if len(self.x) == len(self.profile) else np.arange(self.profile.size) * self.step
+            header = f'{self.axis_label} ({self.unit}),mean' if self.unit else 'frame,mean'
+            fmt = ['%.6g', '%.6g'] if (self.unit or self.step != 1.0) else ['%d', '%.6g']
+            np.savetxt(path, np.c_[x_vals, self.profile], delimiter=',',
+                       header=header, comments='', fmt=fmt)
 
     def closeEvent(self, event):
         for emitter, cb in self._connections:
@@ -386,7 +507,19 @@ class TracesWindow(QWidget):
 
     HEATMAP_ABOVE = 20
 
-    def __init__(self, title, names, traces, viewer=None, image=None, axis=0, xlabel='frame', parent=None):
+    def __init__(
+        self,
+        title,
+        names,
+        traces,
+        viewer=None,
+        image=None,
+        axis=0,
+        xlabel='frame',
+        step: float | None = None,
+        unit: str | None = None,
+        parent=None,
+    ):
         from qtpy.QtWidgets import QComboBox
 
         super().__init__(parent, Qt.Window)
@@ -396,6 +529,8 @@ class TracesWindow(QWidget):
         self.names = [str(n) for n in names]
         self.raw = np.asarray(traces, dtype=np.float64)
         self.viewer, self.image, self.axis, self.xlabel = viewer, image, axis, xlabel
+        self.step = float(step) if (step and step > 0) else 1.0
+        self.unit = unit if (step and unit) else None
 
         self.figure = Figure(figsize=(7, 4), layout='constrained')
         self.canvas = FigureCanvasQTAgg(self.figure)
@@ -443,12 +578,13 @@ class TracesWindow(QWidget):
         ax = self.figure.add_subplot()
         data = self.traces
         n, t = data.shape
-        x = np.arange(t)
+        x = np.arange(t) * self.step
+        x_lo, x_hi = -0.5 * self.step, (t - 0.5) * self.step
         mode = self.mode.currentText()
         ylabel = 'ΔF/F' if self.dff.isChecked() else 'mean intensity'
         if mode == 'Heatmap':
             im = ax.imshow(data, aspect='auto', interpolation='nearest', cmap='magma',
-                           extent=(-0.5, t - 0.5, n - 0.5, -0.5))
+                           extent=(x_lo, x_hi, n - 0.5, -0.5))
             self.figure.colorbar(im, ax=ax, label=ylabel, shrink=0.8)
             ax.set_ylabel('ROI')
             if n <= 40:
@@ -470,8 +606,8 @@ class TracesWindow(QWidget):
             ax.set_yticks([])
             ax.spines[['left', 'top', 'right']].set_visible(False)
             ax.set_title(f'{ylabel}, one trace per ROI (offset for clarity)', fontsize=9)
-        ax.set_xlabel(self.xlabel)
-        ax.set_xlim(-0.5, t - 0.5)
+        ax.set_xlabel(f'{self.xlabel} ({self.unit})' if self.unit else self.xlabel)
+        ax.set_xlim(x_lo, x_hi)
         self.ax = ax
         self._cursor_artists = [ax.axvline(0, color='tab:red', lw=0.8)]
         self.on_step()
@@ -484,13 +620,16 @@ class TracesWindow(QWidget):
             index = roi_mod.current_index(self.viewer, self.image)
         except Exception:
             return
-        self._cursor_artists[0].set_xdata([index[self.axis]] * 2)
+        self._cursor_artists[0].set_xdata([index[self.axis] * self.step] * 2)
         self.canvas.draw_idle()
 
     def table_text(self, sep='\t') -> str:
-        lines = [sep.join(['frame'] + self.names)]
+        x_head = f'{self.xlabel} ({self.unit})' if self.unit else 'frame'
+        lines = [sep.join([x_head] + self.names)]
+        calibrated = self.unit is not None or self.step != 1.0
         for t, row in enumerate(self.traces.T):
-            lines.append(sep.join([str(t)] + [f'{v:.6g}' for v in row]))
+            x_str = f'{t * self.step:.6g}' if calibrated else str(t)
+            lines.append(sep.join([x_str] + [f'{v:.6g}' for v in row]))
         return '\n'.join(lines)
 
     def copy(self) -> None:
@@ -556,3 +695,175 @@ class HistogramWindow(QWidget):
         edges, counts = self.stats['edges'], self.stats['counts']
         QApplication.clipboard().setText(
             '\n'.join(['bin start\tcount'] + [f'{e:.6g}\t{c}' for e, c in zip(edges[:-1], counts)]))
+
+
+def format_image_info(viewer, image) -> tuple[str, str]:
+    """Return ``(summary_text, raw_metadata_text)`` for ``Image ▸ Show Info…``."""
+    data = image.data
+    plane = roi_mod.current_plane(viewer, image)
+    info = axes_mod.get(image)
+    nbytes = int(np.prod(data.shape)) * int(np.dtype(data.dtype).itemsize)
+    backing = ''
+    if isinstance(data, np.memmap) or isinstance(getattr(data, 'base', None), np.memmap):
+        backing = ' (memory-mapped)'
+    elif hasattr(data, 'compute'):
+        backing = ' (lazy Dask)'
+
+    lines = [
+        f'Title:         {image.name}',
+        f'Path:          {image.metadata.get("path", "(not saved)")}',
+        f'Shape:         {tuple(int(s) for s in data.shape)}',
+        f'Type:          {data.dtype}',
+        f'Size:          {nbytes / 2**20:.2f} MB{backing}',
+        f'Current slice: {roi_mod.current_index(viewer, image)[:-2] or "(2D)"}',
+        f'Slice range:   {float(np.nanmin(plane)):.4g} .. {float(np.nanmax(plane)):.4g}',
+    ]
+    if not image.rgb:
+        lo, hi = map(float, image.contrast_limits)
+        lines.append(f'Display range: {lo:.4g} .. {hi:.4g}   (LUT: {image.colormap.name})')
+
+    lines += ['', f'Axes & Calibration ({info.source}' + ('' if info.confident else ', not confident') + ')']
+    for i, ax in enumerate(info.axes):
+        step_str = f'{ax.step:.6g} {ax.unit or ""}'.strip() if ax.step else 'uncalibrated'
+        lines.append(f'  [{i}] {ax.role} ({info.labels[i]}): size={ax.size}, step={step_str}')
+    if info.z_assumed:
+        lines.append('  Note: Z step absent; 3D display assumes isotropic voxels matching XY.')
+    for note in info.notes:
+        lines.append(f'  Note: {note}')
+
+    acq = image.metadata.get('acquisition') or {}
+    ch_names = image.metadata.get('channel_names') or []
+    ch_list = acq.get('channels') or []
+    if ch_names or ch_list:
+        lines += ['', 'Channels']
+        n_ch = max(len(ch_names), len(ch_list))
+        for k in range(n_ch):
+            entry = ch_list[k] if k < len(ch_list) and isinstance(ch_list[k], dict) else {}
+            cname = (ch_names[k] if k < len(ch_names) else '') or entry.get('name') or entry.get('fluor') or f'C{k + 1}'
+            extras = []
+            if entry.get('fluor') and entry.get('fluor') != cname:
+                extras.append(f'fluor={entry["fluor"]}')
+            if entry.get('excitation_nm'):
+                extras.append(f'Ex={entry["excitation_nm"]:g} nm')
+            if entry.get('emission_nm'):
+                extras.append(f'Em={entry["emission_nm"]:g} nm')
+            if entry.get('pinhole_um'):
+                extras.append(f'pinhole={entry["pinhole_um"]:g} µm')
+            if entry.get('exposure_ms'):
+                extras.append(f'exposure={entry["exposure_ms"]:g} ms')
+            if entry.get('acquisition_mode'):
+                extras.append(entry['acquisition_mode'])
+            lines.append(f'  C{k + 1}: {cname}' + (f'  ({", ".join(extras)})' if extras else ''))
+
+    acq_lines = []
+    for key, label in (
+        ('image_name', 'Image name'),
+        ('acquisition_date', 'Acquisition date'),
+        ('software', 'Software'),
+        ('artist', 'Artist'),
+        ('description', 'Description'),
+    ):
+        if acq.get(key):
+            acq_lines.append(f'  {label}: {acq[key]}')
+    mic = acq.get('microscope')
+    if isinstance(mic, dict) and mic:
+        parts = [f'{k}={v}' for k, v in mic.items()]
+        acq_lines.append(f'  Microscope: {", ".join(parts)}')
+    obj = acq.get('objective')
+    if isinstance(obj, dict) and obj:
+        parts = []
+        if obj.get('model') or obj.get('name'):
+            parts.append(str(obj.get('model') or obj.get('name')))
+        if obj.get('magnification'):
+            parts.append(f'{obj["magnification"]:g}x')
+        if obj.get('na'):
+            parts.append(f'NA {obj["na"]:g}')
+        if obj.get('immersion'):
+            parts.append(str(obj['immersion']))
+        if obj.get('working_distance'):
+            parts.append(f'WD {obj["working_distance"]:g}')
+        acq_lines.append(f'  Objective: {", ".join(parts)}')
+    det = acq.get('detector')
+    if isinstance(det, dict) and det:
+        acq_lines.append(f'  Detector: {", ".join(f"{k}={v}" for k, v in det.items())}')
+    stage = acq.get('stage_label')
+    if isinstance(stage, dict) and stage:
+        acq_lines.append(f'  Stage: {", ".join(f"{k}={v}" for k, v in stage.items())}')
+    for extra_key in ('scanimage', 'micromanager', 'info', 'settings'):
+        sub = acq.get(extra_key)
+        if isinstance(sub, dict) and sub:
+            acq_lines.append(f'  {extra_key}:')
+            for k, v in sub.items():
+                acq_lines.append(f'    {k}: {v}')
+    if acq_lines:
+        lines += ['', 'Acquisition Metadata'] + acq_lines
+
+    raw = image.metadata.get('raw_metadata') or {}
+    raw_sections = [f'=== {title} ===\n{str(body).strip()}' for title, body in raw.items() if body]
+    return '\n'.join(lines), '\n\n'.join(raw_sections)
+
+
+class InfoWindow(QWidget):
+    """Scrollable Image ▸ Show Info… window with optional raw XML/header drawer."""
+
+    def __init__(self, viewer, image, parent=None):
+        super().__init__(parent, Qt.Window)
+        style.apply(self)
+        self.image = image
+        self.setWindowTitle(f'Info — {image.name}')
+        self.resize(620, 480)
+
+        summary_text, raw_text = format_image_info(viewer, image)
+        self.summary_text = summary_text
+        self.raw_text = raw_text
+
+        mono = QFont('Monospace')
+        mono.setStyleHint(QFont.TypeWriter)
+
+        self.text = QPlainTextEdit(readOnly=True)
+        self.text.setFont(mono)
+        self.text.setPlainText(summary_text)
+
+        self.raw_box = QPlainTextEdit(readOnly=True)
+        self.raw_box.setFont(mono)
+        self.raw_box.setPlainText(raw_text)
+        self.raw_box.setVisible(False)
+
+        self.raw_btn = QPushButton('Show Raw Metadata')
+        self.raw_btn.setCheckable(True)
+        self.raw_btn.setVisible(bool(raw_text))
+        self.raw_btn.toggled.connect(self._toggle_raw)
+
+        copy_btn = QPushButton('Copy')
+        copy_btn.clicked.connect(self.copy)
+        save_btn = QPushButton('Save .txt…')
+        save_btn.clicked.connect(self.save_txt)
+
+        bar = QHBoxLayout()
+        bar.addWidget(self.raw_btn)
+        bar.addStretch()
+        bar.addWidget(copy_btn)
+        bar.addWidget(save_btn)
+
+        layout = QVBoxLayout(self)
+        layout.addWidget(self.text, 2)
+        layout.addWidget(self.raw_box, 1)
+        layout.addLayout(bar)
+
+    def _toggle_raw(self, on: bool) -> None:
+        self.raw_box.setVisible(on)
+        self.raw_btn.setText('Hide Raw Metadata' if on else 'Show Raw Metadata')
+
+    def full_text(self) -> str:
+        if self.raw_text:
+            return self.summary_text + '\n\n' + self.raw_text
+        return self.summary_text
+
+    def copy(self) -> None:
+        QApplication.clipboard().setText(self.full_text())
+
+    def save_txt(self) -> None:
+        path, _ = QFileDialog.getSaveFileName(self, 'Save Info', f'{self.image.name}_info.txt', 'Text (*.txt)')
+        if path:
+            with open(path, 'w') as f:
+                f.write(self.full_text() + '\n')
