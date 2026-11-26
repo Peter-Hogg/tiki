@@ -13,25 +13,25 @@ TIKI brings the familiar *current image* workflow to Python: open a TIFF, draw
 an ROI, measure it, inspect a trace, make a projection, and move to the next
 image without assembling a collection of unrelated widgets.
 
-::::{grid} 1 2 2 2
+::::{grid} 1 1 1 1
 :gutter: 2
 
-:::{grid-item-card} Cells 3D (2-channel Z-stack)
+:::{grid-item-card} Cells 3D — Orthogonal Views & Calibrated ROI Measurement
 :text-align: center
 ```{image} _static/demo-cells3d.gif
-:alt: Cells 3D two-channel Z-stack exported from TIKI with calibrated scale bar
-:width: 280px
+:alt: Using TIKI on Cells 3D: Orthogonal Views and calibrated ROI measurements
+:width: 720px
 ```
-Exported directly from TIKI (`File ▸ Export ▸ Export Movie…`) with calibrated scale bar and Z depth.
+Open a calibrated 2-channel Z-stack, inspect in **Orthogonal Views** (`Ctrl+Shift+H`), draw ROIs, and **Measure** (`Ctrl+M`) in physical units.
 :::
 
-:::{grid-item-card} Mouse Kidney (3-channel Z-stack)
+:::{grid-item-card} Mouse Kidney — Multi-Channel Z-Stack & Channels Tool
 :text-align: center
 ```{image} _static/demo-kidney.gif
-:alt: Mouse Kidney three-channel Z-stack exported from TIKI
-:width: 280px
+:alt: Using TIKI on Mouse Kidney: 3-channel Z-stack with Channels Tool
+:width: 720px
 ```
-Multi-channel LUTs and overlays (`File ▸ Open Samples ▸ Mouse Kidney`).
+Scroll through a 3-channel Z-stack and toggle channels, LUTs, and contrast live in the **Channels Tool** (`Ctrl+Shift+Z`).
 :::
 
 ::::

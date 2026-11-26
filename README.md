@@ -14,18 +14,15 @@
   <a href="LICENSE"><img alt="License: BSD-3-Clause" src="https://img.shields.io/badge/license-BSD--3--Clause-blue"></a>
 </p>
 
-<table align="center">
-  <tr>
-    <td align="center">
-      <img src="assets/demo-cells3d.gif" alt="Cells 3D two-channel Z-stack exported from TIKI with scale bar" width="300"><br>
-      <sub><b>Cells 3D</b> (2-ch Z-stack, calibrated scale bar &amp; Z label — exported via <code>Export Movie…</code>)</sub>
-    </td>
-    <td align="center">
-      <img src="assets/demo-kidney.gif" alt="Mouse Kidney three-channel Z-stack exported from TIKI" width="300"><br>
-      <sub><b>Mouse Kidney</b> (3-ch Z-stack, split channels &amp; LUTs — <code>File ▸ Open Samples</code>)</sub>
-    </td>
-  </tr>
-</table>
+<p align="center">
+  <img src="assets/demo-cells3d.gif" alt="Using TIKI on Cells 3D: Orthogonal Views and calibrated ROI measurements" width="760"><br>
+  <sub><b>Cells 3D workflow:</b> open a calibrated 2-channel Z-stack, inspect in <b>Orthogonal Views</b> (<code>Ctrl+Shift+H</code>), draw ROIs, and <b>Measure</b> (<code>Ctrl+M</code>) in µm².</sub>
+</p>
+
+<p align="center">
+  <img src="assets/demo-kidney.gif" alt="Using TIKI on Mouse Kidney: 3-channel Z-stack with Channels Tool" width="760"><br>
+  <sub><b>Mouse Kidney workflow:</b> scroll through a 3-channel Z-stack and toggle channels, LUTs, and contrast live in the <b>Channels Tool</b> (<code>Ctrl+Shift+Z</code>).</sub>
+</p>
 
 > [!NOTE]
 > TIKI is an early prototype. The core workflow works, but interfaces and
