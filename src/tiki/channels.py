@@ -265,6 +265,9 @@ class ChannelsTool(QWidget):
             self.grid.addWidget(hi_slider, row, 3)
             self.grid.addWidget(range_label, row, 4)
             self.grid.addWidget(auto_btn, row, 5)
+        sync_btn = QPushButton('Sync to All Windows')
+        sync_btn.clicked.connect(lambda _=False, v=viewer: self.tiki.sync_display(v))
+        self.grid.addWidget(sync_btn, len(images) + 1, 0, 1, 6)
         self.adjustSize()
 
     def closeEvent(self, event):

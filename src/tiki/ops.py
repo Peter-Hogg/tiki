@@ -248,6 +248,9 @@ def axis_profile(
 def saturated_limits(plane: np.ndarray, saturated: float = 0.35) -> tuple[float, float]:
     """Display range that saturates ``saturated`` percent of pixels (Enhance Contrast)."""
     values = np.asarray(plane, dtype=np.float64).ravel()
+    values = values[np.isfinite(values)]
+    if values.size == 0:
+        return 0.0, 1.0
     if values.size > 1_000_000:
         values = values[:: values.size // 1_000_000]
     lo, hi = np.percentile(values, [saturated / 2, 100 - saturated / 2])
@@ -2560,6 +2563,7 @@ def detect_edges(
     return res
 
 
+
 def detect_edges_3d(
     volume: np.ndarray,
     z_ratio: float = 1.0,
@@ -2601,3 +2605,396 @@ def detect_edges_3d(
     if not finite.all():
         res = np.where(finite, res, np.float32(0.0)).astype(np.float32)
     return res
+
+
+# -------------------------------------------------------------- Noise & FFT
+
+
+def despeckle(plane: np.ndarray) -> np.ndarray:
+    """ImageJ ``Process ▸ Noise ▸ Despeckle``: 3×3 median filter."""
+    from scipy.ndimage import median_filter as _med
+
+    arr = np.asarray(plane)
+    return _med(arr, size=3, mode='nearest').astype(arr.dtype, copy=False)
+
+
+def add_gaussian_noise(plane: np.ndarray, sigma: float = 25.0, rng=None) -> np.ndarray:
+    """Add zero-mean Gaussian noise (preserving integer dtypes via clamping)."""
+    arr = np.asarray(plane)
+    gen = np.random.default_rng() if rng is None else rng
+    noisy = arr.astype(np.float64) + gen.normal(0.0, max(float(sigma), 0.0), size=arr.shape)
+    if np.issubdtype(arr.dtype, np.integer):
+        info = np.iinfo(arr.dtype)
+        return np.clip(np.round(noisy), info.min, info.max).astype(arr.dtype)
+    return noisy.astype(np.float32)
+
+
+def salt_and_pepper(plane: np.ndarray, fraction: float = 0.05, rng=None) -> np.ndarray:
+    """Add impulse salt (max) and pepper (min) noise to ``fraction`` of pixels."""
+    arr = np.asarray(plane).copy()
+    frac = float(np.clip(fraction, 0.0, 1.0))
+    if frac <= 0.0 or arr.size == 0:
+        return arr
+    if np.issubdtype(arr.dtype, np.integer):
+        info = np.iinfo(arr.dtype)
+        lo, hi = info.min, info.max
+    else:
+        fin = arr[np.isfinite(arr)]
+        lo = float(fin.min()) if fin.size else 0.0
+        hi = float(fin.max()) if fin.size else 1.0
+    gen = np.random.default_rng() if rng is None else rng
+    r = gen.random(arr.shape)
+    arr[r < frac * 0.5] = lo
+    arr[(r >= frac * 0.5) & (r < frac)] = hi
+    return arr
+
+
+def remove_outliers(
+    plane: np.ndarray,
+    radius: float = 2.0,
+    threshold: float = 50.0,
+    which: str = 'bright',
+) -> np.ndarray:
+    """Replace pixels deviating from their neighborhood median by > ``threshold``."""
+    arr = np.asarray(plane)
+    med = median_filter(arr, radius)
+    a64 = arr.astype(np.float64)
+    m64 = med.astype(np.float64)
+    thr = float(threshold)
+    w = which.lower()
+    if w == 'bright':
+        replace = (a64 - m64) > thr
+    elif w == 'dark':
+        replace = (m64 - a64) > thr
+    elif w == 'both':
+        replace = np.abs(a64 - m64) > thr
+    else:
+        raise ValueError(f'unknown outlier polarity {which!r} (expected bright, dark, or both)')
+    out = np.where(replace, med, arr)
+    return out.astype(arr.dtype, copy=False)
+
+
+def remove_nans(plane: np.ndarray, radius: float = 2.0) -> np.ndarray:
+    """Replace non-finite pixels with the local median of finite neighbors."""
+    arr = np.asarray(plane)
+    if np.issubdtype(arr.dtype, np.integer):
+        return arr.copy()
+    finite = np.isfinite(arr)
+    if finite.all():
+        return arr.copy()
+    out = arr.astype(np.float32, copy=True)
+    if not finite.any():
+        out.fill(0.0)
+        return out
+    global_med = float(np.median(arr[finite]))
+    fp = _disk_footprint(max(float(radius), 1.0))
+    ry = fp.shape[0] // 2
+    rx = fp.shape[1] // 2
+    h, w = out.shape
+    bad_y, bad_x = np.nonzero(~finite)
+    for y, x in zip(bad_y.tolist(), bad_x.tolist()):
+        y0, y1 = max(0, y - ry), min(h, y + ry + 1)
+        x0, x1 = max(0, x - rx), min(w, x + rx + 1)
+        fy0, fy1 = ry - (y - y0), ry + (y1 - y)
+        fx0, fx1 = rx - (x - x0), rx + (x1 - x)
+        patch = arr[y0:y1, x0:x1]
+        sub_fp = fp[fy0:fy1, fx0:fx1] & np.isfinite(patch)
+        vals = patch[sub_fp]
+        out[y, x] = np.float32(np.median(vals)) if vals.size else np.float32(global_med)
+    return out
+
+
+def fft_forward(plane: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Compute shifted 2D FFT; returns ``(log_power_float32, complex_spectrum)``."""
+    img, finite = _fill_nonfinite(plane)
+    if finite.any() and not finite.all():
+        img = np.where(finite, img, float(img[finite].mean()))
+    spec = np.fft.fftshift(np.fft.fft2(img))
+    power = np.log1p(np.abs(spec)).astype(np.float32)
+    return power, spec.astype(np.complex64)
+
+
+def fft_inverse(spectrum: np.ndarray, shape: tuple[int, int] | None = None) -> np.ndarray:
+    """Invert a shifted 2D FFT spectrum back to a spatial float32 image."""
+    rec = np.fft.ifft2(np.fft.ifftshift(spectrum)).real.astype(np.float32)
+    if shape is not None:
+        rec = rec[: int(shape[0]), : int(shape[1])]
+    return np.ascontiguousarray(rec, dtype=np.float32)
+
+
+def bandpass_filter(
+    plane: np.ndarray,
+    filter_large: float = 40.0,
+    filter_small: float = 3.0,
+    suppress_stripes: str = 'none',
+    tolerance: float = 5.0,
+    autoscale: bool = False,
+) -> np.ndarray:
+    """ImageJ-style FFT Bandpass Filter with optional directional stripe suppression."""
+    from scipy.fft import next_fast_len
+
+    img, finite = _fill_nonfinite(plane)
+    h, w = img.shape
+    if h == 0 or w == 0 or not finite.any():
+        return np.zeros((h, w), dtype=np.float32)
+
+    fin_vals = img[finite]
+    in_min, in_max = float(fin_vals.min()), float(fin_vals.max())
+
+    pad_y = min(32, max(0, h - 1))
+    pad_x = min(32, max(0, w - 1))
+    nh = next_fast_len(h + 2 * pad_y)
+    nw = next_fast_len(w + 2 * pad_x)
+    pad_bottom = nh - h - pad_y
+    pad_right = nw - w - pad_x
+    can_reflect = max(pad_y, pad_bottom) < h and max(pad_x, pad_right) < w
+    padded = np.pad(
+        img,
+        ((pad_y, pad_bottom), (pad_x, pad_right)),
+        mode='reflect' if can_reflect else 'edge',
+    )
+
+    fy = np.fft.fftfreq(nh)[:, None]
+    fx = np.fft.fftfreq(nw)[None, :]
+    r = np.hypot(fy, fx)
+
+    filt = np.ones((nh, nw), dtype=np.float64)
+    if filter_large and float(filter_large) > 0:
+        filt *= 1.0 - np.exp(-((r * float(filter_large)) ** 2) * 2.0)
+    if filter_small and float(filter_small) > 0:
+        filt *= np.exp(-((r * float(filter_small)) ** 2) * 2.0)
+
+    stripes = (suppress_stripes or 'none').lower()
+    tol = max(float(tolerance), 0.5)
+    if stripes == 'horizontal':
+        theta_deg = np.degrees(np.arctan2(np.abs(fx), np.abs(fy)))
+        stripe_mask = 1.0 - np.exp(-0.5 * (theta_deg / tol) ** 2)
+        stripe_mask[0, 0] = 1.0
+        filt *= stripe_mask
+    elif stripes == 'vertical':
+        theta_deg = np.degrees(np.arctan2(np.abs(fy), np.abs(fx)))
+        stripe_mask = 1.0 - np.exp(-0.5 * (theta_deg / tol) ** 2)
+        stripe_mask[0, 0] = 1.0
+        filt *= stripe_mask
+
+    filtered = np.fft.ifft2(np.fft.fft2(padded) * filt).real
+    out = filtered[pad_y : pad_y + h, pad_x : pad_x + w]
+    if autoscale and in_max > in_min:
+        o_min, o_max = float(out.min()), float(out.max())
+        if o_max > o_min:
+            out = (out - o_min) * ((in_max - in_min) / (o_max - o_min)) + in_min
+    out = out.astype(np.float32)
+    if not finite.all():
+        out = np.where(finite, out, np.float32(0.0)).astype(np.float32)
+    return np.ascontiguousarray(out, dtype=np.float32)
+
+
+# ----------------------------------------------------- Labels geometry & Coloc
+
+
+def distance_map_labels(labels: np.ndarray, scale: tuple[float, ...] | None = None) -> np.ndarray:
+    """Euclidean distance map (EDM) inside objects to nearest background pixel/voxel."""
+    from scipy.ndimage import distance_transform_edt
+
+    fg = np.asarray(labels) > 0
+    if not fg.any():
+        return np.zeros(fg.shape, dtype=np.float32)
+    return distance_transform_edt(fg, sampling=scale).astype(np.float32)
+
+
+def skeletonize_labels(labels: np.ndarray) -> np.ndarray:
+    """Topological skeletonization (2D or 3D), preserving separate label IDs."""
+    from scipy.ndimage import find_objects
+    from skimage.morphology import skeletonize
+
+    arr = np.asarray(labels)
+    if not arr.any():
+        return np.zeros(arr.shape, dtype=arr.dtype)
+    if int(arr.max()) <= 1:
+        return np.where(skeletonize(arr > 0), 1, 0).astype(arr.dtype)
+
+    out = np.zeros(arr.shape, dtype=arr.dtype)
+    slices = find_objects(arr)
+    for label_id, sl in enumerate(slices, start=1):
+        if sl is None:
+            continue
+        skel = skeletonize(arr[sl] == label_id)
+        if skel.any():
+            out[sl][skel] = label_id
+    return out
+
+
+def outline_labels(labels: np.ndarray) -> np.ndarray:
+    """Inner 1-pixel object outlines (2D or 3D), preserving label IDs."""
+    from skimage.segmentation import find_boundaries
+
+    arr = np.asarray(labels)
+    if not arr.any():
+        return np.zeros(arr.shape, dtype=arr.dtype)
+    bnd = find_boundaries(arr, mode='inner', background=0)
+    return np.where(bnd, arr, 0).astype(arr.dtype, copy=False)
+
+
+def voronoi_labels(
+    labels: np.ndarray,
+    scale: tuple[float, ...] | None = None,
+    boundaries_only: bool = False,
+) -> np.ndarray:
+    """Nearest-seed Voronoi territories (or separating boundaries) in 2D or 3D."""
+    from scipy.ndimage import distance_transform_edt
+    from skimage.segmentation import find_boundaries
+
+    arr = np.asarray(labels)
+    if not arr.any():
+        return np.zeros(arr.shape, dtype=np.uint8 if boundaries_only else arr.dtype)
+    indices = distance_transform_edt(arr == 0, sampling=scale, return_distances=False, return_indices=True)
+    territory = arr[tuple(indices)]
+    if boundaries_only:
+        return find_boundaries(territory, mode='thick').astype(np.uint8)
+    return territory.astype(arr.dtype, copy=False)
+
+
+def _pearson(a: np.ndarray, b: np.ndarray) -> float:
+    if a.size < 2:
+        return float('nan')
+    ac = a - a.mean()
+    bc = b - b.mean()
+    denom = float(np.sqrt(np.dot(ac, ac) * np.dot(bc, bc)))
+    if denom <= 0.0:
+        return float('nan')
+    return float(np.dot(ac, bc) / denom)
+
+
+def _costes_thresholds(a: np.ndarray, b: np.ndarray) -> tuple[float, float, float, float]:
+    """Return ``(t1, t2, slope, intercept)`` using Costes automatic regression bisection."""
+    if a.size < 4:
+        return 0.0, 0.0, 1.0, 0.0
+    ac = a - a.mean()
+    bc = b - b.mean()
+    var_a = float(np.dot(ac, ac))
+    if var_a <= 0.0:
+        return float(a.min()), float(b.min()), 0.0, float(b.mean())
+    slope = float(np.dot(ac, bc) / var_a)
+    intercept = float(b.mean() - slope * a.mean())
+    if slope <= 0.0:
+        return 0.0, 0.0, slope, intercept
+
+    qs = np.unique(np.quantile(a, np.linspace(0.0, 1.0, 256)))
+    if qs.size < 2:
+        return float(a.min()), float(b.min()), slope, intercept
+
+    best_t1 = float(qs[0])
+    lo_idx, hi_idx = 0, len(qs) - 1
+    while lo_idx <= hi_idx:
+        mid = (lo_idx + hi_idx) // 2
+        t1 = float(qs[mid])
+        t2 = slope * t1 + intercept
+        below = (a <= t1) & (b <= t2)
+        if int(below.sum()) < 3:
+            r_sub = 0.0
+        else:
+            r_sub = _pearson(a[below], b[below])
+            if not np.isfinite(r_sub):
+                r_sub = 0.0
+        if r_sub <= 0.0:
+            best_t1 = t1
+            lo_idx = mid + 1
+        else:
+            hi_idx = mid - 1
+    best_t2 = slope * best_t1 + intercept
+    return float(best_t1), float(best_t2), slope, intercept
+
+
+def colocalization_stats(
+    ch1: np.ndarray,
+    ch2: np.ndarray,
+    mask: np.ndarray | None = None,
+    thresh1: float | None = None,
+    thresh2: float | None = None,
+    costes: bool = True,
+) -> dict:
+    """Pearson, Spearman, Overlap, Manders M1/M2, and Costes thresholded colocalization."""
+    from scipy.stats import spearmanr
+
+    arr1 = np.asarray(ch1, dtype=np.float64)
+    arr2 = np.asarray(ch2, dtype=np.float64)
+    if arr1.shape != arr2.shape:
+        raise ValueError(f'channel shapes differ: {arr1.shape} vs {arr2.shape}')
+    valid = np.isfinite(arr1) & np.isfinite(arr2)
+    if mask is not None:
+        m = np.asarray(mask, dtype=bool)
+        if m.shape != arr1.shape[-2:] and m.shape != arr1.shape:
+            raise ValueError(f'mask shape {m.shape} does not match image {arr1.shape}')
+        if m.ndim < arr1.ndim:
+            m = np.broadcast_to(m, arr1.shape)
+        valid &= m
+
+    a = arr1[valid]
+    b = arr2[valid]
+    n = int(a.size)
+    if n < 2:
+        nan = float('nan')
+        return {
+            'N': n,
+            'Pearson_r': nan,
+            'Spearman_rho': nan,
+            'Overlap_R': nan,
+            'Manders_M1': nan,
+            'Manders_M2': nan,
+            'Threshold_1': 0.0,
+            'Threshold_2': 0.0,
+            'tM1': nan,
+            'tM2': nan,
+            'Pearson_above': nan,
+            'Coloc_fraction': 0.0,
+            'Slope': 1.0,
+            'Intercept': 0.0,
+        }
+
+    pearson_r = _pearson(a, b)
+    sp_res = spearmanr(a, b)
+    spearman_rho = float(sp_res.statistic)
+
+    a_pos = np.clip(a, 0.0, None)
+    b_pos = np.clip(b, 0.0, None)
+    sum_a = float(a_pos.sum())
+    sum_b = float(b_pos.sum())
+    norm_ab = float(np.sqrt(np.dot(a_pos, a_pos) * np.dot(b_pos, b_pos)))
+    overlap_r = float(np.dot(a_pos, b_pos) / norm_ab) if norm_ab > 0 else float('nan')
+    m1 = float(a_pos[b_pos > 0].sum() / sum_a) if sum_a > 0 else float('nan')
+    m2 = float(b_pos[a_pos > 0].sum() / sum_b) if sum_b > 0 else float('nan')
+
+    if thresh1 is not None or thresh2 is not None:
+        t1 = float(thresh1) if thresh1 is not None else 0.0
+        t2 = float(thresh2) if thresh2 is not None else 0.0
+        _, _, slope, intercept = _costes_thresholds(a, b)
+    elif costes:
+        t1, t2, slope, intercept = _costes_thresholds(a, b)
+    else:
+        t1, t2 = 0.0, 0.0
+        _, _, slope, intercept = _costes_thresholds(a, b)
+
+    above1 = a > t1
+    above2 = b > t2
+    both = above1 & above2
+    tm1 = float(a_pos[above2].sum() / sum_a) if sum_a > 0 else float('nan')
+    tm2 = float(b_pos[above1].sum() / sum_b) if sum_b > 0 else float('nan')
+    pearson_above = _pearson(a[both], b[both])
+    coloc_frac = float(both.mean())
+
+    return {
+        'N': n,
+        'Pearson_r': pearson_r,
+        'Spearman_rho': spearman_rho,
+        'Overlap_R': overlap_r,
+        'Manders_M1': m1,
+        'Manders_M2': m2,
+        'Threshold_1': t1,
+        'Threshold_2': t2,
+        'tM1': tm1,
+        'tM2': tm2,
+        'Pearson_above': pearson_above,
+        'Coloc_fraction': coloc_frac,
+        'Slope': slope,
+        'Intercept': intercept,
+    }

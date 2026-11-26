@@ -41,27 +41,55 @@ calibrated `(X, Y)` coordinates.
 The threshold preview is temporary. Applying creates a new Labels layer and
 does not alter the image.
 
-Use **Process → Labels → Watershed…**, **Fill Holes**, or **Morphology…**
-(`Erode`, `Dilate`, `Open`, `Close` on binary or multi-label 2D/3D masks) to
-clean up segmented labels before measuring.
+Use **Process → Labels → Watershed…**, **Fill Holes**, **Morphology…**
+(`Erode`, `Dilate`, `Open`, `Close`), **Distance Map** (calibrated Euclidean
+distance map), **Skeletonize** (2D & 3D preserving label IDs), **Outline**, or
+**Voronoi…** to clean up and measure segmented labels. Press {kbd}`Ctrl+Z`
+(**Edit → Undo**) to undo Labels painting strokes, `Crop`, or added layers.
 
-## Filter, maxima, resize, and math
+## Filter, Noise, FFT, maxima, resize, and math
 
 Gaussian blur, Mean, Median, Minimum, Maximum, Variance, Top Hat, Unsharp Mask,
-Convolve (with custom 2D kernels and presets), and rolling-ball Subtract
-Background show a live preview and display kernel sizes in physical units
-alongside pixels when calibrated. Top-level **Process** commands include
-**Smooth** ({kbd}`Ctrl+Shift+S`), **Sharpen**, **Find Edges** (one-click Sobel),
-**Edge Detection…** (Canny, Sobel, Scharr, Prewitt, Roberts, LoG, and DoG with
-live preview and anisotropic 3D support), and **Find Maxima…** (h-maxima
-prominence detection with live point preview and Point Selection, Single Points,
-Segmented Particles, List, and Count outputs).
-**Edit → Invert** inverts intensity non-destructively, **Process → Math…**
-applies scalar/unary math (`Add`, `Subtract`, `Multiply`, `Divide`, `Gamma`,
-`Log`, `Sqrt`, etc.), and **Image → Adjust → Size…** resizes stacks/planes
-while updating physical pixel spacing. Applying adds a new image layer or
-window. For a calibrated Z stack, 3D Gaussian, Mean, Median, Minimum, Maximum,
-Variance, Top Hat, and Unsharp kernels account for anisotropic voxel dimensions.
+Convolve (with custom 2D kernels and presets), **Remove Outliers…**, **Bandpass
+Filter…**, and rolling-ball Subtract Background show a live preview and display
+kernel sizes in physical units alongside pixels when calibrated:
+
+- **Process → Noise**: **Despeckle**, **Remove Outliers…** (`Bright` / `Dark` /
+  `Both` hot pixels), **Remove NaNs…**, **Add Noise**, **Add Specified Noise…**,
+  and **Salt and Pepper**.
+- **Process → FFT**: **FFT** (log-power spectrum), **Inverse FFT**, and
+  **Bandpass Filter…** (large/small feature filtering with horizontal or
+  vertical stripe suppression).
+- Top-level **Process** commands include **Smooth** ({kbd}`Ctrl+Shift+S`),
+  **Sharpen**, **Find Edges** (one-click Sobel), **Edge Detection…** (Canny,
+  Sobel, Scharr, Prewitt, Roberts, LoG, and DoG with live preview and
+  anisotropic 3D support), and **Find Maxima…** (h-maxima prominence detection
+  with live point preview and Point Selection, Single Points, Segmented
+  Particles, List, and Count outputs).
+- **Edit → Invert** inverts intensity non-destructively, **Process → Math…**
+  applies scalar/unary math (`Add`, `Subtract`, `Multiply`, `Divide`, `Gamma`,
+  `Log`, `Sqrt`, etc.), **Image → Adjust → Size…** resizes stacks/planes while
+  updating physical pixel spacing, and **Image → Adjust → Sync Display Across
+  Windows** copies LUTs and contrast ranges across open windows.
+
+For a calibrated Z stack, 3D Gaussian, Mean, Median, Minimum, Maximum, Variance,
+Top Hat, and Unsharp kernels account for anisotropic voxel dimensions.
+
+## Colocalization
+
+Choose **Analyze → Colocalization…**, select two greyscale channels or open
+images (current plane or whole stack, optional ROI mask), and choose **Costes
+automatic**, **Manual**, or **None** thresholding. TIKI displays a 2D
+log-density cytofluorogram, Pearson's *r*, Spearman's ρ, Overlap R, Manders'
+M1 / M2, Costes tM1 / tM2, and **Add to Results**.
+
+## Batch conversion and macros
+
+- **Process → Batch → Convert…**: convert a folder of images (including
+  subfolders and filename globs) to calibrated `.tif`, `.png`, `.jpg`, or `.npy`.
+- **Process → Batch → Run Macro…**: run a saved, recorded, or inline Python
+  macro across matching files in a folder and save optional outputs plus
+  `Results.csv`.
 
 ## Send a session to a notebook
 

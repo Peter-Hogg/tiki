@@ -760,3 +760,106 @@ def test_detect_edges_2d_and_3d():
         ops.detect_edges_3d(vol, method='canny')
 
 
+def test_noise_fft_and_bandpass():
+    # Despeckle, add_gaussian_noise, salt_and_pepper, remove_outliers, remove_nans
+    base = np.full((16, 16), 100, dtype=np.uint8)
+    with_hot = base.copy()
+    with_hot[8, 8] = 250
+    with_cold = base.copy()
+    with_cold[8, 8] = 5
+
+    assert ops.despeckle(with_hot)[8, 8] == 100 and ops.despeckle(with_hot).dtype == np.uint8
+    assert ops.remove_outliers(with_hot, radius=1.0, threshold=50, which='bright')[8, 8] == 100
+    assert ops.remove_outliers(with_cold, radius=1.0, threshold=50, which='dark')[8, 8] == 100
+    both = with_hot.copy()
+    both[3, 3] = 5
+    cleaned = ops.remove_outliers(both, radius=1.0, threshold=50, which='both')
+    assert cleaned[8, 8] == 100 and cleaned[3, 3] == 100
+
+    rng = np.random.default_rng(7)
+    noisy = ops.add_gaussian_noise(base, sigma=10.0, rng=rng)
+    assert noisy.dtype == np.uint8 and noisy.std() > 5.0
+    sp = ops.salt_and_pepper(base, fraction=0.1, rng=rng)
+    assert (sp == 0).any() and (sp == 255).any()
+
+    nan_plane = np.full((11, 11), 42.0, dtype=np.float32)
+    nan_plane[5, 5] = np.nan
+    nan_plane[5, 6] = np.inf
+    fixed = ops.remove_nans(nan_plane, radius=2.0)
+    assert np.all(np.isfinite(fixed)) and fixed[5, 5] == pytest.approx(42.0)
+
+    # FFT forward & inverse roundtrip + Bandpass stripe suppression
+    yy, xx = np.mgrid[:32, :32]
+    signal = (50.0 + 20.0 * np.sin(2 * np.pi * xx / 8.0)).astype(np.float32)
+    power, spec = ops.fft_forward(signal)
+    assert power.shape == (32, 32) and power.dtype == np.float32 and np.iscomplexobj(spec)
+    rec = ops.fft_inverse(spec, shape=(32, 32))
+    np.testing.assert_allclose(rec, signal, atol=1e-3)
+
+    # Horizontal stripe suppression removes horizontal stripes while keeping vertical grating
+    striped = (20.0 * np.sin(2 * np.pi * yy / 4.0) + 15.0 * np.sin(2 * np.pi * xx / 6.0)).astype(np.float32)
+    unstriped = ops.bandpass_filter(
+        striped, filter_large=30.0, filter_small=1.0, suppress_stripes='horizontal', tolerance=8.0
+    )
+    # Variance across rows (horizontal stripes) should drop sharply relative to column modulation
+    row_profile_before = float(striped.mean(axis=1).std())
+    row_profile_after = float(unstriped.mean(axis=1).std())
+    assert row_profile_after < 0.25 * row_profile_before
+
+
+def test_labels_geometry_and_colocalization():
+    # Distance map (2D & anisotropic 3D)
+    sq = np.zeros((13, 13), dtype=np.int32)
+    sq[2:11, 2:11] = 1
+    edm = ops.distance_map_labels(sq, scale=(0.5, 0.5))
+    assert edm.dtype == np.float32 and edm[6, 6] == pytest.approx(2.5) and edm[0, 0] == 0.0
+
+    vol = np.zeros((7, 13, 13), dtype=np.int32)
+    vol[1:6, 2:11, 2:11] = 1
+    edm3 = ops.distance_map_labels(vol, scale=(2.0, 0.5, 0.5))
+    assert edm3[3, 6, 6] == pytest.approx(2.5)
+
+    # Skeletonize (multi-label preserves IDs, thin line), Outline, Voronoi
+    multi = np.zeros((15, 20), dtype=np.int32)
+    multi[3:10, 2:7] = 1
+    multi[3:10, 11:16] = 2
+    skel = ops.skeletonize_labels(multi)
+    assert set(np.unique(skel)) == {0, 1, 2} and skel.sum() < multi.sum()
+
+    out = ops.outline_labels(multi)
+    assert set(np.unique(out)) == {0, 1, 2}
+    assert out[6, 4] == 0 and out[3, 4] == 1 and out[3, 13] == 2
+
+    terr = ops.voronoi_labels(multi)
+    assert set(np.unique(terr)) == {1, 2}
+    assert terr[0, 0] == 1 and terr[0, 19] == 2
+    bnds = ops.voronoi_labels(multi, boundaries_only=True)
+    assert bnds.dtype == np.uint8 and bnds.max() == 1 and bnds[:, 8:10].max() == 1
+
+    # Colocalization: correlated signal above noisy background + anti-correlated case + ROI mask
+    rng = np.random.default_rng(11)
+    ch1 = rng.uniform(0, 10, (24, 24)).astype(np.float32)
+    ch2 = rng.uniform(0, 10, (24, 24)).astype(np.float32)
+    ch1[3:20, 3:20] = rng.uniform(50, 200, (17, 17))
+    ch2[3:20, 3:20] = 0.8 * ch1[3:20, 3:20] + 5.0
+
+    stats = ops.colocalization_stats(ch1, ch2, costes=True)
+    assert stats['Pearson_r'] > 0.95
+    assert stats['Spearman_rho'] > 0.7
+    assert stats['Manders_M1'] == pytest.approx(1.0)
+    assert stats['Manders_M2'] == pytest.approx(1.0)
+    assert stats['Threshold_1'] >= 10.0 and stats['Pearson_above'] > 0.99
+
+    # Restricting to ROI mask containing only signal block yields N=64
+    mask = np.zeros((24, 24), dtype=bool)
+    mask[4:12, 4:12] = True
+    m_stats = ops.colocalization_stats(ch1, ch2, mask=mask, costes=False)
+    assert m_stats['N'] == 64 and m_stats['Spearman_rho'] > 0.99
+
+    # Anti-correlated quadrant gives negative Pearson r
+    ch2_anti = 250.0 - ch1
+    anti = ops.colocalization_stats(ch1, ch2_anti, costes=True)
+    assert anti['Pearson_r'] < -0.95
+
+
+

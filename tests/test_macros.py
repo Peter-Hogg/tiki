@@ -157,3 +157,79 @@ lab = tiki.labels('c2 mask')
     assert not ok and "no image layer named 'nope'" in out and 'C1-two.tif' in out
     ok, out, _ = macros.run_code(tiki, "tiki.image(window='missing')")
     assert not ok and 'open windows' in out
+
+
+def test_macro_api_helpers_recorder_and_batch(tiki, tmp_path):
+    import tifffile
+    from tiki import batch
+
+    # 1. MacroAPI programmatic helpers: set_scale, set_lut, filter, z_project, threshold, analyze_particles
+    mov = np.zeros((4, 16, 16), dtype=np.float32)
+    mov[:, 4:12, 4:12] = 100.0
+    _movie(tiki, mov, roles='ZYX')
+    code = """
+tiki.set_scale(0.5, 0.5, unit='µm')
+tiki.set_lut('Fire')
+tiki.filter('gaussian', whole_stack=True, three_d=False, sigma=1.0)
+tiki.threshold(40.0, 1000.0, scope='whole', split=True, connect_z=True)
+n = tiki.analyze_particles(min_size=5, scope='whole', three_d=True)
+p_view = tiki.z_project('max')
+"""
+    ok, out, ns = macros.run_code(tiki, code)
+    assert ok, out
+    assert ns['n'] == 1
+    assert tiki.results.column_units.get('Volume') == 'µm³'
+    assert ns['p_view'].title.startswith('MAX_')
+
+    # 2. MacroRecorderWindow records actions, supports Pause/Resume and Create Macro -> Editor
+    rec = tiki.show_macro_recorder()
+    tiki.windows.activate(tiki.windows.viewers[0])
+    tiki.invert()
+    assert "tiki.run('Invert')" in rec.code()
+
+    rec.pause_btn.setChecked(True)
+    tiki.flip('horizontal')
+    assert "Flip Horizontally" not in rec.code()
+    rec.pause_btn.setChecked(False)
+
+    ed = rec.create_macro()
+    assert "tiki.run('Invert')" in ed.editor.toPlainText()
+    ed.close()
+    rec.close()
+
+    # 3. Batch Convert (TIFF -> PNG & NPY) and Batch Macro across folder
+    in_dir = tmp_path / 'batch_in'
+    in_dir.mkdir()
+    for idx in range(2):
+        arr = np.full((3, 12, 12), 50 + idx * 40, dtype=np.uint16)
+        arr[:, 3:9, 3:9] += 100
+        tifffile.imwrite(in_dir / f'img_{idx + 1}.tif', arr, imagej=True, metadata={'axes': 'ZYX'})
+
+    out_png = tmp_path / 'out_png'
+    n_conv, errs = batch.batch_convert(in_dir, out_png, fmt='png')
+    assert n_conv == 2 and errs == []
+    assert (out_png / 'img_1.png').is_file() and (out_png / 'img_2.png').is_file()
+
+    out_npy = tmp_path / 'out_npy'
+    n_npy, errs2 = batch.batch_convert(in_dir, out_npy, fmt='npy')
+    assert n_npy == 2 and errs2 == []
+    assert np.load(out_npy / 'img_1.npy').shape == (3, 12, 12)
+
+    tiki.results.clear()
+    out_batch = tmp_path / 'out_batch'
+    before_wins = len(tiki.windows.viewers)
+    n_ok, b_errs = batch.batch_macro(
+        tiki,
+        in_dir,
+        "tiki.z_project('max')\ntiki.run('Measure')",
+        output_dir=out_batch,
+        auto_save=True,
+        save_results_csv=True,
+        close_after=True,
+    )
+    assert n_ok == 2 and b_errs == []
+    assert len(tiki.results.rows) == 2
+    assert (out_batch / 'Results.csv').is_file()
+    assert (out_batch / 'img_1.tif').is_file()
+    assert len(tiki.windows.viewers) == before_wins
+

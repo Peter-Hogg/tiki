@@ -177,8 +177,13 @@ pixel value.
 - **Process ▸ Math…**: non-destructive scalar/unary math (`Add`, `Subtract`,
   `Multiply`, `Divide`, `Min`, `Max`, `Gamma`, `Log`, `Exp`, `Square`, `Sqrt`,
   `Abs`) on the current plane or whole stack
-- **Process ▸ Labels**: **Watershed…**, **Fill Holes**, and **Morphology…**
-  (`Erode`, `Dilate`, `Open`, `Close` on binary or multi-label 2D/3D masks)
+- **Edit ▸ Undo** (<kbd>Ctrl</kbd>+<kbd>Z</kbd>): undo Labels brush strokes, `Crop`, or added processing layers; **Image ▸ Adjust ▸ Sync Display Across Windows** (and **Sync to All Windows** in **Channels Tool…**) copies LUTs and contrast ranges across open windows
+- **Process ▸ Noise** (**Despeckle**, **Remove Outliers…**, **Remove NaNs…**, **Add Noise**, **Add Specified Noise…**, **Salt and Pepper**) and **Process ▸ FFT** (**FFT**, **Inverse FFT**, **Bandpass Filter…** with stripe suppression)
+- **Process ▸ Batch**: **Convert…** (folder conversion to TIFF, PNG, JPEG, or NPY) and **Run Macro…** across folders with optional `Results.csv` export
+- **Analyze ▸ Colocalization…**: Pearson's *r*, Spearman's ρ, Overlap R, Manders' M1/M2, Costes auto-thresholds, and interactive cytofluorogram plot
+- **Process ▸ Labels**: **Watershed…**, **Fill Holes**, **Morphology…**
+  (`Erode`, `Dilate`, `Open`, `Close`), calibrated **Distance Map**,
+  **Skeletonize** (2D/3D), **Outline**, and **Voronoi…**
 - Crop, enhance contrast and reset contrast
 - **Brightness/Contrast…** (<kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>C</kbd>): floating histogram with transfer ramp, Min/Max sliders and spinboxes, **Auto** saturation cycling, **Reset**, exact **Set…** and **Propagate** across windows
 - **Image ▸ Lookup Tables**: `Grays`, `Inverted Grays`, `Fire`, `Cyan Hot`, `HiLo`, channel colors and scientific colormaps, plus per-channel contrast sliders and `Auto` buttons in **Channels Tool…**
@@ -327,7 +332,7 @@ pixel value.
 
 ### Python macros
 
-- **Plugins ▸ Macros ▸ New Macro…** opens a Python editor (Run with Ctrl+R) with
+- **Plugins ▸ Macros ▸ Record…** records menu operations into editable Python; **Plugins ▸ Macros ▸ New Macro…** opens a Python editor (Run with Ctrl+R) with
   a `tiki` object for the open windows: `tiki.image()`, `tiki.show(...)`,
   `tiki.add_labels(...)`, `tiki.rois()`, `tiki.traces()`, `tiki.run('Measure')`,
   `tiki.progress(...)` and more
@@ -368,10 +373,10 @@ pixel value.
 | File → Import | Image Sequence… | <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>I</kbd> |
 | File | Close / Close All | <kbd>Ctrl</kbd>+<kbd>W</kbd> / <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>W</kbd> |
 | File | Save As TIFF… | <kbd>Ctrl</kbd>+<kbd>S</kbd> |
+| Edit | Undo / Invert | <kbd>Ctrl</kbd>+<kbd>Z</kbd> / — |
 | Edit → Selection | Select All / Select None | <kbd>Ctrl</kbd>+<kbd>A</kbd> / <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>A</kbd> |
-| Edit | Invert | |
 | Image → Adjust | Brightness/Contrast… | <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>C</kbd> |
-| Image → Adjust | Size… | |
+| Image → Adjust | Size… / Sync Display Across Windows | |
 | Image → Adjust | Threshold… (preview and result are napari Labels) | <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>T</kbd> |
 | Image → Adjust | Enhance Contrast | <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>E</kbd> |
 | Image → Lookup Tables | Grays, Fire, Cyan Hot, HiLo, channel colors… | |
@@ -383,15 +388,18 @@ pixel value.
 | Image → Stacks | Z Project… / Make Substack… / Bin… / Hyperstack to Stack / Concatenate… / Images to Stack… / Reverse / Remove Slices… | |
 | Process | Smooth / Sharpen / Find Edges / Edge Detection… / Find Maxima… | <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>S</kbd> / — / — / — / — |
 | Process → Filters | Convolve…, Gaussian Blur…, Mean…, Median…, Minimum…, Maximum…, Variance…, Top Hat…, Unsharp Mask… | |
+| Process → Noise | Despeckle, Remove Outliers…, Remove NaNs…, Add Noise, Add Specified Noise…, Salt and Pepper | |
+| Process → FFT | FFT, Inverse FFT, Bandpass Filter… | |
+| Process → Batch | Convert…, Run Macro… | |
 | Process | Subtract Background… / Math… | |
 | Image → Stacks | Plot Z-axis Profile | <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>Y</kbd> |
-| Analyze | Measure | <kbd>Ctrl</kbd>+<kbd>M</kbd> |
+| Analyze | Measure / Colocalization… | <kbd>Ctrl</kbd>+<kbd>M</kbd> / — |
 | Process | ΔF/F…, Bleach Correction…, Motion Correction…, Image Calculator… | |
-| Process → Labels | Watershed…, Fill Holes, Morphology… | |
+| Process → Labels | Watershed…, Fill Holes, Morphology…, Distance Map, Skeletonize, Outline, Voronoi… | |
 | Image → Stacks | Kymograph / Reslice… (from a line or path) | |
 | Analyze | Histogram / Set Scale… | <kbd>Ctrl</kbd>+<kbd>H</kbd> / — |
 | File | Open Recent | |
-| Plugins → Macros | New / Edit / Run Macro…, macros folder (Python) | <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>M</kbd> |
+| Plugins → Macros | Record…, New / Edit / Run Macro…, macros folder (Python) | — / <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>M</kbd> |
 | Analyze | Analyze Particles… (per-object table from a Labels layer) | |
 | Analyze → Traces | From ROI Manager / From Labels (cells × time) | |
 | Analyze → Tools | ROI Manager… / Add to Manager | — / <kbd>Ctrl</kbd>+<kbd>T</kbd> |
@@ -438,6 +446,9 @@ src/tiki/
 ├── rois.py      ROI model, ImageJ .roi/.zip and Labels conversion
 ├── roi_manager.py ROI Manager window
 ├── filters.py   Process filters with live preview
+├── fft_noise.py Noise cleanup, FFT, Inverse FFT and Bandpass Filter
+├── coloc.py     Colocalization metrics and cytofluorogram
+├── batch.py     Batch Convert and Batch Macro over folders
 ├── export.py    Send to Notebook
 ├── style.py     fixed light theme for TIKI windows
 └── icons.py     toolbar icon drawing

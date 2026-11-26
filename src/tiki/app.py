@@ -95,8 +95,10 @@ class Tiki(QMainWindow):
         self.threshold_window = None
         self.roi_manager = None
         self.console_window = None
+        self.recorder_window = None
         self.traces: list = []  # open TracesWindows (exported by Send to Notebook)
         self._last_roi: tuple[np.ndarray, str] | None = None
+        self._undo_stack: list[dict] = []
         self.wand_tolerance: float = 10.0
         self.measurements: set[str] = set(ops.DEFAULT_MEASUREMENTS)
 
@@ -188,6 +190,8 @@ class Tiki(QMainWindow):
         self._add(m, 'Quit', self.close, 'Ctrl+Q')
 
         m = mb.addMenu('&Edit')
+        self._add(m, 'Undo', self.undo, 'Ctrl+Z')
+        m.addSeparator()
         sel = m.addMenu('Selection')
         self._add(sel, 'Select All', self.select_all, 'Ctrl+A')
         self._add(sel, 'Select None', self.select_none, 'Ctrl+Shift+A')
@@ -213,6 +217,7 @@ class Tiki(QMainWindow):
         self._add(adjust, 'Threshold…', self.threshold, 'Ctrl+Shift+T')
         self._add(adjust, 'Enhance Contrast', self.enhance_contrast, 'Ctrl+Shift+E')
         self._add(adjust, 'Reset Display Range', self.reset_contrast)
+        self._add(adjust, 'Sync Display Across Windows', self.sync_display)
         adjust.addSeparator()
         self._add(adjust, 'Size…', lambda: self._process('resize_dialog'))
         luts = m.addMenu('Lookup Tables')
@@ -269,6 +274,18 @@ class Tiki(QMainWindow):
         self._add(filt, 'Variance…', lambda: self.filter_dialog('variance'))
         self._add(filt, 'Top Hat…', lambda: self.filter_dialog('tophat'))
         self._add(filt, 'Unsharp Mask…', lambda: self.filter_dialog('unsharp'))
+        noise_menu = m.addMenu('Noise')
+        self._add(noise_menu, 'Despeckle', lambda: self._fft_noise('despeckle_command'))
+        self._add(noise_menu, 'Remove Outliers…', lambda: self._fft_noise('remove_outliers_dialog'))
+        self._add(noise_menu, 'Remove NaNs…', lambda: self._fft_noise('remove_nans_dialog'))
+        noise_menu.addSeparator()
+        self._add(noise_menu, 'Add Noise', lambda: self._fft_noise('add_noise_command'))
+        self._add(noise_menu, 'Add Specified Noise…', lambda: self._fft_noise('add_specified_noise_dialog'))
+        self._add(noise_menu, 'Salt and Pepper', lambda: self._fft_noise('salt_and_pepper_command'))
+        fft_menu = m.addMenu('FFT')
+        self._add(fft_menu, 'FFT', lambda: self._fft_noise('fft_command'))
+        self._add(fft_menu, 'Inverse FFT', lambda: self._fft_noise('inverse_fft_command'))
+        self._add(fft_menu, 'Bandpass Filter…', lambda: self._fft_noise('bandpass_dialog'))
         self._add(m, 'Subtract Background…', lambda: self.filter_dialog('background'))
         self._add(m, 'Math…', lambda: self._process('math_dialog'))
         m.addSeparator()
@@ -280,11 +297,20 @@ class Tiki(QMainWindow):
         self._add(labels_menu, 'Watershed…', lambda: self._process('watershed_dialog'))
         self._add(labels_menu, 'Fill Holes', lambda: self._process('fill_holes_command'))
         self._add(labels_menu, 'Morphology…', lambda: self._process('morphology_dialog'))
+        labels_menu.addSeparator()
+        self._add(labels_menu, 'Distance Map', lambda: self._process('distance_map_command'))
+        self._add(labels_menu, 'Skeletonize', lambda: self._process('skeletonize_command'))
+        self._add(labels_menu, 'Outline', lambda: self._process('outline_command'))
+        self._add(labels_menu, 'Voronoi…', lambda: self._process('voronoi_dialog'))
+        batch_menu = m.addMenu('Batch')
+        self._add(batch_menu, 'Convert…', lambda: self._batch('batch_convert_dialog'))
+        self._add(batch_menu, 'Run Macro…', lambda: self._batch('batch_macro_dialog'))
 
         m = mb.addMenu('&Analyze')
         self._add(m, 'Measure', self.measure, 'Ctrl+M')
         self._add(m, 'Analyze Particles…', self.analyze_particles)
         self._add(m, 'Histogram', self.histogram, 'Ctrl+H')
+        self._add(m, 'Colocalization…', lambda: self._coloc('colocalization_dialog'))
         self._add(m, 'Set Scale…', lambda: self._process('set_scale_dialog'))
         self._add(m, 'Set Measurements…', lambda: self._process('set_measurements_dialog'))
         self._add(m, 'Clear Results', self.results.clear)
@@ -305,6 +331,8 @@ class Tiki(QMainWindow):
         m.addSeparator()
         macros = m.addMenu('Macros')
         self.macros_menu = macros
+        self._add(macros, 'Record…', self.show_macro_recorder)
+        macros.addSeparator()
         self._add(macros, 'New Macro…', self.new_macro, 'Ctrl+Shift+M')
         self._add(macros, 'Edit Macro…', self.edit_macro)
         self._add(macros, 'Run Macro…', self.run_macro_file)
@@ -658,6 +686,7 @@ class Tiki(QMainWindow):
                     self._message_until = time.monotonic() + 10
                 if 'warning' in meta:
                     self.report('Open', f'{meta["name"]}: {meta["warning"]}')
+            self.record(f'tiki.open({str(path)!r})')
             recent.add(path)
 
     def open_sequence(self, folder_or_paths, **kwargs):
@@ -849,6 +878,7 @@ class Tiki(QMainWindow):
         if not ch_names and layer.metadata.get('channel_name'):
             ch_names = [layer.metadata['channel_name']]
         io.save_tiff(path, layer.data, axes=info, luts=luts, channel_names=ch_names)
+        self.record(f'tiki.save_tiff({str(path)!r})')
         self.status(f'Saved {path}')
         return Path(path)
 
@@ -925,6 +955,68 @@ class Tiki(QMainWindow):
                 self._last_roi = (cur[0].copy(), cur[1])
             layer.data = []
 
+    UNDO_MAX = 10
+    UNDO_MAX_BYTES = 256 * 2**20
+
+    def push_undo_data(self, label: str, viewer, layer) -> None:
+        """Snapshot ``layer.data`` and axes before an in-place edit (up to 256 MB total)."""
+        arr = np.asarray(layer.data)
+        if arr.nbytes > self.UNDO_MAX_BYTES:
+            return
+        entry = {
+            'kind': 'data',
+            'label': label,
+            'viewer': viewer,
+            'layer': layer,
+            'data': arr.copy(),
+            'bytes': int(arr.nbytes),
+            'axes': axes_mod.get(layer).to_dict(),
+        }
+        self._undo_stack.append(entry)
+        self._trim_undo_stack()
+
+    def push_undo_layer(self, label: str, viewer, layer) -> None:
+        """Register a newly created layer so Edit ▸ Undo removes it."""
+        self._undo_stack.append(
+            {'kind': 'layer', 'label': label, 'viewer': viewer, 'layer': layer, 'bytes': 0}
+        )
+        self._trim_undo_stack()
+
+    def _trim_undo_stack(self) -> None:
+        while len(self._undo_stack) > self.UNDO_MAX:
+            self._undo_stack.pop(0)
+        total_bytes = sum(e.get('bytes', 0) for e in self._undo_stack)
+        while total_bytes > self.UNDO_MAX_BYTES and self._undo_stack:
+            total_bytes -= self._undo_stack.pop(0).get('bytes', 0)
+
+    def undo(self) -> None:
+        """Undo the last Labels paint stroke, destructive crop, or added layer."""
+        viewer = self.windows.active
+        if viewer is not None:
+            active = viewer.layers.selection.active
+            if isinstance(active, Labels) and len(getattr(active, '_undo_history', ())):
+                active.undo()
+                self.status(f'Undo paint on "{active.name}"')
+                return
+
+        while self._undo_stack:
+            entry = self._undo_stack.pop()
+            v, ly = entry['viewer'], entry['layer']
+            if v not in self.windows.viewers or ly not in v.layers:
+                continue
+            if entry['kind'] == 'data':
+                ly.data = entry['data']
+                if entry.get('axes'):
+                    axes_mod.apply(v, ly, axes_mod.AxesInfo.from_dict(entry['axes']))
+                v.reset_view()
+            else:
+                v.layers.remove(ly)
+                self.reapply_tool(v)
+            self.status(f'Undo {entry["label"]}')
+            return
+
+        raise TikiError('nothing to undo')
+
     def restore_selection(self) -> None:
         viewer, _ = self.require_image()
         if self._last_roi is None:
@@ -951,6 +1043,7 @@ class Tiki(QMainWindow):
         if not image.rgb:
             kw['colormap'] = image.colormap
         v = self.open_data(out, f'Inv_{image.name}', **kw)
+        self.record("tiki.run('Invert')")
         self.status(f'Inverted {image.name}')
         return v
 
@@ -965,6 +1058,7 @@ class Tiki(QMainWindow):
             kw['colormap'] = image.colormap
         tag = 'FlipH' if axis == 'horizontal' else 'FlipV'
         v = self.open_data(out, f'{tag}_{image.name}', **kw)
+        self.record(f"tiki.run({'Flip Horizontally' if axis == 'horizontal' else 'Flip Vertically'!r})")
         self.status(f'Flipped {image.name} ({axis})')
         return v
 
@@ -983,6 +1077,7 @@ class Tiki(QMainWindow):
             kw['colormap'] = image.colormap
         tag = 'Rot90R' if k < 0 else 'Rot90L'
         v = self.open_data(out, f'{tag}_{image.name}', **kw)
+        self.record(f"tiki.run({'Rotate 90° Right' if k < 0 else 'Rotate 90° Left'!r})")
         self.status(f'Rotated {image.name} 90° {"right" if k < 0 else "left"}')
         return v
 
@@ -1004,6 +1099,9 @@ class Tiki(QMainWindow):
         if not image.rgb:
             kw['colormap'] = image.colormap
         v = self.open_data(out, f'{target_dtype}_{image.name}', **kw)
+        label = {'uint8': '8-bit', 'uint16': '16-bit', 'float32': '32-bit'}.get(target_dtype)
+        if label:
+            self.record(f'tiki.run({label!r})')
         self.status(f'Converted {image.name} to {target_dtype}')
         return v
 
@@ -1073,6 +1171,7 @@ class Tiki(QMainWindow):
         layers = channels.split(viewer, image)
         self.reapply_tool(viewer)
         self._refresh_channels_tool(viewer)
+        self.record("tiki.run('Split Channels')")
         self.status(f'Split {image.name} into {len(layers)} channel layers (run Split Channels again for separate windows)')
 
     def merge_channels(self):
@@ -1085,6 +1184,7 @@ class Tiki(QMainWindow):
             layer = channels.merge(viewer)
             self.reapply_tool(viewer)
             self._refresh_channels_tool(viewer)
+            self.record("tiki.run('Merge Channels')")
             self.status(f'Merged channels back into {layer.name}')
             return layer
         return self._process('merge_channels_dialog')
@@ -1120,6 +1220,7 @@ class Tiki(QMainWindow):
         viewer, image = self.require_image()
         contrast.apply_lut(image, name)
         self._refresh_channels_tool(viewer)
+        self.record(f'tiki.set_lut({name!r})')
         self.status(f'{image.name}: LUT → {name}')
 
     def threshold(self) -> None:
@@ -1143,11 +1244,20 @@ class Tiki(QMainWindow):
         lo, hi = ops.saturated_limits(plane)
         image.contrast_limits_range = (min(lo, image.contrast_limits_range[0]), max(hi, image.contrast_limits_range[1]))
         image.contrast_limits = (lo, hi)
+        self.record("tiki.run('Enhance Contrast')")
         self.status(f'Display range {lo:.4g}–{hi:.4g} (0.35% saturated)')
 
     def reset_contrast(self) -> None:
         viewer, image = self.require_image()
         image.reset_contrast_limits()
+        self.record("tiki.run('Reset Display Range')")
+
+    def sync_display(self, viewer=None) -> int:
+        from . import contrast
+
+        if viewer is None:
+            viewer, _ = self.require_image()
+        return contrast.sync_display_across_windows(self, viewer)
 
     def show_info(self):
         from .widgets import InfoWindow
@@ -1206,9 +1316,14 @@ class Tiki(QMainWindow):
         box = self._roi_box(viewer, image)
         if box is None:
             raise TikiError('Crop needs an area selection')
+        self.push_undo_data('Crop', viewer, image)
         image.data = np.array(ops.crop_to_box(image.data, box))
+        expected_shape = image.data.shape[:-1] if image.rgb else image.data.shape
+        image.metadata['axes'] = axes_mod.fit(axes_mod.get(image), expected_shape).to_dict()
         self.select_none()
         viewer.reset_view()
+        self.record("tiki.run('Crop')")
+        self.status(f'Cropped {image.name} → {image.data.shape}')
 
     def z_project_dialog(self) -> None:
         from .layer_select import LayerCombo
@@ -1281,6 +1396,7 @@ class Tiki(QMainWindow):
         prefix = {'max': 'MAX', 'mean': 'AVG', 'sum': 'SUM', 'std': 'STD', 'median': 'MED', 'min': 'MIN'}[method]
         info = axes_mod.fit(axes_mod.get(image), data.shape).without(axis)
         viewer = self.open_data(result, f'{prefix}_{image.name}', axes=info)
+        self.record(f'tiki.z_project({method!r}, axis={axis!r}, start={start!r}, stop={stop!r})')
         self.status(f'Z Project ({method}) in {time.perf_counter() - t0:.2f} s')
         return viewer
 
@@ -1348,6 +1464,7 @@ class Tiki(QMainWindow):
             verts = np.asarray(current[0])[:, -2:] * np.asarray(scale_yx)
             row['Length'] = float(np.linalg.norm(np.diff(verts, axis=0), axis=1).sum())
         self.results.add_row(row)
+        self.record("tiki.run('Measure')")
         self.show_results()
 
     def show_results(self) -> None:
@@ -1629,6 +1746,10 @@ class Tiki(QMainWindow):
                 if tick(n + 1, len(blocks)) is False:
                     break
         self.show_results()
+        self.record(
+            f'tiki.analyze_particles(min_size={min_size!r}, max_size={max_size!r}, '
+            f'exclude_edges={exclude_edges!r}, clear={clear!r}, scope={scope!r}, three_d={three_d!r})'
+        )
         self.status(f'Analyze Particles: {total} {"3D " if by_volume else ""}objects from "{layer.name}"')
         return total
 
@@ -1712,13 +1833,30 @@ class Tiki(QMainWindow):
         self.status(f'Macro {Path(path).name} finished')
         return ok
 
-    def log(self, text: str) -> None:
+    def show_log(self):
         from .macros import LogWindow
 
         if getattr(self, 'log_window', None) is None:
             self.log_window = LogWindow()
-        self.log_window.append(text)
         self.log_window.show()
+        self.log_window.raise_()
+        return self.log_window
+
+    def log(self, text: str) -> None:
+        self.show_log().append(text)
+
+    def show_macro_recorder(self):
+        from .macros import MacroRecorderWindow
+
+        if self.recorder_window is None:
+            self.recorder_window = MacroRecorderWindow(self)
+        self.recorder_window.show()
+        self.recorder_window.raise_()
+        return self.recorder_window
+
+    def record(self, code: str) -> None:
+        if self.recorder_window is not None and not self.recorder_window.paused:
+            self.recorder_window.record(code)
 
     def show_console(self):
         from .console import PythonConsoleWindow
@@ -1763,6 +1901,21 @@ class Tiki(QMainWindow):
         from . import process
 
         return getattr(process, name)(self, **kwargs)
+
+    def _fft_noise(self, name: str, **kwargs):
+        from . import fft_noise
+
+        return getattr(fft_noise, name)(self, **kwargs)
+
+    def _coloc(self, name: str, **kwargs):
+        from . import coloc
+
+        return getattr(coloc, name)(self, **kwargs)
+
+    def _batch(self, name: str, **kwargs):
+        from . import batch
+
+        return getattr(batch, name)(self, **kwargs)
 
     def _publish(self, name: str, **kwargs):
         from . import publish
@@ -1920,8 +2073,8 @@ class Tiki(QMainWindow):
         self.windows.close_all()
         self.results.close()
         for w in (self.contrast_window, self.threshold_window, self.roi_manager, self.console_window,
-                  getattr(self, 'channels_window', None), getattr(self, 'log_window', None),
-                  getattr(self.results, '_summary_win', None)):
+                  self.recorder_window, getattr(self, 'channels_window', None),
+                  getattr(self, 'log_window', None), getattr(self.results, '_summary_win', None)):
             if w is not None:
                 w.close()
         for w in list(self.profiles):

@@ -267,6 +267,131 @@ class MacroAPI:
         self._app.results.add_row(values)
         self._app.show_results()
 
+    def open(self, path: str | Path):
+        """Open an image file and return its napari viewer."""
+        self._app.open_paths([str(path)])
+        return self.viewer()
+
+    def save_tiff(self, path: str | Path, merge_split: bool = False):
+        """Save the active image or labels layer as a calibrated TIFF."""
+        return self._app.save_layer(path, merge_split=merge_split)
+
+    def set_lut(self, name: str) -> None:
+        """Apply a named LUT (e.g. 'Fire', 'Cyan Hot', 'Grays') to the active image."""
+        self._app.set_lut(name)
+
+    def set_scale(self, step_x: float, step_y: float | None = None, unit: str = 'µm',
+                  global_scale: bool = False) -> None:
+        """Set physical pixel spacing (X/Y) on the current image or all open windows."""
+        from napari.layers import Image
+
+        from . import roi as roi_mod
+
+        sx = float(step_x)
+        sy = float(step_x if step_y is None else step_y)
+        targets = (
+            [
+                (v, ly)
+                for v in self._app.windows.viewers
+                for ly in v.layers
+                if isinstance(ly, Image) and ly.name not in roi_mod.PREVIEW_NAMES
+            ]
+            if global_scale
+            else [(self.viewer(), self.layer())]
+        )
+        for v, ly in targets:
+            info = axes_mod.get(ly)
+            for role, step in (('X', sx), ('Y', sy)):
+                idx = info.index(role)
+                if idx is not None:
+                    info.axes[idx].step = step
+                    info.axes[idx].unit = unit
+            info.source, info.confident = 'macro', True
+            axes_mod.apply(v, ly, info)
+
+    def filter(self, key: str, whole_stack: bool = True, three_d: bool = False, **params):
+        """Run a TIKI filter ('gaussian', 'mean', 'median', 'minimum', 'maximum', 'variance', 'tophat', 'unsharp', 'background')."""
+        from . import filters
+
+        viewer, image = self.viewer(), self.layer()
+        return filters.run_filter(
+            self._app, key, viewer, image, params, whole_stack=whole_stack, three_d=three_d
+        )
+
+    def z_project(self, method: str = 'max', axis: int | None = None, start: int = 0, stop: int | None = None):
+        """Run Z/T Projection along ``axis`` (defaults to first Z or T axis)."""
+        image = self.layer()
+        if axis is None:
+            axis = axes_mod.stack_axis(axes_mod.get(image), prefer='ZT')
+            if axis is None:
+                raise RuntimeError('active image has no Z or T stack axis')
+        return self._app.z_project(image, method, axis=axis, start=start, stop=stop)
+
+    def threshold(
+        self,
+        lower: float,
+        upper: float,
+        scope: str = 'plane',
+        split: bool = True,
+        connect_z: bool = False,
+        min_size: int = 0,
+    ):
+        """Threshold the current image and add a Labels layer."""
+        from napari.layers import Labels
+
+        from . import nd, ops
+        from . import roi as roi_mod
+
+        viewer, image = self.viewer(), self.layer()
+        info = axes_mod.get(image)
+        shape = tuple(image.data.shape[: image.ndim])
+        index = roi_mod.current_index(viewer, image)
+        if image.ndim == 2:
+            out = ops.segment(np.asarray(image.data), lower, upper, split=split, min_size=min_size)
+            geom = axes_mod.geometry(image)
+            meta = {}
+        else:
+            blocks = nd.blocks(info, shape, index, scope, bool(connect_z and scope != nd.PLANE))
+            out = ops.threshold_blocks(image.data, lower, upper, blocks, split=split, min_size=min_size)
+            if scope == nd.PLANE:
+                out = out[blocks[0]]
+                geom = axes_mod.geometry(image, ndim=2)
+                meta = {}
+            elif scope == nd.VOLUME:
+                out = out[blocks[0]]
+                geom = axes_mod.geometry(image, ndim=3)
+                meta = {'axes': axes_mod.fit(info, out.shape).to_dict()}
+            else:
+                geom = axes_mod.geometry(image)
+                meta = {'axes': info.to_dict()}
+        layer = Labels(out, name=f'{image.name} labels', opacity=0.6, metadata=meta, **geom)
+        viewer.add_layer(layer)
+        self._app.reapply_tool(viewer)
+        return layer
+
+    def analyze_particles(
+        self,
+        min_size: int = 0,
+        max_size: float | None = None,
+        exclude_edges: bool = False,
+        clear: bool = True,
+        scope: str = 'plane',
+        three_d: bool = True,
+    ) -> int:
+        """Run Analyze Particles on the active Labels layer."""
+        viewer = self.viewer()
+        return self._app.particles(
+            viewer,
+            self.layer(),
+            self._app.labels_layer(viewer),
+            min_size=min_size,
+            exclude_edges=exclude_edges,
+            clear=clear,
+            scope=scope,
+            three_d=three_d,
+            max_size=max_size,
+        )
+
     # -- running -------------------------------------------------------------
 
     def run(self, command: str) -> None:
@@ -712,3 +837,70 @@ class LogWindow(QMainWindow):
 
     def append(self, text: str) -> None:
         self.text.appendPlainText(text.rstrip('\n'))
+
+
+class MacroRecorderWindow(QWidget):
+    """Plugins > Macros > Record…: capture menu actions as editable Python code."""
+
+    HEADER = '# TIKI Macro Recorder — run actions in TIKI, then click "Create Macro"\n'
+
+    def __init__(self, app):
+        super().__init__(None, Qt.Window)
+        style.apply(self)
+        self.app = app
+        self.paused = False
+        self.setWindowTitle('Macro Recorder')
+        self.resize(620, 320)
+
+        self.text = QPlainTextEdit(self.HEADER)
+        font = QFont('Monospace')
+        font.setStyleHint(QFont.TypeWriter)
+        self.text.setFont(font)
+
+        self.pause_btn = QPushButton('Pause')
+        self.pause_btn.setCheckable(True)
+        self.pause_btn.toggled.connect(self._toggle_pause)
+
+        create_btn = QPushButton('Create Macro')
+        create_btn.clicked.connect(self.create_macro)
+        copy_btn = QPushButton('Copy')
+        copy_btn.clicked.connect(self.copy)
+        clear_btn = QPushButton('Clear')
+        clear_btn.clicked.connect(self.clear)
+
+        bar = QHBoxLayout()
+        bar.addWidget(self.pause_btn)
+        bar.addWidget(create_btn)
+        bar.addStretch()
+        bar.addWidget(copy_btn)
+        bar.addWidget(clear_btn)
+
+        layout = QVBoxLayout(self)
+        layout.addLayout(bar)
+        layout.addWidget(self.text, 1)
+
+    def _toggle_pause(self, paused: bool) -> None:
+        self.paused = bool(paused)
+        self.pause_btn.setText('Resume' if self.paused else 'Pause')
+
+    def record(self, code_line: str) -> None:
+        if self.paused or not code_line.strip():
+            return
+        self.text.appendPlainText(code_line.rstrip())
+
+    def code(self) -> str:
+        return self.text.toPlainText()
+
+    def create_macro(self):
+        editor = MacroEditor(self.app)
+        editor._load_text(self.code(), None)
+        self.app.keep_window(editor)
+        editor.show()
+        editor.raise_()
+        return editor
+
+    def copy(self) -> None:
+        QApplication.clipboard().setText(self.code())
+
+    def clear(self) -> None:
+        self.text.setPlainText(self.HEADER)

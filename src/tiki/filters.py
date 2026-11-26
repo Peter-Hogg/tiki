@@ -318,5 +318,10 @@ def run_filter(tiki, key: str, viewer, image, values: dict, whole_stack: bool = 
                   metadata={'axes': axes_mod.fit(info, result.shape).to_dict()})
     viewer.add_layer(layer)
     tiki.reapply_tool(viewer)
+    tiki.push_undo_layer(spec.title, viewer, layer)
+    key = next((k for k, v in FILTERS.items() if v is spec), spec.short)
+    kw_args = ', '.join(f'{k}={v!r}' for k, v in values.items() if k != '3D')
+    extra = (f', {kw_args}' if kw_args else '')
+    tiki.record(f'tiki.filter({key!r}, whole_stack={whole_stack!r}, three_d={three_d!r}{extra})')
     tiki.status(f'{spec.title}: new layer "{layer.name}" (original kept underneath)')
     return layer

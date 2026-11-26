@@ -109,6 +109,7 @@ def _add_result(tiki, viewer, source, data, name, colormap=None, limits=None, ax
     layer = Image(data, **kwargs)
     viewer.add_layer(layer)
     tiki.reapply_tool(viewer)
+    tiki.push_undo_layer(name, viewer, layer)
     return layer
 
 
@@ -540,6 +541,9 @@ def set_scale_dialog(tiki):
         ly_info.source, ly_info.confident = 'set by you', True
         axes_mod.apply(v, ly, ly_info)
         v.reset_view()
+    tiki.record(
+        f'tiki.set_scale({sx_step!r}, {sy_step!r}, unit={u_txt!r}, global_scale={global_box.isChecked()!r})'
+    )
     tiki.status(f'Scale: {1 / sx_step:.4g} pixels per {u_txt} ({sx_step:.4g} {u_txt}/pixel)')
     return sx_step
 
@@ -1346,6 +1350,7 @@ def clear_selection(tiki, outside: bool = False):
     suffix = 'cleared outside' if outside else 'cleared'
     layer = _add_result(tiki, viewer, image, out, f'{image.name} {suffix}', image.colormap,
                         tuple(map(float, image.contrast_limits)) if not image.rgb else None)
+    tiki.record(f"tiki.run({'Clear Outside' if outside else 'Clear'!r})")
     tiki.status(f'{"Clear Outside" if outside else "Clear"} → "{layer.name}"')
     return layer
 
@@ -1599,6 +1604,10 @@ def math_dialog(tiki):
         )
         viewer.add_layer(layer)
         tiki.reapply_tool(viewer)
+        tiki.push_undo_layer(f'Math ({suffix})', viewer, layer)
+    tiki.record(
+        f'tiki.add_image(tiki.ops.math_op(tiki.image(), {op_name!r}, {val!r}), f"{{tiki.layer().name}} ({suffix})")'
+    )
     tiki.status(f'Math ({suffix}) → "{layer.name}"')
     return layer
 
@@ -1715,6 +1724,7 @@ def resize_dialog(tiki):
     if not img.rgb:
         kw['colormap'] = img.colormap
     v = tiki.open_data(out, f'Resize_{img.name}', **kw)
+    tiki.record(f'tiki.show(tiki.ops.resize_image(tiki.image(), {(new_h, new_w)!r}, order={interp.currentData()!r}), f"Resize_{{tiki.layer().name}}")')
     tiki.status(f'Resized {img.name} to {new_w}×{new_h} px')
     return v
 
@@ -1824,10 +1834,165 @@ def morphology_dialog(tiki):
     )
     viewer.add_layer(new_ly)
     viewer.layers.selection.active = new_ly
+    tiki.push_undo_layer(f'Labels {op_key}', viewer, new_ly)
     roi = roi_mod.roi_layer(viewer, create=False)
     if roi is not None:
         viewer.layers.move(viewer.layers.index(roi), len(viewer.layers))
+    tiki.record(
+        f'tiki.add_labels(tiki.ops.morphology_labels(tiki.labels(), op={op_key!r}, radius={rad!r}), f"{{tiki.layer().name}} {op_key}")'
+    )
     tiki.status(f'Labels {op_key} (r={rad:g} px) → "{new_ly.name}"')
+    return new_ly
+
+
+def _apply_labels_geom(viewer, layer: Labels, fn, use_physical: bool = True, out_dtype=None):
+    info = _labels_info(viewer, layer)
+    data = np.asarray(layer.data)
+    phys_3d, unit, _ = axes_mod.physical_scale_3d(info)
+    block_ndim = 3 if (data.ndim >= 3 and info.index('Z') == data.ndim - 3) else 2
+    if use_physical and unit:
+        scale_arg = phys_3d if block_ndim == 3 else phys_3d[1:]
+    else:
+        scale_arg = (1.0,) * block_ndim
+    if data.ndim <= block_ndim:
+        out = fn(data, scale_arg)
+        if out_dtype is not None:
+            out = np.asarray(out, dtype=out_dtype)
+    else:
+        out = np.empty(data.shape, dtype=out_dtype) if out_dtype is not None else None
+        for idx in np.ndindex(data.shape[:-block_ndim]):
+            blk = fn(data[idx], scale_arg)
+            if out is None:
+                out = np.empty(data.shape, dtype=blk.dtype)
+            out[idx] = blk
+    return info, out, unit if use_physical else None
+
+
+def distance_map_command(tiki):
+    """``Process ▸ Labels ▸ Distance Map``: calibrated 2D/3D Euclidean distance map (EDM)."""
+    viewer, _ = tiki.require_image()
+    layer = tiki.labels_layer(viewer)
+    info, out, unit = _apply_labels_geom(
+        viewer,
+        layer,
+        lambda blk, sc: ops.distance_map_labels(blk, scale=sc),
+        use_physical=True,
+        out_dtype=np.float32,
+    )
+    lo, hi = 0.0, max(1.0, float(out.max()))
+    edm_ly = Image(
+        out,
+        name=f'{layer.name} distance map',
+        colormap='viridis',
+        contrast_limits=(lo, hi),
+        metadata={'axes': info.to_dict()} if out.ndim > 2 else {},
+        **axes_mod.geometry(layer),
+    )
+    viewer.add_layer(edm_ly)
+    tiki.reapply_tool(viewer)
+    tiki.push_undo_layer('Distance Map', viewer, edm_ly)
+    tiki.record("tiki.run('Distance Map')")
+    u_note = f' ({unit})' if unit else ' (px)'
+    tiki.status(f'Distance Map{u_note} → "{edm_ly.name}"')
+    return edm_ly
+
+
+def skeletonize_command(tiki):
+    """``Process ▸ Labels ▸ Skeletonize``: 2D or 3D topological skeleton preserving label IDs."""
+    viewer, _ = tiki.require_image()
+    layer = tiki.labels_layer(viewer)
+    info, out, _unit = _apply_labels_geom(
+        viewer,
+        layer,
+        lambda blk, _sc: ops.skeletonize_labels(blk),
+        use_physical=False,
+    )
+    new_ly = Labels(
+        out,
+        name=f'{layer.name} skeleton',
+        opacity=0.8,
+        metadata={'axes': info.to_dict()} if out.ndim > 2 else {},
+        **axes_mod.geometry(layer),
+    )
+    viewer.add_layer(new_ly)
+    viewer.layers.selection.active = new_ly
+    tiki.reapply_tool(viewer)
+    tiki.push_undo_layer('Skeletonize', viewer, new_ly)
+    tiki.record("tiki.run('Skeletonize')")
+    tiki.status(f'Skeletonize → "{new_ly.name}"')
+    return new_ly
+
+
+def outline_command(tiki):
+    """``Process ▸ Labels ▸ Outline``: inner 1-px object boundary preserving label IDs."""
+    viewer, _ = tiki.require_image()
+    layer = tiki.labels_layer(viewer)
+    info, out, _unit = _apply_labels_geom(
+        viewer,
+        layer,
+        lambda blk, _sc: ops.outline_labels(blk),
+        use_physical=False,
+    )
+    new_ly = Labels(
+        out,
+        name=f'{layer.name} outline',
+        opacity=0.8,
+        metadata={'axes': info.to_dict()} if out.ndim > 2 else {},
+        **axes_mod.geometry(layer),
+    )
+    viewer.add_layer(new_ly)
+    viewer.layers.selection.active = new_ly
+    tiki.reapply_tool(viewer)
+    tiki.push_undo_layer('Outline', viewer, new_ly)
+    tiki.record("tiki.run('Outline')")
+    tiki.status(f'Outline → "{new_ly.name}"')
+    return new_ly
+
+
+def voronoi_dialog(tiki):
+    """``Process ▸ Labels ▸ Voronoi…``: partition image by nearest object seed."""
+    from .layer_select import LayerCombo
+
+    viewer, _ = tiki.require_image()
+    layer = tiki.labels_layer(viewer)
+    dlg, form = _form(tiki, 'Voronoi')
+    labels_box = LayerCombo(viewer, Labels, current=layer)
+    mode_box = QComboBox()
+    mode_box.addItem('Territory labels', False)
+    mode_box.addItem('Voronoi boundaries', True)
+    phys_box = QCheckBox('Use physical voxel calibration', checked=True)
+    form.addRow('Labels:', labels_box)
+    form.addRow('Output:', mode_box)
+    form.addRow(phys_box)
+    _buttons(dlg, form)
+
+    if dlg.exec_() != QDialog.Accepted:
+        return None
+    ly = labels_box.layer()
+    if ly is None:
+        return None
+    bnd_only = bool(mode_box.currentData())
+    info, out, _unit = _apply_labels_geom(
+        viewer,
+        ly,
+        lambda blk, sc: ops.voronoi_labels(blk, scale=sc, boundaries_only=bnd_only),
+        use_physical=phys_box.isChecked(),
+    )
+    new_ly = Labels(
+        out,
+        name=f'{ly.name} voronoi' + (' boundaries' if bnd_only else ''),
+        opacity=0.6,
+        metadata={'axes': info.to_dict()} if out.ndim > 2 else {},
+        **axes_mod.geometry(ly),
+    )
+    viewer.add_layer(new_ly)
+    viewer.layers.selection.active = new_ly
+    tiki.reapply_tool(viewer)
+    tiki.push_undo_layer('Voronoi', viewer, new_ly)
+    tiki.record(
+        f'tiki.add_labels(tiki.ops.voronoi_labels(tiki.labels(), boundaries_only={bnd_only!r}), f"{{tiki.layer().name}} voronoi")'
+    )
+    tiki.status(f'Voronoi → "{new_ly.name}"')
     return new_ly
 
 
@@ -1848,6 +2013,7 @@ def _plane_filter_command(tiki, title: str, suffix: str, func):
         out = func(image.data)
     lo, hi = ops.saturated_limits(out if out.ndim == 2 else out[(0,) * (out.ndim - 2)])
     layer = _add_result(tiki, viewer, image, out, f'{image.name} {suffix}', image.colormap, (lo, hi))
+    tiki.record(f'tiki.run({title!r})')
     tiki.status(f'{title} → "{layer.name}"')
     return layer
 
@@ -2047,6 +2213,8 @@ def convolve_dialog(tiki):
         )
         viewer.add_layer(layer)
         tiki.reapply_tool(viewer)
+        tiki.push_undo_layer('Convolve', viewer, layer)
+    tiki.record(f"tiki.add_image(tiki.ops.convolve_plane(tiki.image(), tiki.ops.parse_kernel({dlg.kernel_edit.toPlainText()!r}), normalize={normalize!r}), {name!r})")
     tiki.status(f'Convolve ({kernel.shape[0]}×{kernel.shape[1]}) → "{layer.name}"')
     return layer
 
@@ -2269,6 +2437,12 @@ def find_maxima_dialog(tiki):
         layer = Labels(out, name=f'{img.name} maxima', opacity=0.8, metadata=meta, **geom)
         viewer.add_layer(layer)
         tiki.reapply_tool(viewer)
+        tiki.push_undo_layer('Find Maxima', viewer, layer)
+        tiki.record(
+            f'coords, _ = tiki.ops.find_maxima(tiki.image(), prominence={opts["prominence"]!r}, '
+            f'exclude_edges={opts["exclude_edges"]!r}, light_background={opts["light_background"]!r}, '
+            f'strict={opts["strict"]!r})'
+        )
         tiki.status(f'Find Maxima (Single Points): {total_pts} points → "{layer.name}"')
         return layer
 
@@ -2301,6 +2475,11 @@ def find_maxima_dialog(tiki):
         layer = Labels(out, name=f'{img.name} maxima segmented', opacity=0.6, metadata=meta, **geom)
         viewer.add_layer(layer)
         tiki.reapply_tool(viewer)
+        tiki.push_undo_layer('Find Maxima', viewer, layer)
+        tiki.record(
+            f'coords, _ = tiki.ops.find_maxima(tiki.image(), prominence={opts["prominence"]!r}); '
+            'tiki.add_labels(tiki.ops.segment_maxima(tiki.image(), coords), f"{tiki.layer().name} maxima segmented")'
+        )
         tiki.status(f'Find Maxima (Segmented): {total_pts} regions → "{layer.name}"')
         return layer
 
@@ -3038,6 +3217,7 @@ def edge_detection_dialog(tiki):
         )
         viewer.add_layer(layer)
         tiki.reapply_tool(viewer)
+        tiki.push_undo_layer('Edge Detection', viewer, layer)
     else:
         lo, hi = (0.0, 255.0) if method == 'canny' else ops.saturated_limits(
             out if out.ndim == 2 else out[(0,) * (out.ndim - 2)]
@@ -3056,5 +3236,9 @@ def edge_detection_dialog(tiki):
             )
             viewer.add_layer(layer)
             tiki.reapply_tool(viewer)
+            tiki.push_undo_layer('Edge Detection', viewer, layer)
+    tiki.record(
+        f'tiki.add_image(tiki.ops.detect_edges(tiki.image(), method={method!r}, sigma={opts["sigma"]!r}), f"{{tiki.layer().name}} edges")'
+    )
     tiki.status(f'Edge Detection ({method}) → "{layer.name}"')
     return layer

@@ -493,3 +493,43 @@ class BrightnessContrastWindow(QWidget):
     def closeEvent(self, event):
         self._detach()
         super().closeEvent(event)
+
+
+def sync_display_across_windows(tiki, viewer=None) -> int:
+    """Copy colormap, contrast_limits, and visibility from ``viewer`` to all other windows."""
+    viewer = viewer or tiki.windows.active
+    if viewer is None:
+        return 0
+    src_images = [ly for ly in viewer.layers if isinstance(ly, Image) and ly.name not in roi_mod.PREVIEW_NAMES]
+    if not src_images:
+        return 0
+
+    updated_windows = 0
+    for other in tiki.windows.viewers:
+        if other is viewer:
+            continue
+        dst_images = [ly for ly in other.layers if isinstance(ly, Image) and ly.name not in roi_mod.PREVIEW_NAMES]
+        if not dst_images:
+            continue
+        changed_here = False
+        for i, src_ly in enumerate(src_images):
+            ch = src_ly.metadata.get('channel')
+            dst_ly = None
+            if ch is not None:
+                dst_ly = next((ly for ly in dst_images if ly.metadata.get('channel') == ch), None)
+            if dst_ly is None and i < len(dst_images):
+                dst_ly = dst_images[i]
+            if dst_ly is None:
+                continue
+            dst_ly.colormap = src_ly.colormap
+            dst_ly.visible = bool(src_ly.visible)
+            lo, hi = map(float, src_ly.contrast_limits)
+            r0, r1 = map(float, dst_ly.contrast_limits_range)
+            dst_ly.contrast_limits_range = (min(r0, lo), max(r1, hi))
+            dst_ly.contrast_limits = (lo, hi)
+            changed_here = True
+        if changed_here:
+            updated_windows += 1
+
+    tiki.status(f'Synced display settings from "{viewer.title}" to {updated_windows} window(s)')
+    return updated_windows

@@ -14,6 +14,13 @@ and `np` for numpy; anything installed in TIKI's environment can be imported
   Folder**, default `~/.config/tiki/macros`, or set `TIKI_MACROS`). Every `.py`
   there appears in the Plugins → Macros menu; files starting with `_` are
   hidden. Output of menu-run macros goes to the Log window.
+- **Plugins → Macros → Record…** opens the Macro Recorder, capturing menu
+  operations (Open, Filters, Threshold, Z Project, Analyze Particles, Find
+  Maxima, Set Scale, etc.) as runnable Python code with **Pause / Resume** and
+  one-click **Create Macro**.
+- **Process → Batch → Run Macro…** runs a saved macro, recorded macro, or
+  inline Python script across a folder of images (optional TIFF auto-save and
+  combined `Results.csv` output).
 
 ## The `tiki` object
 
@@ -46,6 +53,11 @@ A wrong name raises an error listing the names that exist.
 | `tiki.traces(masks=None, which=None, window=None)` | (n, frames) mean traces |
 | `tiki.measure(**values)` | add a row to the Results table |
 | `tiki.run('Measure')` | run any menu command by name, like ImageJ's `run()` |
+| `tiki.open(path)`, `tiki.save_tiff(path)` | open a file; save the active image/labels as calibrated TIFF |
+| `tiki.filter(key, whole_stack=True, three_d=False, **params)` | run any registered filter (`'gaussian'`, `'variance'`, `'tophat'`, …) |
+| `tiki.z_project(method='max')`, `tiki.threshold(lo, hi)` | Z/T projection; threshold to a Labels layer |
+| `tiki.analyze_particles(...)`, `tiki.set_scale(sx, sy, unit)` | run Analyze Particles; set XY pixel calibration |
+| `tiki.set_lut(name)` | apply a LUT (`'Fire'`, `'Cyan Hot'`, …) |
 | `tiki.progress(iterable, 'label')` | progress bar with Cancel; keeps TIKI responsive |
 | `tiki.status('text')`, `tiki.ops` | status bar message; TIKI's numpy operations |
 

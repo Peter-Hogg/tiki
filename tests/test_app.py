@@ -898,7 +898,7 @@ def test_brightness_contrast_window_luts_and_channels_tool(tiki, hyperstack):
     assert ct.isVisible()
     from qtpy.QtWidgets import QPushButton
 
-    auto_buttons = ct.findChildren(QPushButton)
+    auto_buttons = [b for b in ct.findChildren(QPushButton) if b.text() == 'Auto']
     assert len(auto_buttons) == 2
     auto_buttons[0].click()
     ch1 = hv.layers[f'C1-{path.name}']
@@ -1896,5 +1896,168 @@ def test_edge_detection_dialog_methods_and_3d(tiki, accept_dialogs):
     scharr_ly = process.edge_detection_dialog(tiki)
     assert isinstance(scharr_ly, Image) and scharr_ly.data.shape == vol.shape
     assert 'scharr 3D' in scharr_ly.name and float(scharr_ly.data.max()) > 0.0
+
+
+def test_noise_fft_coloc_labels_geometry_undo_sync_and_batch_ui(tiki, tmp_path, accept_dialogs):
+    from napari.layers import Image, Labels
+    from qtpy.QtWidgets import QDoubleSpinBox, QLineEdit, QPlainTextEdit
+    from tiki import axes, batch, channels, coloc, fft_noise, process
+
+    # Verify new menu actions are registered cleanly
+    for key in (
+        'Edit>Undo',
+        'Adjust>Sync Display Across Windows',
+        'Noise>Despeckle',
+        'Noise>Remove Outliers…',
+        'Noise>Remove NaNs…',
+        'Noise>Add Noise',
+        'Noise>Add Specified Noise…',
+        'Noise>Salt and Pepper',
+        'FFT>FFT',
+        'FFT>Inverse FFT',
+        'FFT>Bandpass Filter…',
+        'Labels>Distance Map',
+        'Labels>Skeletonize',
+        'Labels>Outline',
+        'Labels>Voronoi…',
+        'Batch>Convert…',
+        'Batch>Run Macro…',
+        'Analyze>Colocalization…',
+        'Macros>Record…',
+    ):
+        assert key in tiki._actions
+
+    # 1. Noise commands + Remove Outliers preview cleanup + FFT + Inverse FFT + Bandpass
+    # Keep pixels finite in the Qt VisPy viewer (test_ops verifies NaN replacement directly)
+    plane = np.full((20, 20), 100.0, dtype=np.float32)
+    plane[10, 10] = 250.0
+    info = axes.AxesInfo([axes.Axis('Y', 20, 0.5, 'µm'), axes.Axis('X', 20, 0.5, 'µm')], 'test', True)
+    v = tiki.open_data(plane, 'noisy.tif', axes=info)
+
+    rodlg = fft_noise.RemoveOutliersDialog(tiki, v, v.layers['noisy.tif'])
+    assert 'filter preview' in v.layers and 'µm' in rodlg.phys_label.text()
+    rodlg.reject()
+    assert 'filter preview' not in v.layers
+
+    accept_dialogs['configure'] = lambda d: None
+    ro_ly = fft_noise.remove_outliers_dialog(tiki)
+    assert float(ro_ly.data[10, 10]) == pytest.approx(100.0)
+    nan_ly = fft_noise.remove_nans_dialog(tiki)
+    assert np.all(np.isfinite(nan_ly.data))
+
+    fft_noise.despeckle_command(tiki)
+    fft_noise.add_noise_command(tiki)
+    fft_noise.salt_and_pepper_command(tiki)
+
+    v.layers.selection.active = nan_ly
+    v_fft = fft_noise.fft_command(tiki)
+    assert 'FFT of' in v_fft.title and 'fft_complex' in v_fft.layers[0].metadata
+    v_inv = fft_noise.inverse_fft_command(tiki)
+    assert v_inv.layers[0].data.shape == (20, 20)
+
+    tiki.windows.activate(v)
+    v.layers.selection.active = nan_ly
+    bp_ly = fft_noise.bandpass_dialog(tiki)
+    assert 'bandpass' in bp_ly.name and 'filter preview' not in v.layers
+
+    # 2. Labels geometry: Distance Map, Skeletonize, Outline, Voronoi
+    lab = np.zeros((16, 20), dtype=np.int32)
+    lab[3:12, 2:8] = 1
+    lab[3:12, 12:18] = 2
+    v_lab = tiki.open_data(np.zeros((16, 20), np.float32), 'geom.tif', axes=info)
+    v_lab.add_labels(lab, name='seg', scale=info.scale)
+
+    edm_ly = process.distance_map_command(tiki)
+    assert 'distance map' in edm_ly.name and float(edm_ly.data.max()) > 0.0
+    v_lab.layers.selection.active = v_lab.layers['seg']
+    sk_ly = process.skeletonize_command(tiki)
+    assert set(np.unique(sk_ly.data)) == {0, 1, 2}
+    v_lab.layers.selection.active = v_lab.layers['seg']
+    ol_ly = process.outline_command(tiki)
+    assert ol_ly.data[7, 5] == 0 and ol_ly.data[3, 5] == 1
+    v_lab.layers.selection.active = v_lab.layers['seg']
+    vor_ly = process.voronoi_dialog(tiki)
+    assert set(np.unique(vor_ly.data)) == {1, 2}
+
+    # 3. Edit ▸ Undo (Crop restores original array & axes; Labels painting undo; layer undo removes added layer)
+    tiki.windows.activate(v_lab)
+    assert sk_ly in v_lab.layers and edm_ly in v_lab.layers and vor_ly in v_lab.layers
+    tiki.undo()  # undoes Voronoi added layer
+    assert vor_ly not in v_lab.layers
+
+    v_lab.layers.selection.active = v_lab.layers['geom.tif']
+    _rect(tiki.roi_layer(v_lab), 2, 10, 2, 12)
+    tiki.crop()
+    assert v_lab.layers['geom.tif'].data.shape == (8, 10)
+    tiki.undo()
+    assert v_lab.layers['geom.tif'].data.shape == (16, 20)
+
+    paint_ly = v_lab.layers['seg']
+    paint_ly._save_history(((np.array([0]), np.array([0])), np.array([0]), np.array([9])))
+    paint_ly.data[0, 0] = 9
+    v_lab.layers.selection.active = paint_ly
+    tiki.undo()
+    assert int(paint_ly.data[0, 0]) == 0
+
+    # 4. Sync Display Across Windows (via Tiki & ChannelsTool)
+    hs = np.zeros((2, 10, 10), dtype=np.float32)
+    hs[0] = np.arange(100, dtype=np.float32).reshape(10, 10)
+    hs[1] = hs[0] * 2.0
+    info_c = axes.AxesInfo([axes.Axis('C', 2), axes.Axis('Y', 10), axes.Axis('X', 10)], 'test', True)
+    va = tiki.open_data(hs, 'syncA.tif', axes=info_c)
+    tiki.split_channels()
+    vb = tiki.open_data(hs.copy(), 'syncB.tif', axes=info_c)
+    tiki.split_channels()
+
+    va.layers[0].colormap = 'fire'
+    va.layers[0].contrast_limits = (10.0, 80.0)
+    va.layers[1].visible = False
+    tiki.sync_display(va)
+    assert vb.layers[0].colormap.name == 'fire'
+    assert tuple(map(float, vb.layers[0].contrast_limits)) == pytest.approx((10.0, 80.0))
+    assert not vb.layers[1].visible
+
+    tiki.channels_tool()
+    assert 'Sync to All Windows' in [
+        w.text() for w in tiki.channels_window.findChildren(type(tiki.channels_window.grid.itemAtPosition(3, 0).widget()))
+    ]
+
+    # 5. Colocalization dialog + ColocalizationWindow + Add to Results
+    tiki.windows.activate(va)
+    tiki.results.clear()
+    accept_dialogs['configure'] = lambda dlg: None
+    cwin = coloc.colocalization_dialog(tiki)
+    assert cwin.stats['Pearson_r'] > 0.99
+    cwin.add_to_results()
+    assert len(tiki.results.rows) == 1 and tiki.results.rows[0]['Pearson_r'] > 0.99
+    cwin.close()
+
+    # 6. Batch dialogs (Convert… & Run Macro…)
+    in_b = tmp_path / 'ui_batch_in'
+    out_b = tmp_path / 'ui_batch_out'
+    in_b.mkdir()
+    import tifffile
+
+    tifffile.imwrite(in_b / 'sample.tif', np.full((8, 8), 12, dtype=np.uint8))
+
+    def cfg_bconv(dlg):
+        edits = dlg.findChildren(QLineEdit)
+        edits[0].setText(str(in_b))
+        edits[1].setText(str(out_b))
+
+    accept_dialogs['configure'] = cfg_bconv
+    n_conv, errs_b = batch.batch_convert_dialog(tiki)
+    assert n_conv == 1 and errs_b == [] and (out_b / 'sample.tif').is_file()
+
+    def cfg_bmac(dlg):
+        edits = dlg.findChildren(QLineEdit)
+        edits[0].setText(str(in_b))
+        dlg.findChild(QPlainTextEdit).setPlainText("tiki.run('Measure')")
+
+    tiki.results.clear()
+    accept_dialogs['configure'] = cfg_bmac
+    n_bm, errs_bm = batch.batch_macro_dialog(tiki)
+    assert n_bm == 1 and errs_bm == [] and len(tiki.results.rows) == 1
+
 
 
