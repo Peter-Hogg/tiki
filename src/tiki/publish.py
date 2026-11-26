@@ -1060,17 +1060,24 @@ class OrthogonalViewsWindow(QWidget):
         return np.asarray(self.image.data[tuple(sel)])
 
     def _voxel_aspects(self) -> tuple[float, float]:
-        """Return ``(xz_aspect, yz_aspect)`` from calibrated voxel sizes."""
+        """Return ``(xz_aspect, yz_aspect)`` from calibrated voxel sizes in matching units."""
         info = axes_mod.get(self.image)
-        sz = float(info.axes[self.z_axis].scale) if self.z_axis < len(info.axes) else 1.0
-        sy = float(info.axes[-2].scale) if len(info.axes) >= 2 else 1.0
-        sx = float(info.axes[-1].scale) if len(info.axes) >= 1 else 1.0
-        sz = sz if sz > 0 else 1.0
-        sy = sy if sy > 0 else 1.0
-        sx = sx if sx > 0 else 1.0
+        az = info.axes[self.z_axis] if self.z_axis < len(info.axes) else None
+        ay = info.axes[-2] if len(info.axes) >= 2 else None
+        ax = info.axes[-1] if len(info.axes) >= 1 else None
+        sy = float(ay.scale) if ay and ay.scale > 0 else 1.0
+        sx = float(ax.scale) if ax and ax.scale > 0 else 1.0
+        if az and az.step and ay and ay.step:
+            sz_y = axes_mod.convert_unit(az.step, az.unit, ay.unit)
+        else:
+            sz_y = float(az.scale) if az and az.scale > 0 else 1.0
+        if az and az.step and ax and ax.step:
+            sz_x = axes_mod.convert_unit(az.step, az.unit, ax.unit)
+        else:
+            sz_x = float(az.scale) if az and az.scale > 0 else 1.0
         # Clamp extreme ratios so thin Z-stacks stay visible and clickable
-        xz_aspect = float(np.clip(sz / sx, 0.1, 10.0))
-        yz_aspect = float(np.clip(sy / sz, 0.1, 10.0))
+        xz_aspect = float(np.clip(sz_x / sx, 0.1, 10.0))
+        yz_aspect = float(np.clip(sy / sz_y, 0.1, 10.0))
         return xz_aspect, yz_aspect
 
     def _to_display(self, plane: np.ndarray) -> np.ndarray:

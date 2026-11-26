@@ -862,4 +862,28 @@ def test_labels_geometry_and_colocalization():
     assert anti['Pearson_r'] < -0.95
 
 
+def test_crop_to_box_rgb_and_z_ratio_mixed_units():
+    from tiki import axes as axes_mod
+
+    rgb = np.arange(20 * 30 * 3, dtype=np.uint8).reshape(20, 30, 3)
+    cropped = ops.crop_to_box(rgb, (2, 8, 5, 12), rgb=True)
+    assert cropped.shape == (6, 7, 3)
+    np.testing.assert_array_equal(cropped, rgb[2:8, 5:12, :])
+
+    # Z = 500 nm and Y/X = 0.5 µm -> isotropic ratio 1.0 (not 0.001)
+    info = axes_mod.AxesInfo(
+        [axes_mod.Axis('Z', 10, 500.0, 'nm'), axes_mod.Axis('Y', 20, 0.5, 'µm'), axes_mod.Axis('X', 20, 0.5, 'µm')],
+        'test',
+        True,
+    )
+    assert axes_mod.z_ratio(info) == pytest.approx(1.0)
+
+    info2 = axes_mod.AxesInfo(
+        [axes_mod.Axis('Z', 10, 2.0, 'µm'), axes_mod.Axis('Y', 20, 500.0, 'nm'), axes_mod.Axis('X', 20, 500.0, 'nm')],
+        'test',
+        True,
+    )
+    assert axes_mod.z_ratio(info2) == pytest.approx(0.25)
+
+
 

@@ -27,21 +27,48 @@ def _safe(name: str) -> str:
     return re.sub(r'[^A-Za-z0-9_.-]+', '_', name).strip('_') or 'layer'
 
 
+def _unique_name(base: str, ext: str, used: set[str]) -> str:
+    """Return a unique filename ``f'{base}{ext}'`` (appending ``_2``, ``_3``, … on collision)."""
+    cand = f'{base}{ext}'
+    n = 2
+    while cand in used:
+        cand = f'{base}_{n}{ext}'
+        n += 1
+    used.add(cand)
+    return cand
+
+
 def _loader_line(var: str, path: str) -> str:
     low = path.lower()
+    p = repr(str(path))
     if low.endswith('.npy'):
-        return f"{var} = np.load(r'{path}', mmap_mode='r')"
+        return f"{var} = np.load({p}, mmap_mode='r')"
     if low.endswith(('.tif', '.tiff')):
-        return f"{var} = tifffile.imread(r'{path}')  # or tifffile.memmap(...) for uncompressed files"
+        return f"{var} = tifffile.imread({p})  # or tifffile.memmap(...) for uncompressed files"
     if low.endswith('.czi'):
-        return f"import czifile; {var} = czifile.imread(r'{path}')"
+        return f"import czifile; {var} = czifile.imread({p})"
     if low.endswith('.nd2'):
-        return f"import nd2; {var} = nd2.imread(r'{path}')"
+        return f"import nd2; {var} = nd2.imread({p})"
     if low.endswith('.zarr'):
-        return f"import zarr; {var} = zarr.open(r'{path}', mode='r')"
+        return f"import zarr; {var} = zarr.open({p}, mode='r')"
     if low.endswith(('.h5', '.hdf5', '.mat')):
-        return f"import h5py; {var} = h5py.File(r'{path}', 'r')"
-    return f"{var} = skimage.io.imread(r'{path}')"
+        return f"import h5py; {var} = h5py.File({p}, 'r')"
+    return f"import skimage.io; {var} = skimage.io.imread({p})"
+
+
+def _can_reload_source(image, src: str | None) -> bool:
+    """True only when ``src`` on disk still represents ``image.data`` verbatim."""
+    if not src:
+        return False
+    p = Path(src)
+    if not p.exists():
+        return False
+    if p.is_dir() and p.suffix.lower() != '.zarr':
+        return False
+    meta = getattr(image, 'metadata', {}) or {}
+    if meta.get('modified') or 'split_from' in meta or meta.get('scene') is not None:
+        return False
+    return True
 
 
 def export_session(
@@ -78,12 +105,14 @@ def export_session(
         'import numpy as np',
         'import tifffile',
         '',
-        f"session = Path(r'{folder}')",
+        f"session = Path({str(folder)!r})",
     ]
 
     # -- image ---------------------------------------------------------
     src = image.metadata.get('path')
-    if src and Path(src).exists():
+    if src:
+        manifest['source_path'] = src
+    if _can_reload_source(image, src):
         manifest['image_path'] = src
         lines.append(_loader_line('image', src))
     elif image.data.nbytes <= MAX_COPY_BYTES:
@@ -95,17 +124,18 @@ def export_session(
         lines.append('image = None  # unsaved image too large to export; save it from TIKI first')
 
     # -- other layers --------------------------------------------------
+    used_files: set[str] = {'image.npy'}
     labels_vars = []
     for layer in viewer.layers:
         if layer.name in roi_mod.PREVIEW_NAMES or layer is image:
             continue
         if isinstance(layer, Labels):
-            fname = f'labels_{_safe(layer.name)}.npy'
+            fname = _unique_name(f'labels_{_safe(layer.name)}', '.npy', used_files)
             np.save(folder / fname, np.asarray(layer.data))
             manifest['layers'][layer.name] = {'type': 'labels', 'file': fname}
             labels_vars.append((layer.name, fname))
         elif isinstance(layer, Image) and layer.data.nbytes <= MAX_COPY_BYTES:
-            fname = f'image_{_safe(layer.name)}.npy'
+            fname = _unique_name(f'image_{_safe(layer.name)}', '.npy', used_files)
             np.save(folder / fname, np.asarray(layer.data))
             manifest['layers'][layer.name] = {'type': 'image', 'file': fname}
     if labels_vars:

@@ -655,8 +655,10 @@ class Tiki(QMainWindow):
                 traceback.print_exc()
                 self.report('Open', f'Could not open {Path(path).name}:\n{exc}')
                 continue
-            for data, meta in loaded:
+            for scene_idx, (data, meta) in enumerate(loaded):
                 metadata = {'path': meta['path']}
+                if len(loaded) > 1:
+                    metadata['scene'] = scene_idx
                 for key in ('imagej_luts', 'channel_names', 'acquisition', 'raw_metadata'):
                     if meta.get(key) is not None:
                         metadata[key] = meta[key]
@@ -1317,7 +1319,8 @@ class Tiki(QMainWindow):
         if box is None:
             raise TikiError('Crop needs an area selection')
         self.push_undo_data('Crop', viewer, image)
-        image.data = np.array(ops.crop_to_box(image.data, box))
+        image.data = np.array(ops.crop_to_box(image.data, box, rgb=bool(image.rgb)))
+        image.metadata['modified'] = True
         expected_shape = image.data.shape[:-1] if image.rgb else image.data.shape
         image.metadata['axes'] = axes_mod.fit(axes_mod.get(image), expected_shape).to_dict()
         self.select_none()

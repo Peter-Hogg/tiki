@@ -120,13 +120,8 @@ FILTERS = {
 
 
 def z_ratio(image) -> float:
-    """x/y pixel size divided by z step (1 if either is unknown)."""
-    info = axes_mod.get(image)
-    z, y = info.index('Z'), info.index('Y')
-    if z is None or y is None:
-        return 1.0
-    sz, sy = info.axes[z].step, info.axes[y].step
-    return float(sy / sz) if sz and sy else 1.0
+    """x/y pixel size divided by z step in matching physical units (1 if either is unknown)."""
+    return axes_mod.z_ratio(axes_mod.get(image))
 
 
 class FilterDialog(QDialog):

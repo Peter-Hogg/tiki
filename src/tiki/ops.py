@@ -259,9 +259,14 @@ def saturated_limits(plane: np.ndarray, saturated: float = 0.35) -> tuple[float,
     return float(lo), float(hi)
 
 
-def crop_to_box(data: np.ndarray, box: tuple[int, int, int, int]) -> np.ndarray:
-    """Crop the last two axes to ``(y0, y1, x0, x1)``, clipped to the image."""
+def crop_to_box(data: np.ndarray, box: tuple[int, int, int, int], rgb: bool = False) -> np.ndarray:
+    """Crop the spatial Y/X axes to ``(y0, y1, x0, x1)``, clipped to the image."""
     y0, y1, x0, x1 = box
+    if rgb and data.ndim >= 3:
+        h, w = data.shape[-3:-1]
+        y0, y1 = max(0, y0), min(h, y1)
+        x0, x1 = max(0, x0), min(w, x1)
+        return data[..., y0:y1, x0:x1, :]
     h, w = data.shape[-2:]
     y0, y1 = max(0, y0), min(h, y1)
     x0, x1 = max(0, x0), min(w, x1)

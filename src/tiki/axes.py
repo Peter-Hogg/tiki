@@ -187,6 +187,18 @@ def spatial_unit(info: AxesInfo) -> str | None:
     return None
 
 
+def z_ratio(info: AxesInfo) -> float:
+    """XY pixel size divided by Z step in matching physical units (1.0 if either is unknown)."""
+    z, y = info.index('Z'), info.index('Y')
+    if z is None or y is None:
+        return 1.0
+    az, ay = info.axes[z], info.axes[y]
+    if not (az.step and ay.step):
+        return 1.0
+    sz_in_y = convert_unit(az.step, az.unit, ay.unit)
+    return float(ay.step / sz_in_y) if sz_in_y > 0 else 1.0
+
+
 def physical_scale_3d(info: AxesInfo) -> tuple[tuple[float, float, float], str | None, bool]:
     """Return ``((sz, sy, sx), unit, z_assumed)`` in consistent XY spatial units."""
     y_idx, x_idx, z_idx = info.index('Y'), info.index('X'), info.index('Z')

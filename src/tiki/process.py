@@ -999,13 +999,7 @@ def _labels_info(viewer, layer: Labels) -> axes_mod.AxesInfo:
 
 
 def _labels_z_ratio(viewer, layer: Labels) -> float:
-    info = _labels_info(viewer, layer)
-    z, y = info.index('Z'), info.index('Y')
-    if z is not None and y is not None:
-        sz, sy = info.axes[z].step, info.axes[y].step
-        if sz and sy:
-            return float(sy / sz)
-    return 1.0
+    return axes_mod.z_ratio(_labels_info(viewer, layer))
 
 
 class WatershedDialog(QDialog):

@@ -2060,4 +2060,61 @@ def test_noise_fft_coloc_labels_geometry_undo_sync_and_batch_ui(tiki, tmp_path, 
     assert n_bm == 1 and errs_bm == [] and len(tiki.results.rows) == 1
 
 
+def test_review_bugfixes_export_integrity_collisions_rgb_crop_and_units(tiki, tmp_path):
+    import tifffile
+
+    from tiki import axes as axes_mod
+    from tiki import export, filters
+
+    # 1. Mixed-unit 3D z_ratio (500 nm Z vs 0.5 µm XY -> 1.0, not 0.001)
+    vol = np.zeros((6, 12, 12), dtype=np.float32)
+    info = axes_mod.AxesInfo(
+        [axes_mod.Axis('Z', 6, 500.0, 'nm'), axes_mod.Axis('Y', 12, 0.5, 'µm'), axes_mod.Axis('X', 12, 0.5, 'µm')],
+        'test',
+        True,
+    )
+    v_unit = tiki.open_data(vol, 'units.tif', axes=info)
+    assert filters.z_ratio(v_unit.layers[0]) == pytest.approx(1.0)
+
+    # 2. RGB crop slices spatial Y/X, not the 3-channel color axis
+    rgb = np.arange(20 * 30 * 3, dtype=np.uint8).reshape(20, 30, 3)
+    v_rgb = tiki.open_data(rgb, 'rgb.png', rgb=True)
+    _rect(v_rgb.layers[roi.ROI_NAME], 1.5, 7.5, 4.5, 11.5)
+    tiki.crop()
+    assert v_rgb.layers[0].data.shape == (6, 7, 3)
+    np.testing.assert_array_equal(v_rgb.layers[0].data, rgb[2:8, 5:12, :])
+
+    # 3. Round-trip notebook export: split channel + crop + colliding label names + apostrophe path
+    apostrophe_dir = tmp_path / "o'brien's lab"
+    apostrophe_dir.mkdir()
+    src_tif = apostrophe_dir / "two'ch.tif"
+    raw = np.arange(2 * 12 * 16, dtype=np.uint16).reshape(2, 12, 16)
+    tifffile.imwrite(src_tif, raw, imagej=True, metadata={'axes': 'CYX'})
+
+    tiki.open_paths([str(src_tif)])
+    v_src = tiki.windows.active
+    tiki.split_channels()
+    ch1 = v_src.layers[0]
+    v_src.layers.selection.active = ch1
+    _rect(v_src.layers[roi.ROI_NAME], 1.5, 7.5, 2.5, 10.5)
+    tiki.crop()
+    expected = np.asarray(ch1.data).copy()
+    assert expected.shape == (6, 8)
+
+    # Colliding label names: 'a b' and 'a_b'
+    lbl1 = np.full((6, 8), 1, dtype=np.int32)
+    lbl2 = np.full((6, 8), 2, dtype=np.int32)
+    v_src.add_labels(lbl1, name='a b')
+    v_src.add_labels(lbl2, name='a_b')
+
+    out_dir = apostrophe_dir / "session'1"
+    folder, snippet = export.export_session(out_dir, v_src, ch1)
+    ns: dict = {}
+    exec(compile(snippet, str(folder / 'load_session.py'), 'exec'), ns)
+    assert ns['image'].shape == (6, 8)
+    np.testing.assert_array_equal(ns['image'], expected)
+    assert int(ns['labels']['a b'][0, 0]) == 1
+    assert int(ns['labels']['a_b'][0, 0]) == 2
+
+
 
