@@ -157,6 +157,14 @@ class ChannelsTool(QWidget):
         images = [] if viewer is None else [
             ly for ly in viewer.layers if isinstance(ly, Image) and ly.name not in roi_mod.PREVIEW_NAMES
         ]
+        if viewer is not None:
+            def _on_layers_changed(_event=None, v=viewer):
+                if v is self.tiki.windows.active:
+                    self.refresh(v)
+
+            for ev in (viewer.layers.events.inserted, viewer.layers.events.removed):
+                ev.connect(_on_layers_changed)
+                self._layer_connections.append((ev, _on_layers_changed))
         if not images:
             self.grid.addWidget(QLabel('No image layers in the current window'), 0, 0)
             self.adjustSize()

@@ -25,7 +25,22 @@ class LayerCombo(QComboBox):
         self.kind = kind
         self.viewer = None
         self.currentIndexChanged.connect(lambda _: self.layer_changed.emit(self.layer()))
+        self.destroyed.connect(self._on_destroyed)
         self.set_viewer(viewer, current)
+
+    def _on_destroyed(self, _obj=None) -> None:
+        v = self.viewer
+        self.viewer = None
+        if v is not None:
+            for ev in (v.layers.events.inserted, v.layers.events.removed):
+                try:
+                    ev.disconnect(self.refresh)
+                except Exception:
+                    pass
+
+    def closeEvent(self, event) -> None:
+        self._on_destroyed()
+        super().closeEvent(event)
 
     def set_viewer(self, viewer, current=None) -> None:
         if self.viewer is not None:
@@ -46,22 +61,29 @@ class LayerCombo(QComboBox):
         return [ly for ly in self.viewer.layers if isinstance(ly, self.kind) and ly.name not in PREVIEWS]
 
     def refresh(self, event=None, current=None) -> None:
-        keep = current if current is not None else self.layer()
+        try:
+            keep = current if current is not None else self.layer()
+        except RuntimeError:
+            self._on_destroyed()
+            return
         layers = self.layers()
-        self.blockSignals(True)
-        self.clear()
-        for ly in layers:
-            self.addItem(ly.name, ly)
-        if keep in layers:
-            self.setCurrentIndex(layers.index(keep))
-        elif layers:
-            default = roi_mod.target_image(self.viewer) if self.kind is Image else None
-            if self.kind is Labels and isinstance(self.viewer.layers.selection.active, Labels):
-                default = self.viewer.layers.selection.active
-            self.setCurrentIndex(layers.index(default) if default in layers else len(layers) - 1)
-        self.blockSignals(False)
-        if self.layer() is not keep:
-            self.layer_changed.emit(self.layer())
+        try:
+            self.blockSignals(True)
+            self.clear()
+            for ly in layers:
+                self.addItem(ly.name, ly)
+            if keep in layers:
+                self.setCurrentIndex(layers.index(keep))
+            elif layers:
+                default = roi_mod.target_image(self.viewer) if self.kind is Image else None
+                if self.kind is Labels and isinstance(self.viewer.layers.selection.active, Labels):
+                    default = self.viewer.layers.selection.active
+                self.setCurrentIndex(layers.index(default) if default in layers else len(layers) - 1)
+            self.blockSignals(False)
+            if self.layer() is not keep:
+                self.layer_changed.emit(self.layer())
+        except RuntimeError:
+            self._on_destroyed()
 
     def layer(self):
         return self.currentData() if self.count() else None

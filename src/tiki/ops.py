@@ -157,7 +157,11 @@ def mask_stats(
             row['Solidity'] = nan
         return row
 
-    area = values.size * px_area
+    if plane.ndim == 3:
+        n_pixels = int(np.count_nonzero(mask)) if mask is not None else int(plane.shape[0] * plane.shape[1])
+    else:
+        n_pixels = int(values.size)
+    area = n_pixels * px_area
     mean = float(values.mean())
     row = {}
     if 'Area' in wanted:
@@ -283,6 +287,10 @@ def auto_threshold(values: np.ndarray, method: str = 'Default') -> float:
     from skimage import filters
 
     values = np.asarray(values).ravel()
+    if np.issubdtype(values.dtype, np.floating):
+        values = values[np.isfinite(values)]
+    if values.size == 0:
+        raise ValueError('no finite pixel values to threshold')
     if values.size > 2_000_000:
         values = values[:: values.size // 2_000_000]
     if values.min() == values.max():
@@ -381,7 +389,11 @@ def particle_table(labels: np.ndarray, intensity: np.ndarray, scale=(1.0, 1.0)) 
 
     labels = np.asarray(labels).astype(np.int32, copy=False)
     intensity = np.asarray(intensity)
-    scale = tuple(float(s) for s in scale)[-labels.ndim:]
+    scale = tuple(float(s) for s in scale)
+    if len(scale) < labels.ndim:
+        scale = (1.0,) * (labels.ndim - len(scale)) + scale
+    else:
+        scale = scale[-labels.ndim:]
     rows = []
     if labels.ndim == 3:
         for region in regionprops(labels, intensity, spacing=scale):
@@ -453,6 +465,7 @@ def roi_traces(data, axis: int, index: tuple, masks: list[np.ndarray], chunk: in
     Reads each chunk of frames once (only the union bounding box of all masks)
     however many ROIs there are. ``progress(done, total)`` may return False to cancel.
     """
+    axis = axis % data.ndim
     n_t = data.shape[axis]
     out = np.full((len(masks), n_t), np.nan)
     if not masks:
@@ -477,6 +490,7 @@ def roi_traces(data, axis: int, index: tuple, masks: list[np.ndarray], chunk: in
 
 def label_traces(data, axis: int, index: tuple, labels: np.ndarray, chunk: int = 256, progress=None):
     """Mean of every label in a 2D label image at each frame: ``(ids, (n_ids, n_frames))``."""
+    axis = axis % data.ndim
     labels = np.asarray(labels)
     ids = np.unique(labels)
     ids = ids[ids > 0]
@@ -484,10 +498,19 @@ def label_traces(data, axis: int, index: tuple, labels: np.ndarray, chunk: int =
     out = np.full((ids.size, n_t), np.nan)
     if ids.size == 0:
         return ids, out
-    # compact ids so bincount stays small even with sparse label numbers
-    compact = np.zeros(int(labels.max()) + 1, dtype=np.int64)
-    compact[ids] = np.arange(1, ids.size + 1)
-    lab = compact[labels].ravel()
+    flat_labels = labels.ravel()
+    max_id = int(ids[-1])
+    if max_id <= 1_000_000:
+        # compact ids so bincount stays small even with sparse label numbers
+        compact = np.zeros(max_id + 1, dtype=np.int64)
+        compact[ids] = np.arange(1, ids.size + 1)
+        pos = flat_labels > 0
+        lab = np.zeros(flat_labels.size, dtype=np.int64)
+        lab[pos] = compact[flat_labels[pos]]
+    else:
+        pos = flat_labels > 0
+        lab = np.zeros(flat_labels.size, dtype=np.int64)
+        lab[pos] = np.searchsorted(ids, flat_labels[pos]) + 1
     counts = np.bincount(lab, minlength=ids.size + 1)[1:].astype(np.float64)
     for t0 in range(0, n_t, chunk):
         t1 = min(t0 + chunk, n_t)
@@ -594,11 +617,14 @@ def subtract_background(plane: np.ndarray, radius: float, light_background: bool
     from skimage.restoration import rolling_ball
     from skimage.transform import resize
 
+    if radius <= 0:
+        raise ValueError('rolling ball radius must be positive')
     plane = np.asarray(plane)
     img = plane.astype(np.float32)
     # Light background: invert, subtract, invert back, so the background
     # ends up at the image maximum (white) as in ImageJ.
-    top = float(img.max())
+    finite = img[np.isfinite(img)]
+    top = float(finite.max()) if finite.size else 0.0
     work = top - img if light_background else img
     shrink = 8 if radius > 100 else 4 if radius > 30 else 2 if radius > 10 else 1
     if shrink > 1:
@@ -746,6 +772,8 @@ def bleach_correct(data, axis: int, method: str = 'ratio', background: float = 0
         means[t] = float(np.mean(np.take(data, t, axis=axis), dtype=np.float64)) - background
     info: dict = {'means': means}
     if method == 'ratio':
+        if means[0] <= 0:
+            raise ValueError('first frame mean (after background subtraction) must be positive for ratio bleach correction')
         factors = means[0] / np.where(means > 0, means, np.nan)
     elif method == 'exponential':
         from scipy.optimize import curve_fit
@@ -771,11 +799,11 @@ def bleach_correct(data, axis: int, method: str = 'ratio', background: float = 0
                 f'change {100 * -drop:+.2g}%). Nothing was corrected. Check the mean-intensity plot; '
                 'dips or rises may be real signal or motion.')
         info['r2'] = r2
-        factors = fit[0] / fit
+        factors = fit[0] / np.where(fit > 0, fit, np.nan)
         info |= {'a': a, 'b': b, 'tau_frames': tau, 'fit': fit}
     else:
         raise ValueError(f'unknown bleach method {method!r}')
-    factors = np.nan_to_num(factors, nan=1.0)
+    factors = np.nan_to_num(factors, nan=1.0, posinf=1.0, neginf=1.0)
     out = np.empty(data.shape, dtype=np.float32)
     for t in range(n):
         idx = [slice(None)] * data.ndim
@@ -821,11 +849,12 @@ def kymograph(data, axis: int, index: tuple, verts: np.ndarray, width: int = 1,
     """
     from scipy.ndimage import map_coordinates
 
+    axis = axis % data.ndim
     samples = line_samples(verts, width)  # (w, n, 2) in y, x
     h, w_img = data.shape[-2:]
-    lo = np.clip(np.floor(samples.reshape(-1, 2).min(0)).astype(int) - 1, 0, None)
-    hi = np.minimum(np.ceil(samples.reshape(-1, 2).max(0)).astype(int) + 2, (h, w_img))
-    ys, xs = slice(lo[0], hi[0]), slice(lo[1], hi[1])
+    lo = np.clip(np.floor(samples.reshape(-1, 2).min(0)).astype(int) - 1, 0, [h - 1, w_img - 1])
+    hi = np.clip(np.ceil(samples.reshape(-1, 2).max(0)).astype(int) + 2, lo + 1, [h, w_img])
+    ys, xs = slice(int(lo[0]), int(hi[0])), slice(int(lo[1]), int(hi[1]))
     local = samples - lo
     coords = local.reshape(-1, 2).T  # (2, w*n)
     n_t = data.shape[axis]
@@ -1860,10 +1889,13 @@ def invert_image(data, rgb: bool = False, progress=None) -> np.ndarray:
     for n, idx in enumerate(combos):
         plane = np.asarray(data[idx])
         if is_uint:
-            inv = (hi_val - plane.astype(np.int64)).astype(out_dtype) if not rgb else plane.copy()
-            if rgb:
+            max_u = np.array(hi_val, dtype=out_dtype)
+            if not rgb:
+                inv = max_u - plane.astype(out_dtype, copy=False)
+            else:
+                inv = plane.copy()
                 c_end = 3 if plane.shape[-1] == 4 else plane.shape[-1]
-                inv[..., :c_end] = (hi_val - plane[..., :c_end].astype(np.int64)).astype(out_dtype)
+                inv[..., :c_end] = max_u - plane[..., :c_end].astype(out_dtype, copy=False)
         else:
             sum_hl = lo_val + hi_val
             if rgb and plane.ndim == 3 and plane.shape[-1] == 4:
@@ -2969,15 +3001,24 @@ def colocalization_stats(
     m1 = float(a_pos[b_pos > 0].sum() / sum_a) if sum_a > 0 else float('nan')
     m2 = float(b_pos[a_pos > 0].sum() / sum_b) if sum_b > 0 else float('nan')
 
+    def _ols_line(x: np.ndarray, y: np.ndarray) -> tuple[float, float]:
+        xm, ym = float(x.mean()), float(y.mean())
+        dx = x - xm
+        var_x = float(np.dot(dx, dx))
+        if var_x <= 0:
+            return 1.0, 0.0
+        sl = float(np.dot(dx, y - ym) / var_x)
+        return sl, float(ym - sl * xm)
+
     if thresh1 is not None or thresh2 is not None:
         t1 = float(thresh1) if thresh1 is not None else 0.0
         t2 = float(thresh2) if thresh2 is not None else 0.0
-        _, _, slope, intercept = _costes_thresholds(a, b)
+        slope, intercept = _ols_line(a, b)
     elif costes:
         t1, t2, slope, intercept = _costes_thresholds(a, b)
     else:
         t1, t2 = 0.0, 0.0
-        _, _, slope, intercept = _costes_thresholds(a, b)
+        slope, intercept = _ols_line(a, b)
 
     above1 = a > t1
     above2 = b > t2

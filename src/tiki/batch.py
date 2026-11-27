@@ -201,15 +201,16 @@ def batch_convert(
     errors: list[tuple[Path, str]] = []
     for n, (src, dst_dir, base_stem, planned_dst) in enumerate(plan, 1):
         try:
-            if planned_dst is None:
-                if progress is not None and progress(n, len(plan)) is False:
-                    break
-                continue
             scenes = io.read_multi(src)
             if len(scenes) == 1:
+                if planned_dst is None:
+                    if progress is not None and progress(n, len(plan)) is False:
+                        break
+                    continue
                 targets = [planned_dst]
             else:
-                used_resolved.discard(planned_dst.resolve(strict=False))
+                if planned_dst is not None:
+                    used_resolved.discard(planned_dst.resolve(strict=False))
                 targets = []
                 for idx in range(len(scenes)):
                     t = _unique_dest(

@@ -261,7 +261,12 @@ class RoiManager(QWidget):
                 lead = viewer.dims.ndim - 2
                 if len(roi.position) <= lead:
                     step = list(viewer.dims.current_step)
-                    step[lead - len(roi.position) : lead] = roi.position
+                    nsteps = viewer.dims.nsteps
+                    offset = lead - len(roi.position)
+                    for i, pos_val in enumerate(roi.position):
+                        d = offset + i
+                        hi = max(int(nsteps[d]) - 1, 0) if d < len(nsteps) else max(int(pos_val), 0)
+                        step[d] = int(np.clip(int(pos_val), 0, hi))
                     viewer.dims.current_step = tuple(step)
         self.refresh_overlay()
 

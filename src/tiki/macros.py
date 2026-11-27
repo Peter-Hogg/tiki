@@ -583,6 +583,11 @@ def run_code(app, code: str, filename: str = '<macro>', namespace: dict | None =
     except MacroCancelled as exc:
         buffer.write(f'\n{exc}\n')
         ok = False
+    except SystemExit as exc:
+        code_val = exc.code
+        ok = code_val in (None, 0)
+        if not ok:
+            buffer.write(f'SystemExit: {code_val}\n')
     except Exception as exc:  # a macro error must never take TIKI down
         ok = False
         tb = traceback.extract_tb(exc.__traceback__)
@@ -857,7 +862,7 @@ class MacroEditor(QMainWindow):
         m.addAction('Close', self.close)
         t = self.menuBar().addMenu('&Templates')
         for name, code in TEMPLATES.items():
-            t.addAction(name, lambda c=code: self._load_text(c, None))
+            t.addAction(name, lambda _checked=False, c=code: self._load_text(c, None))
         r = self.menuBar().addMenu('&Run')
         r.addAction('Run (Ctrl+R)', self.run)
         r.addAction('Run selection (Ctrl+Shift+R)', self.run_selection)
@@ -893,21 +898,22 @@ class MacroEditor(QMainWindow):
         if path:
             self._load_file(Path(path))
 
-    def save(self) -> None:
+    def save(self) -> bool:
         if self.path is None:
-            self.save_as()
-            return
+            return self.save_as()
         self.path.write_text(self.editor.toPlainText())
         self.editor.document().setModified(False)
         self._title()
         self.app.status(f'Saved macro {self.path}')
+        return True
 
-    def save_as(self) -> None:
+    def save_as(self) -> bool:
         MACROS_DIR.mkdir(parents=True, exist_ok=True)
         path, _ = QFileDialog.getSaveFileName(self, 'Save macro', str(MACROS_DIR / 'my_macro.py'), 'Python (*.py)')
         if path:
             self.path = Path(path) if path.endswith('.py') else Path(path + '.py')
-            self.save()
+            return self.save()
+        return False
 
     # -- running -----------------------------------------------------------------
 
@@ -956,7 +962,9 @@ class MacroEditor(QMainWindow):
                 event.ignore()
                 return
             if answer == QMessageBox.Save:
-                self.save()
+                if not self.save():
+                    event.ignore()
+                    return
         super().closeEvent(event)
 
 
@@ -1044,3 +1052,7 @@ class MacroRecorderWindow(QWidget):
 
     def clear(self) -> None:
         self.text.setPlainText(self.HEADER)
+
+    def closeEvent(self, event) -> None:
+        self.pause_btn.setChecked(True)
+        super().closeEvent(event)

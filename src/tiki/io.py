@@ -405,9 +405,12 @@ def read_nd2_scenes(path: str | Path) -> list[tuple[object, dict]]:
                 break
 
         def _build_entry(arr, ax_codes: str, name: str) -> tuple[object, dict]:
-            if len(ax_codes) == arr.ndim:
+            is_rgb = ax_codes.endswith('S') and arr.ndim >= 3 and arr.shape[-1] in (3, 4)
+            eff_codes = ax_codes[:-1] if is_rgb else ax_codes
+            eff_shape = arr.shape[:-1] if is_rgb else arr.shape
+            if len(eff_codes) == len(eff_shape):
                 axes_list = []
-                for c, n in zip(ax_codes, arr.shape):
+                for c, n in zip(eff_codes, eff_shape):
                     role = axes_mod.TIFF_ROLES.get(c, '?')
                     step, unit = None, None
                     if role == 'T' and t_step_s:
@@ -418,11 +421,13 @@ def read_nd2_scenes(path: str | Path) -> list[tuple[object, dict]]:
                             step, unit = float(v), 'µm'
                     axes_list.append(axes_mod.Axis(role, int(n), step, unit))
                 info = axes_mod.AxesInfo(axes_list, 'ND2 metadata', '?' not in ''.join(a.role for a in axes_list[:-2]))
-                if info.problems(arr.shape):
-                    info = axes_mod.guess(arr.shape)
+                if info.problems(eff_shape):
+                    info = axes_mod.guess(eff_shape)
             else:
-                info = _axes_without_metadata(path, arr.shape)
+                info = _axes_without_metadata(path, eff_shape)
             meta: dict = {'name': name, 'path': str(path), 'axes': info}
+            if is_rgb:
+                meta['rgb'] = True
             c_idx = info.index('C')
             if c_idx is not None:
                 n_c = arr.shape[c_idx]
@@ -711,10 +716,11 @@ def read_hdf5(path: str | Path, dataset: str | None = None) -> tuple[object, dic
     if isinstance(raw_axes, (bytes, bytearray)):
         raw_axes = raw_axes.decode('utf-8', errors='ignore')
     if isinstance(raw_axes, str) and len(raw_axes) == len(shape):
+        mapped = [axes_mod.TIFF_ROLES.get(c.upper(), '?') for c in raw_axes]
         cand = axes_mod.AxesInfo(
-            [axes_mod.Axis(axes_mod.TIFF_ROLES.get(c.upper(), '?'), int(n)) for c, n in zip(raw_axes, shape)],
+            [axes_mod.Axis(role, int(n)) for role, n in zip(mapped, shape)],
             'HDF5 metadata',
-            '?' not in raw_axes[:-2],
+            '?' not in mapped[:-2],
         )
         if not cand.problems(shape):
             info = cand
@@ -836,9 +842,9 @@ def read_tiff_scenes(path: str | Path) -> list[tuple[object, dict]]:
                 series = tf.series[idx]
                 expected = series.shape
                 try:
-                    data = tf.asarray(out='memmap') if not multi else series.asarray(out='memmap')
+                    data = tf.asarray(out='memmap') if (not multi and idx == 0) else series.asarray(out='memmap')
                 except Exception:
-                    data = tf.asarray() if not multi else series.asarray()
+                    data = tf.asarray() if (not multi and idx == 0) else series.asarray()
                 try:
                     info = axes_mod.from_tiff(tf, data.shape) if idx == 0 else axes_mod.from_tiff(
                         tf, data.shape, series_index=idx
@@ -956,10 +962,12 @@ def save_tiff(
 
     if axes is None:
         kwargs: dict = {}
-        if scale is not None:
-            kwargs['resolution'] = (1.0 / scale[-1], 1.0 / scale[-2])
-            if arr.ndim >= 3 and not want_ome:
-                kwargs['metadata'] = {'spacing': scale[-3]}
+        if scale is not None and len(scale) >= 2:
+            sy, sx = float(scale[-2]), float(scale[-1])
+            if sx > 0 and sy > 0:
+                kwargs['resolution'] = (1.0 / sx, 1.0 / sy)
+            if arr.ndim >= 3 and len(scale) >= 3 and not want_ome and float(scale[-3]) > 0:
+                kwargs['metadata'] = {'spacing': float(scale[-3])}
         if want_ome:
             tifffile.imwrite(path, arr, ome=True, **kwargs)
         else:
@@ -972,6 +980,11 @@ def save_tiff(
         save_tiff(path, arr, scale=scale)
         return
 
+    # ImageJ hyperstack mode only supports 3-sample uint8 RGB; fall back to OME-TIFF
+    # for uint16/float32 RGB or 4-sample RGBA.
+    if rgb and (arr.dtype != np.uint8 or arr.shape[-1] != 3):
+        want_ome = True
+
     def _axis(role: str):
         idx = axes.index(role)
         return axes.axes[idx] if idx is not None else None
@@ -982,7 +995,15 @@ def save_tiff(
     xy_unit = (y_ax.unit if y_ax and y_ax.unit else None) or (x_ax.unit if x_ax else None)
 
     if want_ome:
-        ome_meta: dict = {'axes': axes.roles.replace('?', 'Z') + ('S' if rgb else '')}
+        used_roles = set(axes.roles)
+        fallback_pool = [r for r in ('Z', 'T', 'C', 'Q') if r not in used_roles]
+        ome_roles = []
+        for ch in axes.roles:
+            if ch == '?':
+                ome_roles.append(fallback_pool.pop(0) if fallback_pool else 'Q')
+            else:
+                ome_roles.append(ch)
+        ome_meta: dict = {'axes': ''.join(ome_roles) + ('S' if rgb else '')}
         if sx:
             ome_meta['PhysicalSizeX'] = sx
             if xy_unit:
@@ -1026,6 +1047,8 @@ def save_tiff(
             }.get(xy_unit or '')
             if res_unit is not None:
                 res_kw['resolutionunit'] = res_unit
+        if not rgb:
+            res_kw['photometric'] = 'minisblack'
         tifffile.imwrite(path, arr, imagej=False, **res_kw)
         return
 

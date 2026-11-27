@@ -110,10 +110,12 @@ class PropertiesDialog(QDialog):
         for (role_box, step, unit), a in zip(self.rows, self.info.axes):
             role = role_box.currentData()
             has_units = role in UNITS
+            raw_u = unit.currentText().strip()
+            norm_u = axes_mod._unit(raw_u) if (has_units and step.value() and raw_u) else None
             axes.append(axes_mod.Axis(
                 role, a.size,
                 step.value() or None if has_units else None,
-                unit.currentText() or None if has_units and step.value() else None,
+                norm_u,
             ))
         return axes_mod.AxesInfo(axes, 'set by you', True)
 

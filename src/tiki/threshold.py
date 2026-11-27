@@ -298,6 +298,13 @@ class ThresholdWindow(QWidget):
         values = np.asarray(self._hist_values(), dtype=np.float64).ravel()
         values = values[np.isfinite(values)]
         if values.size == 0:
+            self.vmin, self.vmax = 0.0, 1.0
+            self.counts = np.zeros(1)
+            self.edges = np.array([0.0, 1.0])
+            self._values = np.empty(0, dtype=np.float64)
+            self.lo_val, self.hi_val = 0.0, 1.0
+            self._sync_widgets()
+            self._draw_histogram()
             return
         self.vmin, self.vmax = float(values.min()), float(values.max())
         if self.vmax == self.vmin:
@@ -326,7 +333,12 @@ class ThresholdWindow(QWidget):
     # ------------------------------------------------------------- range
 
     def _to_slider(self, value: float) -> int:
-        return int(round((value - self.vmin) / (self.vmax - self.vmin) * STEPS))
+        if self.vmax <= self.vmin:
+            return 0
+        frac = (value - self.vmin) / (self.vmax - self.vmin)
+        if not np.isfinite(frac):
+            return 0
+        return int(np.clip(round(frac * STEPS), 0, STEPS))
 
     def _from_slider(self, which: str, step: int) -> None:
         if self._updating:

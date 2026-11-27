@@ -12,8 +12,10 @@ MAX_RECENT = 10
 def load() -> list[str]:
     try:
         items = json.loads(RECENT_FILE.read_text())
+        if not isinstance(items, list):
+            return []
         return [str(p) for p in items][:MAX_RECENT]
-    except (OSError, ValueError):
+    except (OSError, ValueError, TypeError):
         return []
 
 

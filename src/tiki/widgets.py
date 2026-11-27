@@ -52,7 +52,7 @@ class ResultsTable(QWidget):
             ('Clear', self.clear),
         ):
             b = QPushButton(text)
-            b.clicked.connect(slot)
+            b.clicked.connect(lambda _checked=False, s=slot: s())
             buttons.addWidget(b)
         buttons.addStretch()
         layout = QVBoxLayout(self)
@@ -334,6 +334,7 @@ class ProfileWindow(QWidget):
                        header=header, comments='', fmt=fmt)
 
     def closeEvent(self, event):
+        self._timer.stop()
         for emitter, cb in self._connections:
             try:
                 emitter.disconnect(cb)
@@ -558,7 +559,7 @@ class TracesWindow(QWidget):
         bar.addStretch()
         for text, slot in (('Copy', self.copy), ('Save .npy…', self.save_npy), ('Save CSV…', self.save_csv)):
             b = QPushButton(text)
-            b.clicked.connect(slot)
+            b.clicked.connect(lambda _checked=False, s=slot: s())
             bar.addWidget(b)
         layout = QVBoxLayout(self)
         layout.addWidget(self.canvas)

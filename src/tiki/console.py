@@ -326,4 +326,6 @@ class PythonConsoleWindow(QWidget):
             except Exception:
                 pass
             self._connected = False
+        for key in ('viewer', 'layer', 'data'):
+            self.namespace[key] = None
         super().closeEvent(event)

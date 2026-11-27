@@ -40,7 +40,11 @@ class Roi:
 
     def default_name(self, index: int) -> str:
         """ImageJ-style ``0001-0123-0456`` (index, centre y, centre x)."""
+        if self.yx.size == 0:
+            return f'{index:04d}-0000-0000'
         cy, cx = self.yx.mean(axis=0)
+        if not (np.isfinite(cy) and np.isfinite(cx)):
+            return f'{index:04d}-0000-0000'
         return f'{index:04d}-{int(round(cy)):04d}-{int(round(cx)):04d}'
 
 
@@ -126,9 +130,10 @@ def save_imagej(path: str | Path, rois: list[Roi]) -> None:
     path = Path(path)
     if path.suffix.lower() == '.roi' and len(rois) != 1:
         path = path.with_suffix('.zip')
+    ij_rois = [to_imagej(r) for r in rois]
     if path.exists():
         path.unlink()  # roiwrite appends to existing zips
-    roiwrite(path, [to_imagej(r) for r in rois], mode='w')
+    roiwrite(path, ij_rois, mode='w')
 
 
 def load_imagej(path: str | Path) -> tuple[list[Roi], int]:

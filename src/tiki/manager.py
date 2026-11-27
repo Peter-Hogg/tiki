@@ -27,6 +27,7 @@ class WindowManager(QObject):
         super().__init__()
         self.viewers: list[napari.Viewer] = []
         self._active: napari.Viewer | None = None
+        self._viewer_conns: dict[int, list[tuple]] = {}
         self.reserved_shortcuts = [QKeySequence(s) for s in (reserved_shortcuts or [])]
 
     # -- creating windows -------------------------------------------------
@@ -130,16 +131,19 @@ class WindowManager(QObject):
         reserved = {s.toString() for s in self.reserved_shortcuts}
         # napari's app-model actions are shared and parented to the QApplication,
         # so reach them through the window's menus as well as its children.
-        actions = set(qwin.findChildren(QAction))
-        for menu in qwin.findChildren(QMenu):
-            actions.update(menu.actions())
-        for action in actions:
-            keep = [s for s in action.shortcuts() if s.toString() not in reserved]
-            if len(keep) != len(action.shortcuts()):
-                action.setShortcuts(keep)
-        for shortcut in qwin.findChildren(QShortcut):
-            if shortcut.key().toString() in reserved:
-                shortcut.setEnabled(False)
+        try:
+            actions = set(qwin.findChildren(QAction))
+            for menu in qwin.findChildren(QMenu):
+                actions.update(menu.actions())
+            for action in actions:
+                keep = [s for s in action.shortcuts() if s.toString() not in reserved]
+                if len(keep) != len(action.shortcuts()):
+                    action.setShortcuts(keep)
+            for shortcut in qwin.findChildren(QShortcut):
+                if shortcut.key().toString() in reserved:
+                    shortcut.setEnabled(False)
+        except RuntimeError:
+            return
 
     def register(self, viewer: napari.Viewer) -> None:
         if viewer in self.viewers:
@@ -152,12 +156,18 @@ class WindowManager(QObject):
         viewer.window._qt_viewer.installEventFilter(self)
         self._strip_shortcuts(viewer)
         # napari rebuilds menus lazily; strip again once the window settles.
-        QTimer.singleShot(0, lambda: self._strip_shortcuts(viewer))
-        viewer.dims.events.ndisplay.connect(lambda event, v=viewer: self.ndisplay_changed.emit(v))
-        viewer.layers.events.inserted.connect(lambda event, v=viewer: self._on_layer_added(v, event.value))
-        viewer.cursor.events.position.connect(
-            lambda event, v=viewer: self.cursor_moved.emit(v, v.cursor.position)
-        )
+        QTimer.singleShot(0, lambda v=viewer: self._strip_shortcuts(v))
+        cb_ndisplay = lambda event, v=viewer: self.ndisplay_changed.emit(v)
+        cb_inserted = lambda event, v=viewer: self._on_layer_added(v, event.value)
+        cb_cursor = lambda event, v=viewer: self.cursor_moved.emit(v, v.cursor.position)
+        viewer.dims.events.ndisplay.connect(cb_ndisplay)
+        viewer.layers.events.inserted.connect(cb_inserted)
+        viewer.cursor.events.position.connect(cb_cursor)
+        self._viewer_conns[id(viewer)] = [
+            (viewer.dims.events.ndisplay, cb_ndisplay),
+            (viewer.layers.events.inserted, cb_inserted),
+            (viewer.cursor.events.position, cb_cursor),
+        ]
         self.set_active(viewer)
         self.windows_changed.emit()
 
@@ -225,10 +235,25 @@ class WindowManager(QObject):
         if not visible:
             self.unregister(viewer)
 
+    def _cleanup_viewer(self, viewer: napari.Viewer) -> None:
+        for ev, cb in self._viewer_conns.pop(id(viewer), ()):
+            try:
+                ev.disconnect(cb)
+            except Exception:
+                pass
+        for attr in ('_qt_window', '_qt_viewer'):
+            w = getattr(getattr(viewer, 'window', None), attr, None)
+            if w is not None:
+                try:
+                    w.removeEventFilter(self)
+                except (RuntimeError, AttributeError):
+                    pass
+
     def unregister(self, viewer: napari.Viewer) -> None:
         if viewer not in self.viewers:
             return
         self.viewers.remove(viewer)
+        self._cleanup_viewer(viewer)
         if self._active is viewer:
             self.set_active(self.viewers[-1] if self.viewers else None)
         self.windows_changed.emit()
@@ -237,10 +262,23 @@ class WindowManager(QObject):
         self.unregister(viewer)
         try:
             viewer.close()
+        except RuntimeError as exc:
+            if 'deleted' in str(exc).lower():
+                return
+            qwin = getattr(viewer.window, '_qt_window', None)
+            if qwin is not None:
+                try:
+                    qwin.close()
+                except RuntimeError:
+                    pass
+            raise
         except Exception:
             qwin = getattr(viewer.window, '_qt_window', None)
             if qwin is not None:
-                qwin.close()
+                try:
+                    qwin.close()
+                except RuntimeError:
+                    pass
             raise
 
     def close_all(self) -> None:
@@ -248,6 +286,8 @@ class WindowManager(QObject):
         for v in list(getattr(napari.Viewer, '_instances', ())):
             if v not in viewers and getattr(v.window, '_qt_window', None) is not None:
                 viewers.append(v)
+        for v in viewers:
+            self._cleanup_viewer(v)
         self.viewers.clear()
         self.set_active(None)
         if viewers:

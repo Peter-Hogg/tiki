@@ -180,7 +180,7 @@ class FilterDialog(QDialog):
         info = axes_mod.get(self.image)
         # availability is stored, not read back from widget visibility (a closed
         # dialog reports every widget as hidden)
-        self.has_z = info.index('Z') is not None and self.spec.func3d is not None
+        self.has_z = info.index('Z') is not None and self.spec.func3d is not None and not self.image.rgb
         self.three_d.setVisible(self.has_z)
         n = int(np.prod(self.image.data.shape[: self.image.ndim - 2])) if self.image.ndim > 2 else 0
         self.has_stack = n > 0
@@ -232,7 +232,7 @@ class FilterDialog(QDialog):
             self._timer.start()
 
     def update_preview(self) -> None:
-        if not self.show_preview.isChecked():
+        if not self.show_preview.isChecked() or self.image is None or self.image not in self.viewer.layers:
             return
         if self.use_3d():  # filter the current volume, show the current slice of it
             info = axes_mod.get(self.image)

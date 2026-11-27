@@ -107,11 +107,14 @@ def shape_mask(vertices: np.ndarray, shape_type: str, shape2d: tuple[int, int]) 
 def shape_box(vertices: np.ndarray, shape2d: tuple[int, int]) -> tuple[int, int, int, int]:
     """Integer ``(y0, y1, x0, x1)`` bounding box of a shape, clipped to the image."""
     verts = np.asarray(vertices, dtype=float)[:, -2:]
+    if verts.size == 0:
+        return 0, 0, 0, 0
     y0, x0 = np.floor(verts.min(axis=0) + 0.5).astype(int)
     y1, x1 = np.floor(verts.max(axis=0) + 0.5).astype(int)
-    y0, x0 = max(y0, 0), max(x0, 0)
-    y1, x1 = min(y1, shape2d[0]), min(x1, shape2d[1])
-    return int(y0), int(y1), int(x0), int(x1)
+    h, w = int(shape2d[0]), int(shape2d[1])
+    y0, x0 = max(0, min(int(y0), h)), max(0, min(int(x0), w))
+    y1, x1 = max(0, min(int(y1), h)), max(0, min(int(x1), w))
+    return y0, y1, x0, x1
 
 
 def spatial_shape(image: Image) -> tuple[int, int]:

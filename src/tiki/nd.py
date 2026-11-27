@@ -55,6 +55,8 @@ def blocks(info: axes_mod.AxesInfo, shape: tuple, index: tuple, scope: str, by_v
 
 def for_layer(block: tuple, layer_ndim: int) -> tuple:
     """The same block for a layer that has only the trailing ``layer_ndim`` axes."""
+    if layer_ndim >= len(block):
+        return (slice(None),) * (layer_ndim - len(block)) + tuple(block)
     return block[len(block) - layer_ndim:]
 
 

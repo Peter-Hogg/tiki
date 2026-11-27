@@ -567,9 +567,13 @@ def from_tiff(tf, data_shape: tuple, series_index: int = 0) -> AxesInfo:
                     if i is not None:
                         axes[i].step, axes[i].unit = step, unit
         if ij.get('spacing') and info.index('Z') is not None:
-            axes[info.index('Z')].step = float(ij['spacing'])
-            axes[info.index('Z')].unit = _unit(ij.get('unit')) or 'µm'
-        rate = ij.get('fps') or (1 / float(ij['finterval']) if ij.get('finterval') else None)
+            sp = abs(float(ij['spacing']))
+            if sp > 0:
+                axes[info.index('Z')].step = sp
+                axes[info.index('Z')].unit = _unit(ij.get('unit')) or 'µm'
+        fps_val = float(ij['fps']) if ij.get('fps') else 0.0
+        fint_val = float(ij['finterval']) if ij.get('finterval') else 0.0
+        rate = (fps_val if fps_val > 0 else None) or (1.0 / fint_val if fint_val > 0 else None)
         if (info.index('T') is None and info.index('Z') is not None and rate
                 and not ij.get('spacing') and not ij.get('frames')):
             # ImageJ often saves movies as plain "slices"; a frame rate without a
@@ -577,11 +581,11 @@ def from_tiff(tf, data_shape: tuple, series_index: int = 0) -> AxesInfo:
             axes[info.index('Z')].role = 'T'
             notes.append(f'ImageJ stored the frames as slices; fps = {float(rate):g} says this is time '
                          '(change in Image ▸ Properties if not)')
-        if ij.get('fps') and not ij.get('finterval') and info.index('T') is not None:
-            axes[info.index('T')].step = 1 / float(ij['fps'])
+        if fps_val > 0 and fint_val <= 0 and info.index('T') is not None:
+            axes[info.index('T')].step = 1.0 / fps_val
             axes[info.index('T')].unit = 's'
-        if ij.get('finterval') and info.index('T') is not None:
-            axes[info.index('T')].step = float(ij['finterval'])
+        if fint_val > 0 and info.index('T') is not None:
+            axes[info.index('T')].step = fint_val
             axes[info.index('T')].unit = _unit(ij.get('tunit')) or 's'
         if tf.is_scanimage:
             fd = (tf.scanimage_metadata or {}).get('FrameData', {})
@@ -895,12 +899,19 @@ def remember(path: str | Path, shape: tuple, info: AxesInfo) -> None:
     """Store roles/steps for files of this dimensionality in this folder."""
     try:
         MEMORY_FILE.parent.mkdir(parents=True, exist_ok=True)
-        memory = json.loads(MEMORY_FILE.read_text()) if MEMORY_FILE.exists() else {}
+        if MEMORY_FILE.exists():
+            try:
+                loaded = json.loads(MEMORY_FILE.read_text())
+                memory = loaded if isinstance(loaded, dict) else {}
+            except (OSError, ValueError):
+                memory = {}
+        else:
+            memory = {}
         memory[_memory_key(Path(path), shape)] = [
             {'role': a.role, 'step': a.step, 'unit': a.unit} for a in info.axes
         ]
         MEMORY_FILE.write_text(json.dumps(memory, indent=1))
-    except OSError:
+    except (OSError, TypeError, ValueError):
         pass  # memory is a convenience; never fail an action over it
 
 
@@ -909,10 +920,15 @@ def recall(path: str | Path, shape: tuple) -> AxesInfo | None:
         memory = json.loads(MEMORY_FILE.read_text())
     except (OSError, ValueError):
         return None
-    saved = memory.get(_memory_key(Path(path), shape))
-    if not saved or len(saved) != len(shape):
+    if not isinstance(memory, dict):
         return None
-    axes = [Axis(s['role'], int(n), s.get('step'), s.get('unit')) for s, n in zip(saved, shape)]
+    saved = memory.get(_memory_key(Path(path), shape))
+    if not isinstance(saved, list) or len(saved) != len(shape):
+        return None
+    try:
+        axes = [Axis(s['role'], int(n), s.get('step'), s.get('unit')) for s, n in zip(saved, shape)]
+    except (TypeError, KeyError, ValueError):
+        return None
     info = AxesInfo(axes, 'remembered for this folder', True)
     return None if info.problems(shape) else info
 

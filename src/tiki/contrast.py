@@ -276,14 +276,21 @@ class BrightnessContrastWindow(QWidget):
             return
         label = lut_label(self.image)
         self.lut_box.blockSignals(True)
-        if self.lut_box.findText(label) < 0:
-            self.lut_box.addItem(label)
+        idx = self.lut_box.findText(label)
+        if idx < 0:
+            self.lut_box.addItem(label, self.image.colormap)
+        elif label not in LUTS:
+            self.lut_box.setItemData(idx, self.image.colormap)
         self.lut_box.setCurrentText(label)
         self.lut_box.blockSignals(False)
 
     def _on_lut_selected(self, name: str) -> None:
         if self.image is not None and name:
-            apply_lut(self.image, name)
+            cmap = self.lut_box.currentData()
+            if cmap is not None:
+                self.image.colormap = cmap
+            else:
+                apply_lut(self.image, name)
 
     def _on_layer_colormap(self, event=None) -> None:
         self._sync_lut_box()

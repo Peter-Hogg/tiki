@@ -142,7 +142,7 @@ def render_plane_rgb(viewer, step: tuple[int, ...] | None = None) -> np.ndarray:
                 hi = float(np.iinfo(plane.dtype).max)
                 rgb = rgb / (hi if hi > 0 else 255.0)
             else:
-                rgb = np.clip(rgb, 0.0, 1.0)
+                rgb = np.clip(np.nan_to_num(rgb, nan=0.0, posinf=1.0, neginf=0.0), 0.0, 1.0)
             acc += rgb * opacity
         else:
             lo, hi = ly.contrast_limits
@@ -293,7 +293,7 @@ def draw_rois_on_axes(
     if include_manager and roi_manager is not None and getattr(roi_manager, 'rois', None):
         for r in roi_manager.rois:
             _draw_shape(
-                ax, r.vertices, r.shape_type,
+                ax, r.yx, r.kind,
                 color='cyan', lw=1.2,
                 label=r.name if show_labels else None,
             )
@@ -562,28 +562,66 @@ def export_movie(
         cmd += ['-c:v', 'mpeg4', '-q:v', '3']
     cmd.append(str(out))
 
+    import threading
+
     proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
     assert proc.stdin is not None
+    stderr_chunks: list[bytes] = []
+
+    def _drain_stderr() -> None:
+        if proc.stderr is None:
+            return
+        try:
+            while True:
+                chunk = proc.stderr.read(4096)
+                if not chunk:
+                    break
+                stderr_chunks.append(chunk)
+        finally:
+            try:
+                proc.stderr.close()
+            except Exception:
+                pass
+
+    stderr_thread = threading.Thread(target=_drain_stderr, daemon=True)
+    stderr_thread.start()
+    cancelled = False
+    broken_pipe = False
     try:
-        proc.stdin.write(first.tobytes())
-        if progress is not None and progress(1, len(indices)) is False:
+        try:
+            proc.stdin.write(first.tobytes())
+        except BrokenPipeError:
+            broken_pipe = True
+        if not broken_pipe:
+            if progress is not None and progress(1, len(indices)) is False:
+                cancelled = True
+            else:
+                for n, idx in enumerate(indices[1:], 2):
+                    frame = _frame(idx)
+                    try:
+                        proc.stdin.write(frame.tobytes())
+                    except BrokenPipeError:
+                        broken_pipe = True
+                        break
+                    if progress is not None and progress(n, len(indices)) is False:
+                        cancelled = True
+                        break
+        try:
             proc.stdin.close()
-            proc.wait()
-            return out
-        for n, idx in enumerate(indices[1:], 2):
-            frame = _frame(idx)
-            proc.stdin.write(frame.tobytes())
-            if progress is not None and progress(n, len(indices)) is False:
-                break
-        proc.stdin.close()
-        stderr = proc.stderr.read().decode('utf-8', errors='replace') if proc.stderr else ''
+        except OSError:
+            pass
         rc = proc.wait()
-        if rc != 0:
+        stderr_thread.join(timeout=5.0)
+        stderr = b''.join(stderr_chunks).decode('utf-8', errors='replace')
+        if cancelled:
+            return out
+        if rc != 0 or broken_pipe:
             _error(f'ffmpeg failed (exit {rc}):\n{stderr[-400:]}')
     finally:
         if proc.poll() is None:
             proc.kill()
             proc.wait()
+        stderr_thread.join(timeout=2.0)
     return out
 
 
@@ -919,7 +957,7 @@ def make_montage_dialog(tiki) -> None:
     step_offset = _step_offset(layer, len(base_step))
     is_rgb = bool(flatten_box.isChecked() or layer.rgb)
 
-    if flatten_box.isChecked() and not layer.rgb:
+    if flatten_box.isChecked():
         frames = []
         for idx in indices:
             step = list(base_step)
@@ -1082,7 +1120,11 @@ class OrthogonalViewsWindow(QWidget):
 
     def _to_display(self, plane: np.ndarray) -> np.ndarray:
         if self.image.rgb:
-            return plane[..., :3]
+            rgb = plane[..., :3]
+            if np.issubdtype(rgb.dtype, np.integer):
+                hi = float(np.iinfo(rgb.dtype).max)
+                return np.clip(np.round(rgb.astype(np.float32) / (hi if hi > 0 else 255.0) * 255.0), 0, 255).astype(np.uint8)
+            return np.clip(np.nan_to_num(rgb.astype(np.float32), nan=0.0, posinf=1.0, neginf=0.0), 0.0, 1.0)
         lo, hi = self.image.contrast_limits
         return ops.composite_rgb([(plane, self.image.colormap, (float(lo), float(hi)))])
 

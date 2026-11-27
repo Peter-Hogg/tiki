@@ -173,6 +173,8 @@ def dff_dialog(tiki) -> Image | None:
     image = image_box.layer()
     if image is None or axis_box.currentData() is None:
         _error('choose an image with a stack axis')
+    if image.rgb:
+        _error('ΔF/F on RGB images is not supported; split or convert to greyscale first')
     if not _confirm_size(tiki, image.data.shape, 'ΔF/F'):
         return None
     m = method.currentText()
@@ -186,6 +188,8 @@ def dff_dialog(tiki) -> Image | None:
     dff, f0 = result if add_f0.isChecked() else (result, None)
     finite = dff[np.isfinite(dff)]
     span = float(np.percentile(np.abs(finite), 99.5)) if finite.size else 1.0
+    if not np.isfinite(span) or span <= 0:
+        span = 1.0
     if f0 is not None and f0.shape == image.data.shape:
         _add_result(tiki, viewer, image, f0, f'{image.name} F0')
     elif f0 is not None:
@@ -261,9 +265,13 @@ def bleach_dialog(tiki) -> Image | None:
     if dlg.exec_() != QDialog.Accepted:
         return None
     image = image_box.layer()
+    axis = axis_box.currentData()
+    if image is None or axis is None:
+        _error('choose an image with a stack axis')
+    if image.rgb:
+        _error('bleach correction on RGB images is not supported; split or convert first')
     if not _confirm_size(tiki, image.data.shape, 'Bleach Correction'):
         return None
-    axis = axis_box.currentData()
     ax_info = axes_mod.get(image)
     ax_meta = ax_info.axes[axis]
     with tiki.progress('Bleach Correction', image.data.shape[axis]) as tick:
@@ -334,6 +342,8 @@ def kymograph_dialog(tiki):
         return None
     image = image_box.layer()
     axis = axis_box.currentData()
+    if image is None or axis is None:
+        _error('choose an image with a stack axis')
     info = axes_mod.get(image)
     index = roi_mod.current_index(viewer, image)
     data = image.data
@@ -1198,8 +1208,11 @@ def watershed_dialog(tiki):
             return None
         geometry = axes_mod.geometry(layer)
 
+    out_info = info if out.ndim == layer.ndim else axes_mod.fit(
+        axes_mod.AxesInfo(info.axes[-out.ndim :], info.source, info.confident), out.shape
+    )
     new_layer = Labels(out, name=f'{layer.name} watershed', opacity=0.6,
-                       metadata={'axes': info.to_dict()} if layer.ndim > 2 else {}, **geometry)
+                       metadata={'axes': out_info.to_dict()} if out.ndim > 2 else {}, **geometry)
     viewer.add_layer(new_layer)
     viewer.layers.selection.active = new_layer
     roi = roi_mod.roi_layer(viewer, create=False)
@@ -1764,6 +1777,19 @@ def run_morphology_labels(
     if eff_scope == nd.PLANE or ly.ndim == 2:
         out = ops.morphology_labels(tiki.labels_plane(viewer, ly), op=op_key, radius=rad)
         geom = axes_mod.geometry(ly, ndim=2)
+    elif eff_scope == nd.VOLUME:
+        (block,) = nd.blocks(info, shape, index, nd.VOLUME, False)
+        vol = np.asarray(ly.data[block])
+        if by_volume:
+            out = ops.morphology_labels(vol, op=op_key, radius=rad, z_ratio=zr)
+        else:
+            out = np.zeros(vol.shape, dtype=np.int32)
+            with tiki.progress(f'Morphology ({op_key})', vol.shape[0]) as tick:
+                for k in range(vol.shape[0]):
+                    out[k] = ops.morphology_labels(vol[k], op=op_key, radius=rad, z_ratio=1.0)
+                    if tick(k + 1, vol.shape[0]) is False:
+                        return None
+        geom = axes_mod.geometry(ly, ndim=3)
     else:
         blocks = nd.blocks(info, shape, index, eff_scope, by_volume)
         out_arr = np.zeros(shape, dtype=np.int32)
@@ -1773,12 +1799,8 @@ def run_morphology_labels(
                 out_arr[b] = ops.morphology_labels(blk, op=op_key, radius=rad, z_ratio=zr if blk.ndim == 3 else 1.0)
                 if tick(n, len(blocks)) is False:
                     return None
-        if eff_scope == nd.VOLUME:
-            out = out_arr[blocks[0]]
-            geom = axes_mod.geometry(ly, ndim=3)
-        else:
-            out = out_arr
-            geom = axes_mod.geometry(ly)
+        out = out_arr
+        geom = axes_mod.geometry(ly)
 
     out_info = info if out.ndim == ly.ndim else axes_mod.fit(
         axes_mod.AxesInfo(info.axes[-out.ndim :], info.source, info.confident), out.shape
@@ -2743,14 +2765,21 @@ def concatenate_dialog(tiki):
     ax_choice = axis_box.currentData()
     try:
         if first_ly.ndim == 2:
-            out = ops.concatenate_stacks(arrays, axis=0)
+            if first_ly.rgb:
+                arrs = [np.asarray(a) for a in arrays]
+                if len({a.shape for a in arrs}) != 1:
+                    raise ValueError('all images must have the same shape to stack')
+                out = np.stack(arrs, axis=0)
+            else:
+                out = ops.concatenate_stacks(arrays, axis=0)
             src_info = axes_mod.get(first_ly)
             new_axes = [axes_mod.Axis(ax_choice if isinstance(ax_choice, str) else 'T', out.shape[0])] + list(src_info.axes)
             new_info = axes_mod.AxesInfo(new_axes, 'concatenated', True)
         else:
             ax = int(ax_choice)
             out = ops.concatenate_stacks(arrays, axis=ax)
-            new_info = axes_mod.fit(axes_mod.get(first_ly), out.shape)
+            spatial_shape = out.shape[:-1] if first_ly.rgb else out.shape
+            new_info = axes_mod.fit(axes_mod.get(first_ly), spatial_shape)
     except ValueError as exc:
         _error(str(exc))
 
@@ -3035,7 +3064,10 @@ def merge_channels_dialog(tiki):
     if not chosen:
         return None
     layers_sel = [ly for ly, _ in chosen]
-    merged = ops.images_to_stack([ly.data for ly in layers_sel])
+    if len(layers_sel) == 1:
+        merged = np.asarray(layers_sel[0].data)[np.newaxis, ...]
+    else:
+        merged = ops.images_to_stack([ly.data for ly in layers_sel])
     first = layers_sel[0]
     first_info = axes_mod.get(first)
     c_axes = [axes_mod.Axis('C', len(layers_sel))] + [

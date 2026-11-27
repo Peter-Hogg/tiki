@@ -69,7 +69,10 @@ def _handle_message(tiki, raw: bytes) -> None:
         msg = json.loads(raw.decode('utf-8').strip())
     except Exception:
         return
-    files = msg.get('files') or []
+    if not isinstance(msg, dict):
+        return
+    raw_files = msg.get('files')
+    files = [str(f) for f in raw_files] if isinstance(raw_files, list) else []
     sample = bool(msg.get('sample'))
     if files:
         tiki.open_dropped(files)

@@ -24,10 +24,13 @@ def _check_mark_svg() -> str:
 
     path = Path(tempfile.gettempdir()) / 'tiki_check.svg'
     if not path.exists():
-        path.write_text(
-            '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 13 13">'
-            '<path d="M2.5 6.8 5.3 9.5 10.5 3.5" fill="none" stroke="white" stroke-width="2"/></svg>'
-        )
+        try:
+            path.write_text(
+                '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 13 13">'
+                '<path d="M2.5 6.8 5.3 9.5 10.5 3.5" fill="none" stroke="white" stroke-width="2"/></svg>'
+            )
+        except OSError:
+            return ''
     return path.as_posix()
 
 
@@ -155,7 +158,8 @@ QTableCornerButton::section {{
 
 def light_palette() -> QPalette:
     """Fusion's light palette, so checkboxes, arrows and scrollbars match."""
-    pal = QStyleFactory.create('Fusion').standardPalette()
+    fusion = QStyleFactory.create('Fusion')
+    pal = fusion.standardPalette() if fusion is not None else QPalette()
     for role, color in (
         (QPalette.Window, WINDOW),
         (QPalette.WindowText, TEXT),

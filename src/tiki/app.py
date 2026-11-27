@@ -108,6 +108,7 @@ class Tiki(QMainWindow):
             reserved_shortcuts=[a.shortcut().toString() for a in self._actions.values() if not a.shortcut().isEmpty()]
         )
         self.windows.active_changed.connect(self._on_active_changed)
+        self.windows.windows_changed.connect(self._prune_undo_stack)
         self.windows.cursor_moved.connect(self._on_cursor)
         self.windows.ndisplay_changed.connect(self._on_ndisplay)
         self.windows.files_dropped.connect(self.open_dropped)
@@ -460,7 +461,11 @@ class Tiki(QMainWindow):
         if image is None:
             return
         ndim = image.ndim
+        if ndim < 2:
+            return
         coords = image.world_to_data(position[-ndim:])
+        if not np.all(np.isfinite(coords)):
+            return
         shape = image.data.shape[:ndim]
         idx = tuple(int(np.floor(c + 0.5)) for c in coords)
         info = axes_mod.get(image)
@@ -1060,6 +1065,12 @@ class Tiki(QMainWindow):
         while total_bytes > self.UNDO_MAX_BYTES and self._undo_stack:
             total_bytes -= self._undo_stack.pop(0).get('bytes', 0)
 
+    def _prune_undo_stack(self) -> None:
+        open_viewers = set(self.windows.viewers)
+        if not self._undo_stack:
+            return
+        self._undo_stack = [e for e in self._undo_stack if e['viewer'] in open_viewers]
+
     def undo(self) -> None:
         """Undo the last Labels paint stroke, destructive crop, or added layer."""
         viewer = self.windows.active
@@ -1391,6 +1402,9 @@ class Tiki(QMainWindow):
         box = self._roi_box(viewer, image)
         if box is None:
             raise TikiError('Crop needs an area selection')
+        y0, y1, x0, x1 = box
+        if y1 <= y0 or x1 <= x0:
+            raise TikiError('Selection is outside the image')
         self.push_undo_data('Crop', viewer, image)
         image.data = np.array(ops.crop_to_box(image.data, box, rgb=bool(image.rgb)))
         image.metadata['modified'] = True
@@ -1465,14 +1479,20 @@ class Tiki(QMainWindow):
 
     def z_project(self, image: Image, method: str, axis: int = 0, start: int = 0, stop: int | None = None):
         t0 = time.perf_counter()
+        n = image.data.shape[axis]
+        s0 = max(0, int(start))
+        s1 = n if stop is None else min(n, int(stop))
+        if s1 <= s0:
+            raise TikiError('Z Project start slice must be less than or equal to stop slice')
         sl = [slice(None)] * image.data.ndim
-        sl[axis] = slice(start, stop)
+        sl[axis] = slice(s0, s1)
         data = image.data[tuple(sl)]
         result = ops.z_project(data, method, axis)
         prefix = {'max': 'MAX', 'mean': 'AVG', 'sum': 'SUM', 'std': 'STD', 'median': 'MED', 'min': 'MIN'}[method]
-        info = axes_mod.fit(axes_mod.get(image), data.shape).without(axis)
-        viewer = self.open_data(result, f'{prefix}_{image.name}', axes=info)
-        self.record(f'tiki.z_project({method!r}, axis={axis!r}, start={start!r}, stop={stop!r})')
+        fit_shape = data.shape[:-1] if image.rgb else data.shape
+        info = axes_mod.fit(axes_mod.get(image), fit_shape).without(axis)
+        viewer = self.open_data(result, f'{prefix}_{image.name}', axes=info, rgb=bool(image.rgb))
+        self.record(f'tiki.z_project({method!r}, axis={axis!r}, start={s0!r}, stop={s1!r})')
         self.status(f'Z Project ({method}) in {time.perf_counter() - t0:.2f} s')
         return viewer
 
@@ -1792,13 +1812,17 @@ class Tiki(QMainWindow):
                     lab = ops.label_objects(lab > 0)
                 if exclude_edges:
                     lab = clear_border(lab)
-                if min_size > 1 or (max_size is not None and max_size > 0):
+                if lab.min() < 0:
+                    lab = np.where(lab > 0, lab, 0)
+                want_min = min_size > 1 or (0 < min_size <= 1 and phys_unit)
+                want_max = max_size is not None and max_size > 0
+                if want_min or want_max:
                     sizes = np.bincount(lab.ravel())
                     keep = np.ones_like(sizes, dtype=bool)
                     keep[0] = False
-                    if min_size > 1 or (0 < min_size <= 1 and phys_unit):
+                    if want_min:
                         keep &= sizes >= min_size
-                    if max_size is not None and max_size > 0:
+                    if want_max:
                         keep &= sizes <= max_size
                     lab = np.where(keep[lab], lab, 0)
                 block_scale = [image.scale[d] for d, b in enumerate(block) if not isinstance(b, int)]
@@ -2143,6 +2167,10 @@ class Tiki(QMainWindow):
             self.status('Nothing to open')
 
     def closeEvent(self, event):
+        for w in list(self.profiles):
+            if not w.close():
+                event.ignore()
+                return
         srv = getattr(self, '_instance_server', None)
         if srv is not None:
             srv.close()
@@ -2153,8 +2181,6 @@ class Tiki(QMainWindow):
                   getattr(self, 'log_window', None), getattr(self.results, '_summary_win', None)):
             if w is not None:
                 w.close()
-        for w in list(self.profiles):
-            w.close()
         event.accept()
         QApplication.instance().quit()
 
