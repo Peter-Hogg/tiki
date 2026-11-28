@@ -490,7 +490,8 @@ class ThresholdWindow(QWidget):
             suffix = ''
         self._remove_preview()
         kind = ('3D labels' if three_d else 'labels') if split else 'mask'
-        layer = Labels(out, name=f'{image.name} {kind}{suffix}', opacity=0.6, **geometry)
+        meta = {'axes': axes_mod.fit(info, out.shape).to_dict()} if out.ndim > 2 else {}
+        layer = Labels(out, name=f'{image.name} {kind}{suffix}', opacity=0.6, metadata=meta, **geometry)
         if not split:
             layer.colormap = self._colormap()
         viewer.add_layer(layer)

@@ -121,8 +121,15 @@ class RoiManager(QWidget):
         viewer = self.tiki.windows.active
         if viewer is None:
             self._error('no image open')
+        if self.tiki.tool == 'point':
+            pts = roi_mod.points_layer(viewer, create=False)
+            if pts is not None and len(pts.data):
+                return R.Roi('', 'point', np.asarray(pts.data, dtype=float)[:, -2:].copy())
         current = roi_mod.current_shape(roi_mod.roi_layer(viewer, create=False))
         if current is None:
+            pts = roi_mod.points_layer(viewer, create=False)
+            if pts is not None and len(pts.data):
+                return R.Roi('', 'point', np.asarray(pts.data, dtype=float)[:, -2:].copy())
             self._error('draw a selection first')
         verts, kind = current
         return R.Roi('', kind, np.asarray(verts)[:, -2:].copy())
@@ -138,8 +145,11 @@ class RoiManager(QWidget):
         rows = sorted(i.row() for i in self.list.selectedIndexes())
         if len(rows) != 1:
             self._error('select exactly one entry to update')
+        old = self.rois[rows[0]]
         new = self._current_roi()
-        new.name = self.rois[rows[0]].name
+        new.name = old.name
+        new.position = old.position
+        new.meta = dict(old.meta)
         self.rois[rows[0]] = new
         self._refresh_list(select=rows)
 
@@ -241,8 +251,8 @@ class RoiManager(QWidget):
             path, _ = QFileDialog.getSaveFileName(self, 'Save ROIs', default, 'ImageJ ROIs (*.zip *.roi)')
             if not path:
                 return
-        R.save_imagej(path, [self.rois[i] for i in rows])
-        self.tiki.status(f'Saved {len(rows)} ROIs to {path}')
+        saved = R.save_imagej(path, [self.rois[i] for i in rows])
+        self.tiki.status(f'Saved {len(rows)} ROIs to {saved}')
 
     # ------------------------------------------------------- selection
 
@@ -254,7 +264,10 @@ class RoiManager(QWidget):
         img = roi_mod.target_image(viewer) if viewer is not None else None
         if len(rows) == 1 and viewer is not None and img is not None:
             roi = self.rois[rows[0]]
-            if roi.kind != 'point':
+            if roi.kind == 'point':
+                pts = roi_mod.points_layer(viewer)
+                pts.data = np.asarray(roi.yx, dtype=float)[:, -2:].copy()
+            else:
                 layer = self.tiki.roi_layer(viewer)
                 layer.data = []
                 layer.add(roi.yx, shape_type=roi.kind)

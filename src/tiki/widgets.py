@@ -77,18 +77,35 @@ class ResultsTable(QWidget):
             self.table.setHorizontalHeaderLabels(self._header_labels())
 
     def add_row(self, row: dict) -> None:
-        for key in row:
-            if key not in self.columns:
-                self.columns.append(key)
+        self.add_rows([row])
+
+    def add_rows(self, rows: list[dict]) -> None:
+        if not rows:
+            return
+        new_cols = False
+        for row in rows:
+            for key in row:
+                if key not in self.columns:
+                    self.columns.append(key)
+                    new_cols = True
+        self.table.setUpdatesEnabled(False)
+        try:
+            if new_cols:
+                prev_col_count = self.table.columnCount()
                 self.table.setColumnCount(len(self.columns))
                 self.table.setHorizontalHeaderLabels(self._header_labels())
                 for r, old in enumerate(self.rows):
-                    self._set_cell(r, len(self.columns) - 1, old.get(key, ''))
-        self.rows.append(row)
-        r = self.table.rowCount()
-        self.table.insertRow(r)
-        for c, key in enumerate(self.columns):
-            self._set_cell(r, c, row.get(key, ''))
+                    for c in range(prev_col_count, len(self.columns)):
+                        self._set_cell(r, c, old.get(self.columns[c], ''))
+            start_r = self.table.rowCount()
+            self.table.setRowCount(start_r + len(rows))
+            for offset, row in enumerate(rows):
+                self.rows.append(row)
+                r = start_r + offset
+                for c, key in enumerate(self.columns):
+                    self._set_cell(r, c, row.get(key, ''))
+        finally:
+            self.table.setUpdatesEnabled(True)
         self.table.scrollToBottom()
 
     def _set_cell(self, r: int, c: int, value) -> None:
@@ -228,6 +245,7 @@ class ProfileWindow(QWidget):
         self.axis = axis
         self.roi = roi_mod.roi_layer(viewer, create=True)
         self._signature = None
+        self._last_other_idx = None
         self.profile = np.array([])
         self.x = np.array([])
         ax_info = axes_mod.get(image).axes[axis]
@@ -287,18 +305,17 @@ class ProfileWindow(QWidget):
     def update_profile(self, force: bool = False) -> None:
         if self.image not in self.viewer.layers:
             return
-        sig = self._roi_signature()
+        index = roi_mod.current_index(self.viewer, self.image)
+        other_idx = tuple(index[d] for d in range(len(index) - 2) if d != self.axis)
+        sig = (self._roi_signature(), other_idx)
         if not force and sig == self._signature:
             return
         self._signature = sig
+        self._last_other_idx = other_idx
         shape2d = roi_mod.spatial_shape(self.image)
         current = roi_mod.current_shape(self.roi)
         mask = None if current is None else roi_mod.shape_mask(*current, shape2d)
-        index = roi_mod.current_index(self.viewer, self.image)
-        data = self.image.data
-        if self.image.rgb:
-            data = np.asarray(data)[..., :3].mean(axis=-1)
-        self.profile = ops.axis_profile(data, self.axis, index, mask)
+        self.profile = ops.axis_profile(self.image.data, self.axis, index, mask)
         ax_info = axes_mod.get(self.image).axes[self.axis]
         self.step = float(ax_info.step) if (ax_info.step and ax_info.step > 0) else 1.0
         self.unit = ax_info.unit if (ax_info.step and ax_info.unit) else None
@@ -315,6 +332,9 @@ class ProfileWindow(QWidget):
         if self.image not in self.viewer.layers:
             return
         index = roi_mod.current_index(self.viewer, self.image)
+        other_idx = tuple(index[d] for d in range(len(index) - 2) if d != self.axis)
+        if self._last_other_idx is not None and other_idx != self._last_other_idx:
+            self.schedule()
         self.cursor_line.set_xdata([index[self.axis] * self.step] * 2)
         self.canvas.draw_idle()
 

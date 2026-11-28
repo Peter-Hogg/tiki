@@ -197,8 +197,19 @@ def draw_scale_bar(
     show_label: bool = True,
 ) -> None:
     """Draw a calibrated scale bar onto a matplotlib ``Axes``."""
-    bar_px = max(float(length) / max(float(pixel_size), 1e-12), 1.0)
-    bar_px = min(bar_px, width_px * 0.9)
+    px_size = max(float(pixel_size), 1e-12)
+    max_px = max(width_px * 0.9, 1.0)
+    raw_px = float(length) / px_size
+    if raw_px > max_px:
+        # Keep the drawn bar and its text label physically consistent when the
+        # requested length exceeds 90% of the field of view.
+        eff_len = auto_scale_bar_length(width_px, px_size)
+        if eff_len / px_size > max_px:
+            eff_len = max_px * px_size
+        length = eff_len
+        bar_px = max(length / px_size, 1.0)
+    else:
+        bar_px = max(raw_px, 1.0)
     pad_x = max(width_px * 0.04, 6.0)
     pad_y = max(height_px * 0.05, 8.0)
     bar_h = max(float(thickness), 1.0)
@@ -257,10 +268,18 @@ def draw_timestamp(
 
 def _draw_shape(ax, verts: np.ndarray, shape_type: str, color: str, lw: float = 1.5, label: str | None = None):
     pts = np.asarray(verts, dtype=float)[:, -2:]
+    if pts.size == 0:
+        return
     if shape_type == 'ellipse':
         pts = roi_mod._ellipse_polygon(pts)
     xy = pts[:, ::-1]  # (y, x) -> (x, y)
-    if shape_type in ('line', 'path'):
+    if shape_type == 'point':
+        ax.plot(
+            xy[:, 0], xy[:, 1],
+            marker='+', linestyle='none', color=color,
+            markersize=max(6.0, lw * 4.0), markeredgewidth=lw, zorder=8,
+        )
+    elif shape_type in ('line', 'path'):
         ax.plot(xy[:, 0], xy[:, 1], color=color, linewidth=lw, zorder=8)
     else:
         poly = Polygon(xy, closed=True, fill=False, edgecolor=color, linewidth=lw, zorder=8)
@@ -518,7 +537,7 @@ def export_movie(
         for n, idx in enumerate(indices, 1):
             pil_frames.append(PILImage.fromarray(_frame(idx), mode='RGB'))
             if progress is not None and progress(n, len(indices)) is False:
-                return out
+                return None
         duration_ms = max(int(round(1000.0 / fps)), 10)
         pil_frames[0].save(
             str(out),
@@ -614,7 +633,11 @@ def export_movie(
         stderr_thread.join(timeout=5.0)
         stderr = b''.join(stderr_chunks).decode('utf-8', errors='replace')
         if cancelled:
-            return out
+            try:
+                out.unlink(missing_ok=True)
+            except OSError:
+                pass
+            return None
         if rc != 0 or broken_pipe:
             _error(f'ffmpeg failed (exit {rc}):\n{stderr[-400:]}')
     finally:
@@ -626,6 +649,11 @@ def export_movie(
 
 
 # --------------------------------------------------------------- dialogs
+
+def _viewer_scale_bar(viewer):
+    overlays = getattr(getattr(viewer, 'canvas', None), 'overlays', None)
+    return getattr(overlays, 'scale_bar', None) or viewer.scale_bar
+
 
 def snapshot_dialog(tiki, *, focus_scale_bar: bool = False) -> None:
     """``File ▸ Export ▸ Snapshot (PNG / SVG)…`` & ``Analyze ▸ Tools ▸ Scale Bar…``."""
@@ -644,7 +672,7 @@ def snapshot_dialog(tiki, *, focus_scale_bar: bool = False) -> None:
     fmt_box.currentIndexChanged.connect(lambda _: dpi_spin.setEnabled(fmt_box.currentData() == '.png'))
 
     live_bar = QCheckBox('Show live napari canvas scale bar')
-    live_bar.setChecked(bool(viewer.scale_bar.visible))
+    live_bar.setChecked(bool(_viewer_scale_bar(viewer).visible))
 
     burn_bar = QCheckBox('Burn in scale bar')
     burn_bar.setChecked(True)
@@ -699,7 +727,7 @@ def snapshot_dialog(tiki, *, focus_scale_bar: bool = False) -> None:
         return
 
     if focus_scale_bar:
-        viewer.scale_bar.visible = live_bar.isChecked()
+        _viewer_scale_bar(viewer).visible = live_bar.isChecked()
 
     ext = fmt_box.currentData()
     filt = 'PNG (*.png);;SVG (*.svg)' if ext == '.png' else 'SVG (*.svg);;PNG (*.png)'
@@ -845,7 +873,7 @@ def export_movie_dialog(tiki) -> None:
         out_path = out_path.with_suffix(ext)
 
     with tiki.progress('Export Movie', len(indices)) as tick:
-        export_movie(
+        saved = export_movie(
             viewer,
             out_path,
             axis=ax_idx,
@@ -861,6 +889,9 @@ def export_movie_dialog(tiki) -> None:
             roi_manager=tiki.roi_manager,
             progress=tick,
         )
+    if saved is None:
+        tiki.status('Movie export cancelled')
+        return
     tiki.status(f'Exported movie: {out_path.name} ({len(indices)} frames @ {fps_spin.value():g} fps)')
 
 
@@ -1095,7 +1126,7 @@ class OrthogonalViewsWindow(QWidget):
             else:
                 s = int(step[offset + d]) if 0 <= offset + d < len(step) else 0
                 sel.append(int(np.clip(s, 0, self.image.data.shape[d] - 1)))
-        return np.asarray(self.image.data[tuple(sel)])
+        return self.image.data[tuple(sel)]
 
     def _voxel_aspects(self) -> tuple[float, float]:
         """Return ``(xz_aspect, yz_aspect)`` from calibrated voxel sizes in matching units."""

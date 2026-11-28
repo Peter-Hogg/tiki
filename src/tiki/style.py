@@ -18,11 +18,13 @@ BORDER = '#b9b9b9'
 
 
 def _check_mark_svg() -> str:
-    """Write a white tick SVG once so checked boxes show a mark, not just colour."""
+    """Write a white tick SVG once per user so checked boxes show a mark, not just colour."""
+    import os
     import tempfile
     from pathlib import Path
 
-    path = Path(tempfile.gettempdir()) / 'tiki_check.svg'
+    uid = os.getuid() if hasattr(os, 'getuid') else os.environ.get('USERNAME', 'user')
+    path = Path(tempfile.gettempdir()) / f'tiki_check_{uid}.svg'
     if not path.exists():
         try:
             path.write_text(

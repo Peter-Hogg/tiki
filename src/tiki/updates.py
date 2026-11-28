@@ -27,19 +27,37 @@ def current_version() -> str:
         return __version__
 
 
+def _version_key(ver: str) -> tuple[tuple[int, ...], int, str, int]:
+    """Parse PEP 440 / semver strings so pre-releases sort before final releases."""
+    s = (ver or '').strip().lstrip('vV')
+    m = re.match(r'^(\d+(?:\.\d+)*)(?:[-._]?(a|alpha|b|beta|rc|c|pre|dev)(\d*))?', s, re.IGNORECASE)
+    if not m:
+        nums = tuple(int(n) for n in re.findall(r'\d+', s)) or (0,)
+        return nums, 1, '', 0
+    core = tuple(int(x) for x in m.group(1).split('.'))
+    tag = (m.group(2) or '').lower()
+    if not tag:
+        return core, 1, '', 0
+    tag_map = {'dev': '0_dev', 'a': '1_a', 'alpha': '1_a', 'b': '2_b', 'beta': '2_b', 'c': '3_rc', 'pre': '3_rc', 'rc': '3_rc'}
+    pre_num = int(m.group(3)) if m.group(3) else 0
+    return core, 0, tag_map.get(tag, tag), pre_num
+
+
 def parse_version(ver: str) -> tuple[int, ...]:
     """Parse ``'v0.2.1'`` or ``'0.2.1'`` into a comparable integer tuple."""
-    nums = [int(n) for n in re.findall(r'\d+', ver or '')]
-    return tuple(nums) if nums else (0,)
+    return _version_key(ver)[0]
 
 
 def compare_versions(current: str, latest: str) -> int:
     """Return ``-1`` if ``latest`` is newer, ``0`` if equal, ``+1`` if ``current`` is newer."""
-    a, b = parse_version(current), parse_version(latest)
-    n = max(len(a), len(b))
-    a = a + (0,) * (n - len(a))
-    b = b + (0,) * (n - len(b))
-    return (a > b) - (a < b)
+    ca, cf, ct, cn = _version_key(current)
+    la, lf, lt, ln = _version_key(latest)
+    n = max(len(ca), len(la))
+    ca = ca + (0,) * (n - len(ca))
+    la = la + (0,) * (n - len(la))
+    ka = (ca, cf, ct, cn)
+    kb = (la, lf, lt, ln)
+    return (ka > kb) - (ka < kb)
 
 
 def fetch_latest_release(url: str = API_URL, timeout: float = 5.0) -> dict:
@@ -72,7 +90,13 @@ def check_for_updates_dialog(tiki, fetcher=fetch_latest_release) -> None:
     cur = current_version()
     tiki.status('Checking for updates…')
     try:
-        info = fetcher()
+        if hasattr(tiki, 'run_task'):
+            info, cancelled = tiki.run_task('Check for Updates', 0, lambda _tick: fetcher())
+            if cancelled:
+                tiki.status('Update check cancelled')
+                return
+        else:
+            info = fetcher()
     except Exception as exc:
         box = QMessageBox(
             QMessageBox.Information,

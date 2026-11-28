@@ -1595,8 +1595,7 @@ def run_math(tiki, viewer, img: Image, op_name: str, value: float = 0.0, whole_s
             out.shape,
         )
 
-    finite = out[np.isfinite(out)]
-    lo, hi = ops.saturated_limits(finite if out.ndim == 2 else out[(0,) * (out.ndim - 2)])
+    lo, hi = ops.saturated_limits(out if out.ndim == 2 else out[(0,) * (out.ndim - 2)])
     suffix = op_name if op_name in ops.UNARY_MATH_OPS else f'{op_name} {val:g}'
     if out.ndim == img.ndim:
         layer = _add_result(tiki, viewer, img, out, f'{img.name} ({suffix})', img.colormap, (lo, hi), axes=axes_out)
@@ -2605,7 +2604,14 @@ def run_find_maxima(
             )
             if cancelled:
                 return None
-            total_pts = int(np.count_nonzero(out))
+            next_id = 0
+            for blk in blocks:
+                sub = out[blk]
+                m_id = int(sub.max())
+                if m_id > 0:
+                    sub[sub > 0] += next_id
+                    next_id += m_id
+            total_pts = next_id
             geom = axes_mod.geometry(img)
             meta = {'axes': info.to_dict()}
         else:
@@ -2628,11 +2634,9 @@ def run_find_maxima(
     if output == 'Segmented Particles':
         if use_stack:
             blocks = nd.blocks(info, shape, index, nd.WHOLE, False)
-            counts: list[int] = []
 
             def _seg_maxima_plane(pl):
                 coords, _ = ops.find_maxima(pl, mask=roi_mask, **opts)
-                counts.append(len(coords))
                 return ops.segment_maxima(
                     pl, coords, light_background=opts['light_background'], mask=roi_mask
                 )
@@ -2644,7 +2648,14 @@ def run_find_maxima(
             )
             if cancelled:
                 return None
-            total_pts = int(sum(counts))
+            next_id = 0
+            for blk in blocks:
+                sub = out[blk]
+                m_id = int(sub.max())
+                if m_id > 0:
+                    sub[sub > 0] += next_id
+                    next_id += m_id
+            total_pts = next_id
             geom = axes_mod.geometry(img)
             meta = {'axes': info.to_dict()}
         else:
@@ -3439,9 +3450,7 @@ def run_edge_detection(
 
     suffix = f'edges ({m}' + (' 3D' if use_3d else '') + ')'
     name = f'{img.name} {suffix}'
-    out_info = info if out.ndim == img.ndim else axes_mod.fit(
-        axes_mod.AxesInfo(info.axes[-out.ndim :], info.source, info.confident), out.shape
-    )
+    out_info = info if out.ndim == img.ndim else axes_mod.fit(info, out.shape)
     geom = axes_mod.geometry(img) if out.ndim == img.ndim else axes_mod.geometry(img, ndim=out.ndim)
     if as_lab:
         layer = Labels(

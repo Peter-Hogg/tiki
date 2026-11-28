@@ -355,13 +355,19 @@ def read_nd2_scenes(path: str | Path) -> list[tuple[object, dict]]:
         ) from exc
 
     path = Path(path)
-    with nd2.ND2File(path) as f:
+    has_imread = callable(getattr(nd2, 'imread', None))
+    raw_f = nd2.ND2File(path)
+    f = raw_f.__enter__()
+    keep_open = False
+    try:
         sizes = dict(getattr(f, 'sizes', {}))
-        try:
-            raw = f.to_dask()
-        except Exception:
-            raw = f.asarray()
-        codes = ''.join(sizes.keys()) if len(sizes) == raw.ndim else ''
+        raw = None
+        if not has_imread:
+            try:
+                raw = f.to_dask()
+            except Exception:
+                raw = f.asarray()
+            keep_open = hasattr(raw, 'compute')
         voxel = None
         try:
             voxel = f.voxel_size()
@@ -435,55 +441,70 @@ def read_nd2_scenes(path: str | Path) -> list[tuple[object, dict]]:
                 if obj:
                     acq['objective'] = obj
                 break
+    finally:
+        if not keep_open:
+            raw_f.__exit__(None, None, None)
 
-        def _build_entry(arr, ax_codes: str, name: str) -> tuple[object, dict]:
-            is_rgb = ax_codes.endswith('S') and arr.ndim >= 3 and arr.shape[-1] in (3, 4)
-            eff_codes = ax_codes[:-1] if is_rgb else ax_codes
-            eff_shape = arr.shape[:-1] if is_rgb else arr.shape
-            if len(eff_codes) == len(eff_shape):
-                axes_list = []
-                for c, n in zip(eff_codes, eff_shape):
-                    role = axes_mod.TIFF_ROLES.get(c, '?')
-                    step, unit = None, None
-                    if role == 'T' and t_step_s:
-                        step, unit = t_step_s, 's'
-                    elif voxel is not None:
-                        v = {'X': getattr(voxel, 'x', None), 'Y': getattr(voxel, 'y', None), 'Z': getattr(voxel, 'z', None)}.get(role)
-                        if v and float(v) > 0:
-                            step, unit = float(v), 'µm'
-                    axes_list.append(axes_mod.Axis(role, int(n), step, unit))
-                info = axes_mod.AxesInfo(axes_list, 'ND2 metadata', '?' not in ''.join(a.role for a in axes_list[:-2]))
-                if info.problems(eff_shape):
-                    info = axes_mod.guess(eff_shape)
-            else:
-                info = _axes_without_metadata(path, eff_shape)
-            meta: dict = {'name': name, 'path': str(path), 'axes': info}
-            if is_rgb:
-                meta['rgb'] = True
-            c_idx = info.index('C')
-            if c_idx is not None:
-                n_c = arr.shape[c_idx]
-                if len(luts) == n_c:
-                    meta['imagej_luts'] = luts
-                if len(channel_names) == n_c and any(channel_names):
-                    meta['channel_names'] = channel_names
-            if acq:
-                meta['acquisition'] = acq
-            return arr, meta
+    if has_imread:
+        try:
+            raw = nd2.imread(path, dask=True)
+        except Exception:
+            raw = nd2.imread(path)
+    elif keep_open:
+        import weakref
 
-        if 'P' in codes:
-            p_idx = codes.index('P')
-            n_p = raw.shape[p_idx]
-            rest_codes = codes[:p_idx] + codes[p_idx + 1 :]
-            if n_p > 1:
-                out = []
-                for p in range(n_p):
-                    sl = (slice(None),) * p_idx + (p,) + (slice(None),) * (raw.ndim - p_idx - 1)
-                    out.append(_build_entry(raw[sl], rest_codes, f'{path.name} [P{p}]'))
-                return out
-            sl = (slice(None),) * p_idx + (0,) + (slice(None),) * (raw.ndim - p_idx - 1)
-            return [_build_entry(raw[sl], rest_codes, path.name)]
-        return [_build_entry(raw, codes, path.name)]
+        weakref.finalize(raw, lambda fh=raw_f: fh.__exit__(None, None, None))
+
+    codes = ''.join(sizes.keys()) if len(sizes) == raw.ndim else ''
+
+    def _build_entry(arr, ax_codes: str, name: str) -> tuple[object, dict]:
+        is_rgb = ax_codes.endswith('S') and arr.ndim >= 3 and arr.shape[-1] in (3, 4)
+        eff_codes = ax_codes[:-1] if is_rgb else ax_codes
+        eff_shape = arr.shape[:-1] if is_rgb else arr.shape
+        if len(eff_codes) == len(eff_shape):
+            axes_list = []
+            for c, n in zip(eff_codes, eff_shape):
+                role = axes_mod.TIFF_ROLES.get(c, '?')
+                step, unit = None, None
+                if role == 'T' and t_step_s:
+                    step, unit = t_step_s, 's'
+                elif voxel is not None:
+                    v = {'X': getattr(voxel, 'x', None), 'Y': getattr(voxel, 'y', None), 'Z': getattr(voxel, 'z', None)}.get(role)
+                    if v and float(v) > 0:
+                        step, unit = float(v), 'µm'
+                axes_list.append(axes_mod.Axis(role, int(n), step, unit))
+            info = axes_mod.AxesInfo(axes_list, 'ND2 metadata', '?' not in ''.join(a.role for a in axes_list[:-2]))
+            if info.problems(eff_shape):
+                info = axes_mod.guess(eff_shape)
+        else:
+            info = _axes_without_metadata(path, eff_shape)
+        meta: dict = {'name': name, 'path': str(path), 'axes': info}
+        if is_rgb:
+            meta['rgb'] = True
+        c_idx = info.index('C')
+        if c_idx is not None:
+            n_c = arr.shape[c_idx]
+            if len(luts) == n_c:
+                meta['imagej_luts'] = luts
+            if len(channel_names) == n_c and any(channel_names):
+                meta['channel_names'] = channel_names
+        if acq:
+            meta['acquisition'] = acq
+        return arr, meta
+
+    if 'P' in codes:
+        p_idx = codes.index('P')
+        n_p = raw.shape[p_idx]
+        rest_codes = codes[:p_idx] + codes[p_idx + 1 :]
+        if n_p > 1:
+            out = []
+            for p in range(n_p):
+                sl = (slice(None),) * p_idx + (p,) + (slice(None),) * (raw.ndim - p_idx - 1)
+                out.append(_build_entry(raw[sl], rest_codes, f'{path.name} [P{p}]'))
+            return out
+        sl = (slice(None),) * p_idx + (0,) + (slice(None),) * (raw.ndim - p_idx - 1)
+        return [_build_entry(raw[sl], rest_codes, path.name)]
+    return [_build_entry(raw, codes, path.name)]
 
 
 def read_nd2(path: str | Path, scene: int | None = None) -> tuple[object, dict]:
@@ -1043,32 +1064,16 @@ def _lut_to_ome_color(lut: np.ndarray) -> int:
     return rgba - (1 << 32) if rgba >= (1 << 31) else rgba
 
 
-def save_tiff(
-    path: str | Path,
-    data: np.ndarray,
+def _write_tiff_to(
+    target: Path,
+    arr: np.ndarray,
+    *,
+    want_ome: bool,
     scale: tuple | None = None,
     axes: axes_mod.AxesInfo | None = None,
     luts: list[np.ndarray] | None = None,
     channel_names: list[str] | None = None,
 ) -> None:
-    """Write a calibrated ImageJ hyperstack or OME-TIFF."""
-    arr = np.asarray(data)
-    if arr.dtype == np.float64:
-        arr = arr.astype(np.float32)
-    elif arr.dtype == np.bool_:
-        arr = arr.astype(np.uint8) * 255
-    elif np.issubdtype(arr.dtype, np.integer) and arr.dtype not in (np.uint8, np.uint16):
-        if arr.size == 0 or (int(arr.min()) >= 0 and int(arr.max()) <= 65535):
-            arr = arr.astype(np.uint16)
-        elif arr.dtype == np.int64 and int(arr.min()) >= -(2**31) and int(arr.max()) < 2**31:
-            arr = arr.astype(np.int32)
-
-    want_ome = str(path).lower().endswith(('.ome.tif', '.ome.tiff')) or arr.dtype not in (
-        np.uint8,
-        np.uint16,
-        np.float32,
-    )
-
     if axes is None:
         kwargs: dict = {}
         if scale is not None and len(scale) >= 2:
@@ -1078,15 +1083,15 @@ def save_tiff(
             if arr.ndim >= 3 and len(scale) >= 3 and not want_ome and float(scale[-3]) > 0:
                 kwargs['metadata'] = {'spacing': float(scale[-3])}
         if want_ome:
-            tifffile.imwrite(path, arr, ome=True, **kwargs)
+            tifffile.imwrite(target, arr, ome=True, **kwargs)
         else:
-            tifffile.imwrite(path, arr, imagej=arr.dtype != np.int64, **kwargs)
+            tifffile.imwrite(target, arr, imagej=arr.dtype != np.int64, **kwargs)
         return
 
     rgb = arr.ndim == len(axes.axes) + 1 and arr.shape[-1] in (3, 4)
     expected_shape = arr.shape[:-1] if rgb else arr.shape
     if axes.problems(expected_shape):
-        save_tiff(path, arr, scale=scale)
+        _write_tiff_to(target, arr, want_ome=want_ome, scale=scale, axes=None)
         return
 
     # ImageJ hyperstack mode only supports 3-sample uint8 RGB; fall back to OME-TIFF
@@ -1142,7 +1147,7 @@ def save_tiff(
             if ch_dict:
                 ome_meta['Channel'] = ch_dict
         ome_kwargs = {'photometric': 'minisblack'} if not rgb else {}
-        tifffile.imwrite(path, arr, ome=True, metadata=ome_meta, **ome_kwargs)
+        tifffile.imwrite(target, arr, ome=True, metadata=ome_meta, **ome_kwargs)
         return
 
     if '?' in axes.roles[:-2]:
@@ -1158,7 +1163,7 @@ def save_tiff(
                 res_kw['resolutionunit'] = res_unit
         if not rgb:
             res_kw['photometric'] = 'minisblack'
-        tifffile.imwrite(path, arr, imagej=False, **res_kw)
+        tifffile.imwrite(target, arr, imagej=False, **res_kw)
         return
 
     rank = {'T': 0, 'Z': 1, 'C': 2, 'Y': 3, 'X': 4}
@@ -1190,7 +1195,71 @@ def save_tiff(
             elif 'C' not in canon_roles and len(valid_luts) == 1:
                 ij_meta['LUTs'] = valid_luts
 
-    tifffile.imwrite(path, arr, imagej=True, metadata=ij_meta, **ij_kwargs)
+    tifffile.imwrite(target, arr, imagej=True, metadata=ij_meta, **ij_kwargs)
+
+
+def save_tiff(
+    path: str | Path,
+    data: np.ndarray,
+    scale: tuple | None = None,
+    axes: axes_mod.AxesInfo | None = None,
+    luts: list[np.ndarray] | None = None,
+    channel_names: list[str] | None = None,
+) -> None:
+    """Write a calibrated ImageJ hyperstack or OME-TIFF atomically.
+
+    Writing to a sibling temporary file first avoids truncating ``path`` before
+    reading ``data`` when ``data`` is a memory-mapped view or lazy Dask array
+    backed by ``path`` itself (which otherwise triggers ``SIGBUS`` / 0-byte loss).
+    """
+    import tempfile
+
+    dst = Path(path)
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    arr = np.asarray(data)
+    if arr.dtype == np.float64:
+        arr = arr.astype(np.float32)
+    elif arr.dtype == np.bool_:
+        arr = arr.astype(np.uint8) * 255
+    elif np.issubdtype(arr.dtype, np.integer) and arr.dtype not in (np.uint8, np.uint16):
+        if arr.size == 0 or (int(arr.min()) >= 0 and int(arr.max()) <= 65535):
+            arr = arr.astype(np.uint16)
+        elif arr.dtype == np.int64 and int(arr.min()) >= -(2**31) and int(arr.max()) < 2**31:
+            arr = arr.astype(np.int32)
+
+    low_name = dst.name.lower()
+    want_ome = low_name.endswith(('.ome.tif', '.ome.tiff')) or arr.dtype not in (
+        np.uint8,
+        np.uint16,
+        np.float32,
+    )
+    if low_name.endswith('.ome.tiff'):
+        suffix = '.ome.tiff'
+    elif low_name.endswith('.ome.tif'):
+        suffix = '.ome.tif'
+    else:
+        suffix = dst.suffix or '.tif'
+
+    fd, tmp_name = tempfile.mkstemp(dir=dst.parent, prefix=f'.{dst.stem}_', suffix=suffix)
+    os.close(fd)
+    tmp_path = Path(tmp_name)
+    try:
+        _write_tiff_to(
+            tmp_path,
+            arr,
+            want_ome=want_ome,
+            scale=scale,
+            axes=axes,
+            luts=luts,
+            channel_names=channel_names,
+        )
+        os.replace(tmp_path, dst)
+    finally:
+        if tmp_path.exists():
+            try:
+                tmp_path.unlink()
+            except OSError:
+                pass
 
 
 def synthetic_movie(n_frames: int = 300, size: int = 256, seed: int = 0) -> np.ndarray:

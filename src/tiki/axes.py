@@ -222,21 +222,16 @@ def physical_scale_3d(info: AxesInfo) -> tuple[tuple[float, float, float], str |
 
 # ------------------------------------------------------------------- TIFF
 
-def _xy_step(tf, ij: dict) -> tuple[float | None, str | None, str | None]:
-    """Pixel size from TIFF resolution tags; returns (step, unit, note)."""
+def _tag_step(page, tag_name: str, resunit: int, ij_unit: str | None) -> tuple[float | None, str | None, str | None]:
     import tifffile
 
-    page = tf.pages[0]
-    xres = page.tags.get('XResolution')
-    if xres is None:
+    tag = page.tags.get(tag_name)
+    if tag is None:
         return None, None, None
-    num, den = xres.value
+    num, den = tag.value
     if not num or not den:
         return None, None, None
     step = den / num  # units per pixel
-    resunit = page.tags.get('ResolutionUnit')
-    resunit = resunit.value if resunit is not None else tifffile.RESUNIT.NONE
-    ij_unit = _unit(ij.get('unit'))
     if ij_unit and ij_unit not in ('pixel', 'pixels'):
         unit = ij_unit
     elif resunit == tifffile.RESUNIT.CENTIMETER:
@@ -252,6 +247,30 @@ def _xy_step(tf, ij: dict) -> tuple[float | None, str | None, str | None]:
     if unit == 'µm' and not (0.01 <= step <= 1000):
         return None, None, f'ignored implausible pixel size {step:.3g} µm'
     return step, unit, None
+
+
+def _xy_steps(tf, ij: dict) -> tuple[float | None, float | None, str | None, str | None]:
+    """Pixel sizes ``(sy, sx, unit, note)`` from TIFF XResolution and YResolution tags."""
+    import tifffile
+
+    page = tf.pages[0]
+    resunit = page.tags.get('ResolutionUnit')
+    resunit = resunit.value if resunit is not None else tifffile.RESUNIT.NONE
+    ij_unit = _unit(ij.get('unit'))
+    sx, ux, note_x = _tag_step(page, 'XResolution', resunit, ij_unit)
+    sy, uy, note_y = _tag_step(page, 'YResolution', resunit, ij_unit)
+    unit = ux or uy
+    if sy is None:
+        sy = sx
+    if sx is None:
+        sx = sy
+    return sy, sx, unit, (note_x or note_y)
+
+
+def _xy_step(tf, ij: dict) -> tuple[float | None, str | None, str | None]:
+    """Pixel size from TIFF resolution tags; returns (step, unit, note)."""
+    _sy, sx, unit, note = _xy_steps(tf, ij)
+    return sx, unit, note
 
 
 def _xml_tag(el) -> str:
@@ -558,11 +577,11 @@ def from_tiff(tf, data_shape: tuple, series_index: int = 0) -> AxesInfo:
             info.source = 'Micro-Manager metadata'
 
         if not tf.is_scanimage:  # ScanImage resolution tags are not a calibration
-            step, unit, note = _xy_step(tf, ij)
+            sy, sx, unit, note = _xy_steps(tf, ij)
             if note:
                 notes.append(note)
-            if step:
-                for r in 'YX':
+            for r, step in (('Y', sy), ('X', sx)):
+                if step:
                     i = info.index(r)
                     if i is not None:
                         axes[i].step, axes[i].unit = step, unit
@@ -950,10 +969,19 @@ def get(image) -> AxesInfo:
 
 
 def fit(info: AxesInfo, shape: tuple) -> AxesInfo:
-    """Reuse roles and steps for data of a new shape (crop, filter...)."""
-    if len(info.axes) != len(shape):
+    """Reuse roles and steps for data of a new shape (crop, plane, 3D volume, filter...)."""
+    shape = tuple(shape)
+    src_axes = info.axes
+    if len(shape) < len(src_axes):
+        if len(shape) == 2 and len(src_axes) >= 2:
+            src_axes = src_axes[-2:]
+        elif len(shape) == 3 and len(src_axes) > 3 and info.index('Z') is not None:
+            src_axes = [src_axes[info.index('Z')], src_axes[-2], src_axes[-1]]
+        else:
+            src_axes = src_axes[-len(shape) :]
+    if len(src_axes) != len(shape):
         return guess(shape)
-    out = AxesInfo([Axis(a.role, int(n), a.step, a.unit) for a, n in zip(info.axes, shape)],
+    out = AxesInfo([Axis(a.role, int(n), a.step, a.unit) for a, n in zip(src_axes, shape)],
                    info.source, info.confident, list(info.notes))
     return out if not out.problems(shape) else guess(shape)
 

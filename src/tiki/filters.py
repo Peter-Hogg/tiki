@@ -279,7 +279,7 @@ def run_filter(tiki, key: str, viewer, image, values: dict, whole_stack: bool = 
     spec = FILTERS[key]
     info = axes_mod.get(image)
     three_d = three_d and spec.func3d is not None and info.index('Z') is not None
-    if image.rgb and image.ndim > 2:
+    if image.rgb and image.ndim > 2 and (whole_stack or three_d):
         from .app import TikiError
 
         raise TikiError('filters on RGB stacks are not supported yet')
@@ -308,10 +308,10 @@ def run_filter(tiki, key: str, viewer, image, values: dict, whole_stack: bool = 
     if three_d:
         values = values | {'3D': True}
     lo, hi = ops.saturated_limits(result if result.ndim == 2 else result[(0,) * (result.ndim - 2)])
-    info = axes_mod.get(image) if result.ndim == image.ndim else axes_mod.guess(result.shape)
+    out_info = axes_mod.fit(info, result.shape)
     layer = Image(result, name=f'{image.name} {spec.name_suffix(values)}', colormap=image.colormap,
                   contrast_limits=(lo, hi), **geometry,
-                  metadata={'axes': axes_mod.fit(info, result.shape).to_dict()})
+                  metadata={'axes': out_info.to_dict()})
     viewer.add_layer(layer)
     tiki.reapply_tool(viewer)
     tiki.push_undo_layer(spec.title, viewer, layer)

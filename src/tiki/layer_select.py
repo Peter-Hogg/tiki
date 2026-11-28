@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from napari.layers import Image, Labels
 from qtpy.QtCore import Signal
-from qtpy.QtWidgets import QComboBox
+from qtpy.QtWidgets import QComboBox, QDialog
 
 from . import roi as roi_mod
 
@@ -26,9 +26,10 @@ class LayerCombo(QComboBox):
         self.viewer = None
         self.currentIndexChanged.connect(lambda _: self.layer_changed.emit(self.layer()))
         self.destroyed.connect(self._on_destroyed)
+        self._dialog_hooked = False
         self.set_viewer(viewer, current)
 
-    def _on_destroyed(self, _obj=None) -> None:
+    def _disconnect_viewer(self) -> None:
         v = self.viewer
         self.viewer = None
         if v is not None:
@@ -37,6 +38,17 @@ class LayerCombo(QComboBox):
                     ev.disconnect(self.refresh)
                 except Exception:
                     pass
+
+    def _on_destroyed(self, _obj=None) -> None:
+        self._disconnect_viewer()
+
+    def showEvent(self, event) -> None:
+        if not self._dialog_hooked:
+            win = self.window()
+            if isinstance(win, QDialog):
+                win.finished.connect(self._disconnect_viewer)
+                self._dialog_hooked = True
+        super().showEvent(event)
 
     def closeEvent(self, event) -> None:
         self._on_destroyed()

@@ -550,12 +550,27 @@ class Tiki(QMainWindow):
     def _on_wand_click(self, viewer, event):
         if self.tool != 'wand' or viewer.dims.ndisplay == 3:
             return
+        if getattr(event, 'button', 1) != 1:
+            return
         image = roi_mod.target_image(viewer)
         if image is None:
             return
+        start_pos = tuple(event.pos) if hasattr(event, 'pos') else None
         coords = image.world_to_data(event.position[-image.ndim :])
         y, x = int(np.floor(coords[-2] + 0.5)), int(np.floor(coords[-1] + 0.5))
-        self._run('Magic Wand', lambda: self.wand_select(viewer, y, x, add='Shift' in event.modifiers))
+        mods = set(getattr(event, 'modifiers', ()))
+        moved = False
+        yield
+        while getattr(event, 'type', '') == 'mouse_move':
+            if start_pos is not None and hasattr(event, 'pos'):
+                dx = event.pos[0] - start_pos[0]
+                dy = event.pos[1] - start_pos[1]
+                if dx * dx + dy * dy > 16:
+                    moved = True
+            yield
+        if moved:
+            return
+        self._run('Magic Wand', lambda: self.wand_select(viewer, y, x, add='Shift' in mods))
 
     def wand_select(self, viewer, y: int, x: int, add: bool = False):
         image = roi_mod.target_image(viewer)
@@ -597,12 +612,10 @@ class Tiki(QMainWindow):
 
     def _labels_for_painting(self, viewer) -> Labels:
         """The selected Labels layer, else the topmost one, else a new empty one."""
-        from .threshold import PREVIEW_NAME
-
         active = viewer.layers.selection.active
-        if isinstance(active, Labels) and active.name != PREVIEW_NAME:
+        if isinstance(active, Labels) and active.name not in roi_mod.PREVIEW_NAMES:
             return active
-        labels = [ly for ly in viewer.layers if isinstance(ly, Labels) and ly.name != PREVIEW_NAME]
+        labels = [ly for ly in viewer.layers if isinstance(ly, Labels) and ly.name not in roi_mod.PREVIEW_NAMES]
         if labels:
             return labels[-1]
         image = roi_mod.target_image(viewer)
@@ -895,6 +908,7 @@ class Tiki(QMainWindow):
                 )
             else:
                 data = np.stack([np.asarray(ly.data) for ly in parts], axis=c)
+                info = axes_mod.fit(info, data.shape)
             luts = [contrast.layer_lut_bytes(ly) for ly in parts]
             ch_names = [ly.metadata.get('channel_name') or '' for ly in parts]
             io.save_tiff(
@@ -1043,22 +1057,21 @@ class Tiki(QMainWindow):
                 return None
         return None
 
-    def push_undo_data(self, label: str, viewer, layer, in_place: bool = False) -> bool:
-        """Snapshot ``layer.data`` and axes before an edit without materializing oversized lazy arrays."""
+    def _snapshot_layer_state(self, label: str, viewer, layer, in_place: bool = False) -> dict | None:
         raw = layer.data
         est = self._estimate_nbytes(raw)
         if est is not None and est > self.UNDO_MAX_BYTES:
-            return False
+            return None
         if hasattr(raw, 'compute') and not in_place:
             snapshot = raw
             snap_bytes = 0
         else:
             arr = np.asarray(raw)
             if arr.nbytes > self.UNDO_MAX_BYTES:
-                return False
+                return None
             snapshot = arr.copy()
             snap_bytes = int(arr.nbytes)
-        entry = {
+        return {
             'kind': 'data',
             'label': label,
             'viewer': viewer,
@@ -1069,6 +1082,16 @@ class Tiki(QMainWindow):
             'had_modified': 'modified' in layer.metadata,
             'modified': layer.metadata.get('modified'),
         }
+
+    def push_undo_data(self, label: str, viewer, layer, in_place: bool = False) -> bool:
+        """Snapshot ``layer.data`` and axes before an edit without materializing oversized lazy arrays."""
+        entry = self._snapshot_layer_state(label, viewer, layer, in_place=in_place)
+        if entry is None:
+            self._undo_stack.append(
+                {'kind': 'too_large', 'label': label, 'viewer': viewer, 'layer': layer, 'bytes': 0}
+            )
+            self._trim_undo_stack()
+            return False
         self._undo_stack.append(entry)
         self._trim_undo_stack()
         return True
@@ -1093,6 +1116,19 @@ class Tiki(QMainWindow):
             return
         self._undo_stack = [e for e in self._undo_stack if e['viewer'] in open_viewers]
 
+    @staticmethod
+    def _restore_data_entry(v, e: dict) -> None:
+        ly = e['layer']
+        if ly not in v.layers:
+            return
+        ly.data = e['data']
+        if e.get('axes'):
+            axes_mod.apply(v, ly, axes_mod.AxesInfo.from_dict(e['axes']))
+        if e.get('had_modified'):
+            ly.metadata['modified'] = e.get('modified')
+        else:
+            ly.metadata.pop('modified', None)
+
     def undo(self) -> None:
         """Undo the last Labels paint stroke, destructive crop, or added layer."""
         viewer = self.windows.active
@@ -1104,18 +1140,32 @@ class Tiki(QMainWindow):
                 return
 
         while self._undo_stack:
-            entry = self._undo_stack.pop()
-            v, ly = entry['viewer'], entry['layer']
-            if v not in self.windows.viewers or ly not in v.layers:
+            idx = len(self._undo_stack) - 1
+            if viewer is not None:
+                for k in range(len(self._undo_stack) - 1, -1, -1):
+                    if self._undo_stack[k]['viewer'] is viewer:
+                        idx = k
+                        break
+            entry = self._undo_stack.pop(idx)
+            v = entry['viewer']
+            if v not in self.windows.viewers:
+                continue
+            if entry['kind'] == 'too_large':
+                raise TikiError(f'Cannot undo {entry["label"]}: image exceeded undo memory limit')
+            if entry['kind'] == 'batch':
+                sub_entries = [s for s in entry.get('entries', ()) if s['layer'] in v.layers]
+                if not sub_entries:
+                    continue
+                for s in sub_entries:
+                    self._restore_data_entry(v, s)
+                v.reset_view()
+                self.status(f'Undo {entry["label"]}')
+                return
+            ly = entry['layer']
+            if ly not in v.layers:
                 continue
             if entry['kind'] == 'data':
-                ly.data = entry['data']
-                if entry.get('axes'):
-                    axes_mod.apply(v, ly, axes_mod.AxesInfo.from_dict(entry['axes']))
-                if entry.get('had_modified'):
-                    ly.metadata['modified'] = entry.get('modified')
-                else:
-                    ly.metadata.pop('modified', None)
+                self._restore_data_entry(v, entry)
                 v.reset_view()
             else:
                 v.layers.remove(ly)
@@ -1430,11 +1480,33 @@ class Tiki(QMainWindow):
         y0, y1, x0, x1 = box
         if y1 <= y0 or x1 <= x0:
             raise TikiError('Selection is outside the image')
-        self.push_undo_data('Crop', viewer, image)
-        image.data = np.array(ops.crop_to_box(image.data, box, rgb=bool(image.rgb)))
-        image.metadata['modified'] = True
-        expected_shape = image.data.shape[:-1] if image.rgb else image.data.shape
-        image.metadata['axes'] = axes_mod.fit(axes_mod.get(image), expected_shape).to_dict()
+        split_origin = image.metadata.get('split_from')
+        if split_origin is not None:
+            targets = [
+                ly for ly in viewer.layers
+                if isinstance(ly, Image) and ly.metadata.get('split_from') is split_origin
+            ]
+        else:
+            targets = [image]
+        if len(targets) == 1:
+            self.push_undo_data('Crop', viewer, image)
+        else:
+            snaps = [self._snapshot_layer_state('Crop', viewer, ly) for ly in targets]
+            total_b = sum(s['bytes'] for s in snaps if s is not None)
+            if all(s is not None for s in snaps) and total_b <= self.UNDO_MAX_BYTES:
+                self._undo_stack.append(
+                    {'kind': 'batch', 'label': 'Crop', 'viewer': viewer, 'entries': snaps, 'bytes': total_b}
+                )
+            else:
+                self._undo_stack.append(
+                    {'kind': 'too_large', 'label': 'Crop', 'viewer': viewer, 'layer': image, 'bytes': 0}
+                )
+            self._trim_undo_stack()
+        for ly in targets:
+            ly.data = np.array(ops.crop_to_box(ly.data, box, rgb=bool(ly.rgb)))
+            ly.metadata['modified'] = True
+            expected_shape = ly.data.shape[:-1] if ly.rgb else ly.data.shape
+            ly.metadata['axes'] = axes_mod.fit(axes_mod.get(ly), expected_shape).to_dict()
         self.select_none()
         viewer.reset_view()
         self.record("tiki.run('Crop')")
@@ -1513,6 +1585,14 @@ class Tiki(QMainWindow):
         sl[axis] = slice(s0, s1)
         data = image.data[tuple(sl)]
         result = ops.z_project(data, method, axis)
+        if image.rgb and np.issubdtype(result.dtype, np.floating):
+            if np.issubdtype(image.data.dtype, np.uint8) and method in ('mean', 'median', 'std'):
+                result = np.clip(np.round(result), 0, 255).astype(np.uint8)
+            else:
+                fin = result[np.isfinite(result)]
+                rmax = float(fin.max()) if fin.size else 1.0
+                if rmax > 1.0:
+                    result = np.clip(result / rmax, 0.0, 1.0).astype(np.float32)
         prefix = {'max': 'MAX', 'mean': 'AVG', 'sum': 'SUM', 'std': 'STD', 'median': 'MED', 'min': 'MIN'}[method]
         fit_shape = data.shape[:-1] if image.rgb else data.shape
         info = axes_mod.fit(axes_mod.get(image), fit_shape).without(axis)
@@ -1524,6 +1604,7 @@ class Tiki(QMainWindow):
     def plot_z_profile(self) -> None:
         viewer, image = self.require_image()
         axis = self._stack_axis(viewer, image)
+        self._roi(viewer)
         window = ProfileWindow(viewer, image, axis)
         window.destroyed.connect(lambda _=None, w=window: self.profiles.remove(w) if w in self.profiles else None)
         window.setAttribute(Qt.WA_DeleteOnClose)
@@ -1599,6 +1680,7 @@ class Tiki(QMainWindow):
         current = self.current_roi(viewer)
         if current is None or current[1] not in ('line', 'path'):
             raise TikiError('Plot Profile needs a straight line or segmented line selection')
+        self._roi(viewer)
         win = LineProfileWindow(viewer, image)
         self.keep_window(win)
         win.show()
@@ -1896,6 +1978,7 @@ class Tiki(QMainWindow):
                 }
         self._sync_result_units(p_units, reset=clear)
         total = 0
+        pending_rows: list[dict] = []
         with self.progress('Analyze Particles', len(blocks)) as tick:
             for n, block in enumerate(blocks):
                 lab = np.asarray(labels[nd.for_layer(block, ln)])
@@ -1904,7 +1987,7 @@ class Tiki(QMainWindow):
                     img = img[..., :3].mean(-1)
                 if lab.shape != img.shape:  # e.g. 2D labels against a volume: measure plane by plane
                     lab = np.broadcast_to(lab, img.shape)
-                if lab.max() == 1:  # a 0/1 mask: split into objects first
+                if lab.max() == 1 and lab.dtype in (np.bool_, np.uint8):  # a 0/1 mask: split into objects first
                     lab = ops.label_objects(lab > 0)
                 if exclude_edges:
                     lab = clear_border(lab)
@@ -1926,7 +2009,7 @@ class Tiki(QMainWindow):
                     scale_arg = phys_3d if (lab.ndim == 3 and by_volume) else phys_3d[1:]
                 else:
                     scale_arg = block_scale[-2:] if (lab.ndim == 3 and not by_volume) else block_scale
-                if lab.ndim == 3 and not by_volume:  # labels with Z, measured slice by slice
+                if lab.ndim == 3 and not by_volume:  # labels with Z, measured slice by plane
                     rows = []
                     for k in range(lab.shape[0]):
                         for row in ops.particle_table(lab[k], img[k], scale_arg[-2:]):
@@ -1937,10 +2020,12 @@ class Tiki(QMainWindow):
                 for row in rows:
                     if where:
                         row = {'Slice': where} | row
-                    self.results.add_row(row)
+                    pending_rows.append(row)
                     total += 1
                 if tick(n + 1, len(blocks)) is False:
                     break
+        if pending_rows:
+            self.results.add_rows(pending_rows)
         self.show_results()
         self.record(
             f'tiki.analyze_particles(min_size={min_size!r}, max_size={max_size!r}, '
@@ -1990,7 +2075,7 @@ class Tiki(QMainWindow):
             QMessageBox.information(
                 self, 'Send to Notebook',
                 f'Wrote {out}\n\nPaste into a notebook (already on your clipboard):\n\n'
-                f"exec(open(r'{out / 'load_session.py'}').read())\n\nor open load_session.py.",
+                f'exec(open({str(out / "load_session.py")!r}).read())\n\nor open load_session.py.',
             )
         return snippet
 

@@ -57,17 +57,28 @@ def _axis_aligned(corners: np.ndarray) -> bool:
 
 
 def to_imagej(roi: Roi):
-    from roifile import ROI_TYPE, ImagejRoi
+    from roifile import ROI_OPTIONS, ROI_TYPE, ImagejRoi
 
     xy = roi.yx[:, ::-1] + IJ_OFFSET
     position = roi.position[0] + 1 if roi.position and len(roi.position) == 1 else None
     if roi.kind in ('rectangle', 'ellipse') and _axis_aligned(roi.yx):
-        x0, y0 = np.round(xy.min(axis=0)).astype(int)
-        x1, y1 = np.round(xy.max(axis=0)).astype(int)
-        ij = ImagejRoi(
-            roitype=ROI_TYPE.RECT if roi.kind == 'rectangle' else ROI_TYPE.OVAL,
-            left=int(x0), top=int(y0), right=int(x1), bottom=int(y1),
-        )
+        fx0, fy0 = float(xy[:, 0].min()), float(xy[:, 1].min())
+        fx1, fy1 = float(xy[:, 0].max()), float(xy[:, 1].max())
+        bounds = np.array([fx0, fy0, fx1, fy1], dtype=float)
+        if np.allclose(bounds, np.round(bounds), atol=1e-4):
+            x0, y0, x1, y1 = np.round(bounds).astype(int)
+            ij = ImagejRoi(
+                roitype=ROI_TYPE.RECT if roi.kind == 'rectangle' else ROI_TYPE.OVAL,
+                left=int(x0), top=int(y0), right=int(x1), bottom=int(y1),
+            )
+        else:
+            ij = ImagejRoi(
+                roitype=ROI_TYPE.RECT if roi.kind == 'rectangle' else ROI_TYPE.OVAL,
+                options=ROI_OPTIONS.SUB_PIXEL_RESOLUTION,
+                left=int(np.floor(fx0)), top=int(np.floor(fy0)),
+                right=int(np.ceil(fx1)), bottom=int(np.ceil(fy1)),
+                xd=fx0, yd=fy0, widthd=max(fx1 - fx0, 0.0), heightd=max(fy1 - fy0, 0.0),
+            )
     elif roi.kind == 'line':
         (x1, y1), (x2, y2) = xy[0], xy[-1]
         ij = ImagejRoi(roitype=ROI_TYPE.LINE, x1=float(x1), y1=float(y1), x2=float(x2), y2=float(y2),
@@ -100,9 +111,15 @@ def to_imagej(roi: Roi):
 
 def from_imagej(ij, fallback_name: str = 'roi') -> Roi | None:
     """Convert a roifile ImagejRoi; returns None for unsupported types (e.g. composite)."""
-    from roifile import ROI_TYPE
+    from roifile import ROI_OPTIONS, ROI_SUBTYPE, ROI_TYPE
 
     t = ij.roitype
+    sub = getattr(ij, 'subtype', 0)
+    non_geom_subs = tuple(
+        s for s in (getattr(ROI_SUBTYPE, 'TEXT', None), getattr(ROI_SUBTYPE, 'IMAGE', None)) if s is not None
+    )
+    if sub in non_geom_subs:
+        return None
     name = ij.name or fallback_name
     hpos: dict[str, int] = {}
     for role, val in (('T', getattr(ij, 't_position', 0)), ('Z', getattr(ij, 'z_position', 0)), ('C', getattr(ij, 'c_position', 0))):
@@ -116,7 +133,16 @@ def from_imagej(ij, fallback_name: str = 'roi') -> Roi | None:
     else:
         position = None
     if t in (ROI_TYPE.RECT, ROI_TYPE.OVAL) and not ij.composite:
-        x0, y0, x1, y1 = ij.left, ij.top, ij.right, ij.bottom
+        has_subpx = bool(getattr(ij, 'options', 0) & ROI_OPTIONS.SUB_PIXEL_RESOLUTION) and (
+            float(getattr(ij, 'widthd', 0.0) or 0.0) > 0 or float(getattr(ij, 'heightd', 0.0) or 0.0) > 0
+        )
+        if has_subpx:
+            x0 = float(ij.xd)
+            y0 = float(ij.yd)
+            x1 = x0 + float(ij.widthd)
+            y1 = y0 + float(ij.heightd)
+        else:
+            x0, y0, x1, y1 = ij.left, ij.top, ij.right, ij.bottom
         corners_xy = np.array([[x0, y0], [x1, y0], [x1, y1], [x0, y1]], float)
         yx = corners_xy[:, ::-1] - IJ_OFFSET
         return Roi(name, 'rectangle' if t == ROI_TYPE.RECT else 'ellipse', yx, position, meta=meta)
@@ -140,18 +166,40 @@ def from_imagej(ij, fallback_name: str = 'roi') -> Roi | None:
     return Roi(name, kind, xy[:, ::-1] - IJ_OFFSET, position, meta=meta)
 
 
-def save_imagej(path: str | Path, rois: list[Roi]) -> None:
+def save_imagej(path: str | Path, rois: list[Roi]) -> Path:
     """Write ``.roi`` (one ROI) or ``.zip`` (ROI set) readable by ImageJ/Fiji."""
+    import os
+    import tempfile
+
     from roifile import roiwrite
 
     path = Path(path)
     if path.suffix.lower() == '.roi' and len(rois) != 1:
         path = path.with_suffix('.zip')
     ij_rois = [to_imagej(r) for r in rois]
-    if path.exists():
-        path.unlink()  # roiwrite appends to existing zips
-    payload = ij_rois[0] if (path.suffix.lower() == '.roi' and len(ij_rois) == 1) else ij_rois
-    roiwrite(path, payload, mode='w')
+    if path.suffix.lower() == '.zip':
+        seen: set[str] = set()
+        for idx, ij in enumerate(ij_rois, 1):
+            base = (ij.name or f'{idx:04d}').replace('/', '_').replace('\\', '_').strip() or f'{idx:04d}'
+            cand = base
+            k = 2
+            while cand.lower() in seen:
+                cand = f'{base}_{k}'
+                k += 1
+            seen.add(cand.lower())
+            ij.name = cand
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(dir=path.parent, prefix=f'.{path.stem}_', suffix=path.suffix or '.zip')
+    os.close(fd)
+    tmp_path = Path(tmp_name)
+    try:
+        tmp_path.unlink(missing_ok=True)  # roiwrite appends to existing zips
+        payload = ij_rois[0] if (path.suffix.lower() == '.roi' and len(ij_rois) == 1) else ij_rois
+        roiwrite(tmp_path, payload, mode='w')
+        os.replace(tmp_path, path)
+    finally:
+        tmp_path.unlink(missing_ok=True)
+    return path
 
 
 def load_imagej(path: str | Path) -> tuple[list[Roi], int]:
@@ -187,10 +235,14 @@ def rois_from_labels(labels2d: np.ndarray, tolerance: float = 0.5, prefix: str =
         if not contours:
             continue
         contour = max(contours, key=len) - 1  # undo padding
+        raw_contour = contour[:-1] if (contour.shape[0] > 1 and np.allclose(contour[0], contour[-1])) else contour
         if tolerance > 0 and len(contour) > 8:
-            contour = approximate_polygon(contour, tolerance)
-        if contour.shape[0] > 1 and np.allclose(contour[0], contour[-1]):
-            contour = contour[:-1]
+            approx = approximate_polygon(contour, tolerance)
+            if approx.shape[0] > 1 and np.allclose(approx[0], approx[-1]):
+                approx = approx[:-1]
+            contour = approx if len(approx) >= 3 else raw_contour
+        else:
+            contour = raw_contour
         rois.append(Roi(f'{prefix} {int(lid)}', 'polygon', contour, meta={'label': int(lid)}))
     return rois
 

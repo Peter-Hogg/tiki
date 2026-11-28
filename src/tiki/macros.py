@@ -179,9 +179,18 @@ class MacroAPI:
         units = {'T': 's', 'Z': 'µm', 'Y': 'µm', 'X': 'µm'}
         steps = list(scale) if scale is not None else [None] * data.ndim
         info = axes_mod.AxesInfo(
-            [axes_mod.Axis(r, int(n), (float(s) if s and s != 1 else None), units.get(r) if s and s != 1 else None)
-             for r, n, s in zip(roles, data.shape, steps)],
-            'macro', True)
+            [
+                axes_mod.Axis(
+                    r,
+                    int(n),
+                    (float(s) if (s is not None and float(s) > 0 and r in units) else None),
+                    (units[r] if (s is not None and float(s) > 0 and r in units) else None),
+                )
+                for r, n, s in zip(roles, data.shape, steps)
+            ],
+            'macro',
+            True,
+        )
         problems = info.problems(tuple(data.shape))
         if problems:
             raise ValueError('; '.join(problems))
@@ -233,7 +242,9 @@ class MacroAPI:
         return list(self._manager().rois)
 
     def roi_masks(self, which=None, window=None) -> np.ndarray:
-        shape = self.layer(which, window).data.shape[-2:]
+        from . import roi as roi_mod
+
+        shape = roi_mod.spatial_shape(self.layer(which, window))
         rois = self.rois()
         return np.stack([r.mask(shape) for r in rois]) if rois else np.zeros((0,) + shape, bool)
 

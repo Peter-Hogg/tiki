@@ -67,7 +67,7 @@ class WindowManager(QObject):
                 info = axes if axes is not None and not axes.problems(shape) else axes_mod.guess(shape)
                 if axes is None and 'scale' in image_kwargs:  # caller gave a scale (e.g. derived data)
                     for a, s in zip(info.axes, layer.scale):
-                        a.step = float(s) if s != 1 else None
+                        a.step = float(s) if (s and float(s) > 0 and a.role in ('T', 'Z', 'Y', 'X')) else None
                 axes_mod.apply(viewer, layer, info)
                 viewer.reset_view()
                 # ImageJ opens stacks at the first slice; napari at the middle.

@@ -16,7 +16,7 @@ import traceback
 from contextlib import redirect_stderr, redirect_stdout
 
 import numpy as np
-from qtpy.QtCore import Qt
+from qtpy.QtCore import QEvent, Qt
 from qtpy.QtGui import QColor, QFont, QTextCharFormat, QTextCursor
 from qtpy.QtWidgets import (
     QApplication,
@@ -47,6 +47,12 @@ class _ConsoleInput(QLineEdit):
         super().__init__(parent)
         self._on_history = on_history
         self._on_complete = on_complete
+
+    def event(self, ev):
+        if ev.type() == QEvent.KeyPress and ev.key() == Qt.Key_Tab:
+            self._on_complete()
+            return True
+        return super().event(ev)
 
     def keyPressEvent(self, event):
         key = event.key()
@@ -161,6 +167,7 @@ class PythonConsoleWindow(QWidget):
 
     def _init_namespace(self) -> None:
         self.namespace.clear()
+        self._auto_vars: dict = {}
         self.namespace.update({
             'tiki': self.api,
             'app': self.app,
@@ -170,15 +177,21 @@ class PythonConsoleWindow(QWidget):
             'results': self.app.results.rows,
             'show': self.api.show,
         })
-        self._sync_live_vars()
+        self._sync_live_vars(force=True)
 
-    def _sync_live_vars(self) -> None:
+    def _sync_live_vars(self, force: bool = False) -> None:
         viewer = self.app.windows.active
         layer = roi_mod.target_image(viewer) if viewer is not None else None
-        self.namespace['viewer'] = viewer
-        self.namespace['layer'] = layer
-        self.namespace['data'] = layer.data if layer is not None else None
-        self.namespace['results'] = self.app.results.rows
+        live = {
+            'viewer': viewer,
+            'layer': layer,
+            'data': layer.data if layer is not None else None,
+            'results': self.app.results.rows,
+        }
+        for k, v in live.items():
+            if force or k not in self.namespace or self.namespace[k] is self._auto_vars.get(k):
+                self.namespace[k] = v
+                self._auto_vars[k] = v
 
     def _update_active_badge(self, _viewer=None) -> None:
         self._sync_live_vars()
@@ -269,6 +282,9 @@ class PythonConsoleWindow(QWidget):
             start -= 1
         token = prefix[start:pos]
         if not token:
+            if not prefix or prefix.isspace():
+                self.input.setText(text[:pos] + '    ' + text[pos:])
+                self.input.setCursorPosition(pos + 4)
             return
         self._sync_live_vars()
         completer = rlcompleter.Completer(self.namespace)

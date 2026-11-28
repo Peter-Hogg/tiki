@@ -415,8 +415,6 @@ def test_filter_rgb_zstack_crop_zproject_cursor_undo_channels_roimanager(tiki):
     assert v.dims.current_step[0] == 3
 
     # RoiManager navigates hyperstack_pos by axis role name (T=7 on TZCYX -> T=6, Z=0, C=0)
-    from tiki import axes as axes_mod
-
     tzc = np.zeros((10, 5, 3, 16, 16), dtype=np.uint8)
     tzc_axes = axes_mod.AxesInfo(
         [axes_mod.Axis('T', 10), axes_mod.Axis('Z', 5), axes_mod.Axis('C', 3), axes_mod.Axis('Y', 16), axes_mod.Axis('X', 16)],
@@ -545,7 +543,174 @@ def test_sam_window_ui_and_commit(tiki):
     assert win._last_mask is None
     win._accept_object()
     assert 'sam_stack.tif sam' not in v3.layers
+    # Accepting a second SAM object pushes undo so Ctrl+Z only removes object #2, not #1
+    win.attach(v)
+    mask2 = np.zeros((32, 32), dtype=np.uint8)
+    mask2[2:6, 2:6] = 1
+    win._show_preview_mask(mask2)
+    win._accept_object()
+    assert set(np.unique(v.layers['sam_test.tif sam'].data)) == {0, 1, 2}
+    tiki.windows.activate(v)
+    tiki.undo()
+    assert set(np.unique(v.layers['sam_test.tif sam'].data)) == {0, 1}
     win.close()
+
+
+def test_bugfix_regressions(tiki, tmp_path, monkeypatch):
+    import sys
+    import types
+    import dask.array as da
+    from matplotlib.figure import Figure
+    from tiki import updates
+
+    # 1. Saving a memmap-backed TIFF onto its own path does not truncate/SIGBUS
+    src_tif = tmp_path / 'inplace.tif'
+    raw = np.arange(5 * 12 * 12, dtype=np.uint16).reshape(5, 12, 12)
+    tifffile.imwrite(src_tif, raw)
+    mm, meta = io.read_image(src_tif)
+    assert isinstance(mm, np.memmap)
+    io.save_tiff(src_tif, mm, axes=meta['axes'])
+    reloaded, _ = io.read_image(src_tif)
+    np.testing.assert_array_equal(np.asarray(reloaded), raw)
+
+    # 2. Lazy ND2 Dask array remains readable after read_nd2_scenes returns
+    class LazyFakeND2:
+        def __init__(self, _p):
+            self.closed = False
+            self.sizes = {'T': 2, 'Y': 6, 'X': 6}
+            self.metadata = None
+
+        def voxel_size(self):
+            return types.SimpleNamespace(x=0.5, y=0.5, z=1.0)
+
+        def _block(self):
+            if self.closed:
+                raise OSError('ND2File already closed')
+            return np.full((2, 6, 6), 7, dtype=np.uint16)
+
+        def to_dask(self):
+            import dask
+
+            return da.from_delayed(dask.delayed(self._block)(), shape=(2, 6, 6), dtype=np.uint16)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            self.closed = True
+            return False
+
+    monkeypatch.setitem(sys.modules, 'nd2', types.SimpleNamespace(ND2File=LazyFakeND2))
+    nd2_p = tmp_path / 'lazy.nd2'
+    nd2_p.write_bytes(b'x')
+    ((nd2_arr, _),) = io.read_nd2_scenes(nd2_p)
+    assert int(np.asarray(nd2_arr[0])[0, 0]) == 7
+
+    # 3. NaN-safe measurements, particles, axis_profile, and traces + RGB traces/roi_masks
+    plane_nan = np.full((8, 8), 10.0, dtype=np.float32)
+    plane_nan[2, 2] = np.nan
+    m = np.zeros((8, 8), dtype=bool)
+    m[2:4, 2:4] = True  # 3 finite pixels of 10.0 + 1 NaN pixel
+    st = ops.mask_stats(plane_nan, m)
+    assert st['Mean'] == pytest.approx(10.0) and st['Area'] == pytest.approx(4.0)
+
+    lab = m.astype(np.int32)
+    pt = ops.particle_table(lab, plane_nan)
+    assert len(pt) == 1 and pt[0]['Mean'] == pytest.approx(10.0)
+
+    mov_nan = np.full((3, 8, 8), 5.0, dtype=np.float32)
+    mov_nan[1, 2, 2] = np.nan
+    np.testing.assert_allclose(ops.axis_profile(mov_nan, 0, (0, 0, 0), m), [5.0, 5.0, 5.0])
+    np.testing.assert_allclose(ops.roi_traces(mov_nan, 0, (0, 0, 0), [m])[0], [5.0, 5.0, 5.0])
+    _, ltr = ops.label_traces(mov_nan, 0, (0, 0, 0), lab)
+    np.testing.assert_allclose(ltr[0], [5.0, 5.0, 5.0])
+
+    rgb_mov = np.full((3, 8, 8, 3), 20, dtype=np.uint8)
+    v_rgb = tiki.open_data(
+        rgb_mov,
+        'rgb_mov.tif',
+        axes=axes_mod.AxesInfo([axes_mod.Axis('T', 3), axes_mod.Axis('Y', 8), axes_mod.Axis('X', 8)], 'test', True),
+        rgb=True,
+    )
+    ok_m, out_m, ns_m = macros.run_code(tiki, "tiki.add_roi([[1, 1], [1, 4], [4, 4], [4, 1]], 'rectangle')\nt = tiki.traces()")
+    assert ok_m, out_m
+    np.testing.assert_allclose(ns_m['t'][0], [20.0, 20.0, 20.0])
+    v_avg = tiki.z_project(v_rgb.layers[0], 'mean', axis=0)
+    assert v_avg.layers[0].data.dtype == np.uint8 and int(v_avg.layers[0].data[0, 0, 0]) == 20
+
+    # 4. Anisotropic TIFF Y/X reload + 1.0 step preservation + 4D sub-volume axes.fit
+    aniso_info = axes_mod.AxesInfo(
+        [axes_mod.Axis('Y', 8, 2.0, 'µm'), axes_mod.Axis('X', 8, 0.5, 'µm')],
+        'test',
+        True,
+    )
+    aniso_p = tmp_path / 'aniso.tif'
+    io.save_tiff(aniso_p, np.zeros((8, 8), dtype=np.uint8), axes=aniso_info)
+    _, aniso_meta = io.read_image(aniso_p)
+    assert aniso_meta['axes'].scale == pytest.approx([2.0, 0.5])
+
+    tzyx = axes_mod.AxesInfo(
+        [axes_mod.Axis('T', 2, 1.0, 's'), axes_mod.Axis('Z', 4, 1.5, 'µm'), axes_mod.Axis('Y', 8, 0.5, 'µm'), axes_mod.Axis('X', 8, 0.5, 'µm')],
+        'test',
+        True,
+    )
+    sub_zyx = axes_mod.fit(tzyx, (4, 8, 8))
+    assert sub_zyx.roles == 'ZYX' and sub_zyx.scale == pytest.approx([1.5, 0.5, 0.5])
+
+    ok_s, out_s, ns_s = macros.run_code(tiki, "w = tiki.show(np.zeros((3, 6, 6)), 'one_sec', axes='TYX', scale=[1.0, 0.5, 0.5])")
+    assert ok_s, out_s
+    assert axes_mod.get(ns_s['w'].layers[0]).axes[0].step == pytest.approx(1.0)
+
+    # 5. Scale bar clamps BOTH drawn length and text label when oversized
+    fig = Figure(figsize=(2, 2))
+    ax = fig.add_subplot()
+    publish.draw_scale_bar(ax, width_px=50, height_px=50, pixel_size=1.0, unit='µm', length=200.0)
+    assert ax.texts[0].get_text() != '200 µm'
+
+    # 6. Symmetric Costes regression + subpixel ROI roundtrip + 1-px thin label + split-channel Crop & Merge
+    rng = np.random.default_rng(5)
+    c1 = rng.uniform(0, 10, (16, 16))
+    c2 = rng.uniform(0, 10, (16, 16))
+    c1[4:12, 4:12] = rng.uniform(40, 120, (8, 8))
+    c2[4:12, 4:12] = 1.5 * c1[4:12, 4:12] + 3.0 + rng.normal(0, 2.0, (8, 8))
+    col_fw = ops.colocalization_stats(c1, c2, costes=True)
+    col_bw = ops.colocalization_stats(c2, c1, costes=True)
+    assert col_fw['Slope'] == pytest.approx(1.0 / col_bw['Slope'], rel=1e-5)
+
+    int_rect = rois_mod.Roi('a/b', 'rectangle', np.array([[2.0, 3.0], [2.0, 7.0], [6.0, 7.0], [6.0, 3.0]]))
+    int_rect2 = rois_mod.Roi('a/b', 'rectangle', np.array([[1.0, 1.0], [1.0, 4.0], [4.0, 4.0], [4.0, 1.0]]))
+    zip_p = rois_mod.save_imagej(tmp_path / 'dup.roi', [int_rect, int_rect2])
+    assert zip_p.suffix == '.zip'
+    loaded_r, _ = rois_mod.load_imagej(zip_p)
+    assert len(loaded_r) == 2
+    np.testing.assert_allclose(loaded_r[0].yx, int_rect.yx, atol=1e-4)
+
+    thin = np.zeros((16, 16), dtype=np.int32)
+    thin[8, 2:12] = 1  # 1-px thin horizontal bar
+    thin_rois = rois_mod.rois_from_labels(thin)
+    assert len(thin_rois) == 1 and len(thin_rois[0].yx) >= 3
+
+    cyx = np.zeros((2, 16, 16), dtype=np.uint16)
+    cyx[0] = 10
+    cyx[1] = 20
+    v_sp = tiki.open_data(
+        cyx,
+        'split_crop.tif',
+        axes=axes_mod.AxesInfo([axes_mod.Axis('C', 2), axes_mod.Axis('Y', 16), axes_mod.Axis('X', 16)], 'test', True),
+    )
+    tiki.split_channels()
+    v_sp.layers[roi.ROI_NAME].add_rectangles(np.array([[[2, 2], [2, 10], [10, 10], [10, 2]]], float))
+    tiki.crop()
+    merged_tif = tmp_path / 'merged_crop.tif'
+    tiki.save_layer(merged_tif, viewer=v_sp, merge_split=True)
+    merged_back, merged_meta = io.read_image(merged_tif)
+    assert merged_back.shape == (2, 8, 8) and merged_meta['axes'].roles == 'CYX'
+    merged_ly = tiki.merge_channels()
+    assert merged_ly.data.shape == (2, 8, 8)
+
+    assert updates.compare_versions('0.2.0rc1', '0.2.0') == -1
+    assert updates.compare_versions('0.2.0', '0.2.0rc1') == 1
+
 
 
 

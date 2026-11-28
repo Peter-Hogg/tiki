@@ -54,7 +54,7 @@ def test_remembered_axes_apply_to_folder(tmp_path):
 
 def test_bad_metadata_falls_back_gently(tmp_path, monkeypatch):
     path = tmp_path / 'x.tif'
-    tifffile.imwrite(path, np.zeros((3, 8, 8), np.uint8))
+    tifffile.imwrite(path, np.zeros((3, 8, 8), np.uint8), photometric='minisblack')
 
     def boom(*a, **k):
         raise ValueError('corrupt tag')

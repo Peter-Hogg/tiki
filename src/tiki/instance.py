@@ -30,17 +30,20 @@ def send_to_running(files: list[str], sample: bool = False, name: str | None = N
     resolved = [str(Path(f).expanduser().resolve()) for f in files]
     payload = json.dumps({'files': resolved, 'sample': bool(sample)}).encode('utf-8') + b'\n'
 
-    if hasattr(socket, 'AF_UNIX'):
+    if os.name == 'posix' and hasattr(socket, 'AF_UNIX'):
         path = Path(tempfile.gettempdir()) / target
-        if path.exists():
-            try:
-                with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
-                    s.settimeout(0.5)
-                    s.connect(str(path))
-                    s.sendall(payload)
-                return True
-            except OSError:
+        if not path.exists():
+            return False
+        try:
+            if hasattr(os, 'getuid') and path.stat().st_uid != os.getuid():
                 return False
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+                s.settimeout(0.5)
+                s.connect(str(path))
+                s.sendall(payload)
+            return True
+        except OSError:
+            return False
 
     from qtpy.QtNetwork import QLocalSocket
 

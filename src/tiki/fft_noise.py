@@ -418,7 +418,21 @@ def inverse_fft_command(tiki):
     spec = image.metadata.get('fft_complex')
     if spec is None:
         process._error('Inverse FFT needs an FFT window created by Process ▸ FFT ▸ FFT')
-    rec = ops.fft_inverse(spec, shape=image.metadata.get('fft_shape'))
+    spec_use = np.asarray(spec)
+    cur_power = np.asarray(image.data, dtype=np.float32)
+    if cur_power.shape == spec_use.shape:
+        orig_power = np.log1p(np.abs(spec_use)).astype(np.float32)
+        if not np.allclose(cur_power, orig_power, equal_nan=True):
+            old_mag = np.abs(spec_use)
+            new_mag = np.where(
+                np.isfinite(cur_power) & (cur_power > 0.0),
+                np.maximum(np.expm1(np.clip(cur_power, 0.0, 80.0)), 0.0),
+                0.0,
+            )
+            with np.errstate(divide='ignore', invalid='ignore'):
+                weight = np.where(old_mag > 0, new_mag / old_mag, 0.0)
+            spec_use = (spec_use * weight).astype(np.complex64)
+    rec = ops.fft_inverse(spec_use, shape=image.metadata.get('fft_shape'))
     src_dict = image.metadata.get('fft_source_axes')
     if isinstance(src_dict, dict):
         src_info = axes_mod.AxesInfo.from_dict(src_dict)

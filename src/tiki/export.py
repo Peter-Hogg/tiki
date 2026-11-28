@@ -54,6 +54,8 @@ def _loader_line(
         return f"import czifile; {var} = czifile.imread({p})"
     if low.endswith('.nd2'):
         return f"import nd2; {var} = nd2.imread({p})"
+    if low.endswith('.lif'):
+        return f"from tiki import io as _tiki_io; {var}, _ = _tiki_io.read_lif({p})"
     if low.endswith('.zarr'):
         if container_key:
             return f"import zarr; {var} = zarr.open({p}, mode='r')[{container_key!r}]"
@@ -78,6 +80,8 @@ def _can_reload_source(image, src: str | None) -> bool:
         return False
     meta = getattr(image, 'metadata', {}) or {}
     if meta.get('modified') or 'split_from' in meta or meta.get('scene') is not None:
+        return False
+    if low.endswith('.lif'):
         return False
     if low.endswith(('.h5', '.hdf5', '.mat')):
         ck = meta.get('container_key')
@@ -206,8 +210,10 @@ def export_session(
             writer = csv.DictWriter(f, fieldnames=list(results_columns))
             writer.writeheader()
             writer.writerows(results_rows)
-        lines.append("results = np.genfromtxt(session / 'results.csv', delimiter=',', names=True, dtype=None, encoding=None)"
-                     "  # or pandas.read_csv")
+        lines.append(
+            "import csv; results = list(csv.DictReader((session / 'results.csv').open(newline='')))"
+            "  # or pandas.read_csv"
+        )
 
     (folder / 'session.json').write_text(json.dumps(manifest, indent=1))
     snippet = '\n'.join(lines) + '\n'

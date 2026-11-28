@@ -114,7 +114,31 @@ def merge(viewer) -> Image:
     if not parts:
         raise TikiError('nothing to merge: this window has no split channels')
     original = parts[0].metadata['split_from']
-    group = [ly for ly in parts if ly.metadata['split_from'] is original]
+    group = sorted(
+        [ly for ly in parts if ly.metadata['split_from'] is original],
+        key=lambda ly: ly.metadata.get('channel', 0),
+    )
+    if any(ly.metadata.get('modified') for ly in group):
+        shapes = {tuple(ly.data.shape) for ly in group}
+        if len(shapes) != 1:
+            raise TikiError('cannot merge split channels with different shapes')
+        info = axes_mod.get(original)
+        c = info.index('C')
+        if c is not None and len(group) == original.data.shape[c]:
+            merged = np.stack([np.asarray(ly.data) for ly in group], axis=c)
+            original.data = merged
+            original.metadata['axes'] = axes_mod.fit(info, merged.shape).to_dict()
+        else:
+            merged = np.stack([np.asarray(ly.data) for ly in group], axis=0)
+            p_info = axes_mod.get(group[0])
+            new_info = axes_mod.AxesInfo(
+                [axes_mod.Axis('C', len(group))] + list(p_info.axes),
+                p_info.source,
+                p_info.confident,
+            )
+            original.data = merged
+            original.metadata['axes'] = new_info.to_dict()
+        original.metadata['modified'] = True
     position = min(viewer.layers.index(ly) for ly in group)
     restore = _keep_position(viewer)
     for ly in group:

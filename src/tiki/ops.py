@@ -236,7 +236,15 @@ def mask_stats(
 ) -> dict:
     """ImageJ-style measurements of ``plane`` inside ``mask`` (whole plane if None)."""
     wanted = DEFAULT_MEASUREMENTS if include is None else set(include)
-    values = plane[mask] if mask is not None else plane.ravel()
+    arr = np.asarray(plane)
+    if arr.ndim == 3 and arr.shape[-1] in (3, 4):
+        rgb3 = np.asarray(arr[..., :3], dtype=np.float64)
+        rgb3 = np.where(np.isfinite(rgb3), rgb3, np.nan)
+        with np.errstate(invalid='ignore'):
+            arr2d = np.nanmean(rgb3, axis=-1)
+    else:
+        arr2d = np.asarray(arr, dtype=np.float64)
+    values = arr2d[mask] if mask is not None else arr2d.ravel()
     values = np.asarray(values, dtype=np.float64)
     if scale is not None:
         sy, sx = float(scale[0]), float(scale[1])
@@ -268,29 +276,28 @@ def mask_stats(
             row['Solidity'] = nan
         return row
 
-    if plane.ndim == 3:
-        n_pixels = int(np.count_nonzero(mask)) if mask is not None else int(plane.shape[0] * plane.shape[1])
-    else:
-        n_pixels = int(values.size)
+    n_pixels = int(np.count_nonzero(mask)) if mask is not None else int(arr2d.shape[0] * arr2d.shape[1])
     area = n_pixels * px_area
-    mean = float(values.mean())
+    finite = values[np.isfinite(values)]
+    nan = float('nan')
+    mean = float(finite.mean()) if finite.size else nan
     row = {}
     if 'Area' in wanted:
         row['Area'] = area
     if 'Mean' in wanted:
         row['Mean'] = mean
     if 'StdDev' in wanted:
-        row['StdDev'] = float(values.std(ddof=1)) if values.size > 1 else 0.0
+        row['StdDev'] = (float(finite.std(ddof=1)) if finite.size > 1 else 0.0) if finite.size else nan
     if 'Min' in wanted:
-        row['Min'] = float(values.min())
+        row['Min'] = float(finite.min()) if finite.size else nan
     if 'Max' in wanted:
-        row['Max'] = float(values.max())
+        row['Max'] = float(finite.max()) if finite.size else nan
     if 'Median' in wanted:
-        row['Median'] = float(np.median(values))
+        row['Median'] = float(np.median(finite)) if finite.size else nan
     if 'IntDen' in wanted:
-        row['IntDen'] = area * mean
+        row['IntDen'] = area * mean if finite.size else nan
     if 'RawIntDen' in wanted:
-        row['RawIntDen'] = float(values.sum())
+        row['RawIntDen'] = float(finite.sum()) if finite.size else nan
 
     shape_keys = {'Centroid', 'Perimeter', 'Circularity', 'Feret', 'AR', 'Solidity'}
     if wanted & shape_keys:
@@ -339,9 +346,16 @@ def axis_profile(
     (spatial) axes are ignored. Only the mask's bounding box is read from disk.
     """
     ndim = data.ndim
-    axis = axis % ndim
+    is_rgb = (
+        mask is not None
+        and ndim >= 4
+        and data.shape[-1] in (3, 4)
+        and mask.shape == data.shape[-3:-1]
+    )
+    eff_ndim = ndim - 1 if is_rgb else ndim
+    axis = axis % eff_ndim
     if mask is None:
-        mask = np.ones(data.shape[-2:], dtype=bool)
+        mask = np.ones(data.shape[-3:-1] if is_rgb else data.shape[-2:], dtype=bool)
     rows = np.flatnonzero(mask.any(axis=1))
     cols = np.flatnonzero(mask.any(axis=0))
     if rows.size == 0:
@@ -353,10 +367,21 @@ def axis_profile(
     for t0 in range(0, data.shape[axis], chunk):
         t1 = min(t0 + chunk, data.shape[axis])
         sl = []
-        for d in range(ndim - 2):
+        for d in range(eff_ndim - 2):
             sl.append(slice(t0, t1) if d == axis else int(index[d]))
-        block = np.asarray(data[tuple(sl) + (ys, xs)], dtype=np.float64)
-        out[t0:t1] = block[:, sub_mask].mean(axis=1)
+        spatial_sl = (ys, xs, slice(0, 3)) if is_rgb else (ys, xs)
+        block = np.asarray(data[tuple(sl) + spatial_sl], dtype=np.float64)
+        if is_rgb:
+            block = np.where(np.isfinite(block), block, np.nan)
+            with np.errstate(invalid='ignore'):
+                block = np.nanmean(block, axis=-1)
+        vals = block[:, sub_mask]
+        if np.isfinite(vals).all():
+            out[t0:t1] = vals.mean(axis=1)
+        else:
+            vals = np.where(np.isfinite(vals), vals, np.nan)
+            with np.errstate(invalid='ignore'):
+                out[t0:t1] = np.nanmean(vals, axis=1)
     return out
 
 
@@ -503,15 +528,23 @@ def particle_table(labels: np.ndarray, intensity: np.ndarray, scale=(1.0, 1.0)) 
 
     labels = np.asarray(labels).astype(np.int32, copy=False)
     intensity = np.asarray(intensity)
+    if intensity.ndim == labels.ndim + 1 and intensity.shape[-1] in (3, 4):
+        rgb_f = np.asarray(intensity[..., :3], dtype=np.float64)
+        rgb_f = np.where(np.isfinite(rgb_f), rgb_f, np.nan)
+        with np.errstate(invalid='ignore'):
+            intensity = np.nanmean(rgb_f, axis=-1)
     scale = tuple(float(s) for s in scale)
     if len(scale) < labels.ndim:
         scale = (1.0,) * (labels.ndim - len(scale)) + scale
     else:
         scale = scale[-labels.ndim:]
+    nan = float('nan')
     rows = []
     if labels.ndim == 3:
         for region in regionprops(labels, intensity, spacing=scale):
             vals = region.image_intensity[region.image].astype(np.float64)
+            finite = vals[np.isfinite(vals)]
+            mean_v = float(finite.mean()) if finite.size else nan
             cz, cy, cx = region.centroid  # physical units (spacing applied)
             major, minor = region.axis_major_length, region.axis_minor_length
             volume = float(region.area)
@@ -519,13 +552,13 @@ def particle_table(labels: np.ndarray, intensity: np.ndarray, scale=(1.0, 1.0)) 
                 'Label': int(region.label),
                 'Volume': volume,
                 'Voxels': int(region.image.sum()),
-                'Mean': float(vals.mean()),
-                'StdDev': float(vals.std(ddof=1)) if vals.size > 1 else 0.0,
-                'Min': float(vals.min()),
-                'Max': float(vals.max()),
+                'Mean': mean_v,
+                'StdDev': (float(finite.std(ddof=1)) if finite.size > 1 else 0.0) if finite.size else nan,
+                'Min': float(finite.min()) if finite.size else nan,
+                'Max': float(finite.max()) if finite.size else nan,
                 'X': cx, 'Y': cy, 'Z': cz,
-                'AR': major / minor if minor > 0 else float('nan'),
-                'IntDen': volume * float(vals.mean()),
+                'AR': major / minor if minor > 0 else nan,
+                'IntDen': volume * mean_v if finite.size else nan,
             })
         return rows
     sy, sx = scale
@@ -533,6 +566,8 @@ def particle_table(labels: np.ndarray, intensity: np.ndarray, scale=(1.0, 1.0)) 
     iterable = regionprops(labels, intensity) if iso else regionprops(labels, intensity, spacing=(sy, sx))
     for region in iterable:
         vals = region.image_intensity[region.image].astype(np.float64)
+        finite = vals[np.isfinite(vals)]
+        mean_v = float(finite.mean()) if finite.size else nan
         area_px = float(region.image.sum())
         area_phys = area_px * sy * sx
         cy, cx = region.centroid
@@ -551,18 +586,18 @@ def particle_table(labels: np.ndarray, intensity: np.ndarray, scale=(1.0, 1.0)) 
         rows.append({
             'Label': int(region.label),
             'Area': area_phys,
-            'Mean': float(vals.mean()),
-            'StdDev': float(vals.std(ddof=1)) if vals.size > 1 else 0.0,
-            'Min': float(vals.min()),
-            'Max': float(vals.max()),
+            'Mean': mean_v,
+            'StdDev': (float(finite.std(ddof=1)) if finite.size > 1 else 0.0) if finite.size else nan,
+            'Min': float(finite.min()) if finite.size else nan,
+            'Max': float(finite.max()) if finite.size else nan,
             'X': x_val,
             'Y': y_val,
             'Perim.': perim_phys,
             'Circ.': min(1.0, 4 * np.pi * area_phys / perim_phys**2) if perim_phys > 0 else 1.0,
             'Feret': feret_phys,
-            'AR': major / minor if minor > 0 else float('nan'),
+            'AR': major / minor if minor > 0 else nan,
             'Solidity': sol,
-            'IntDen': area_phys * float(vals.mean()),
+            'IntDen': area_phys * mean_v if finite.size else nan,
         })
     return rows
 
@@ -579,7 +614,14 @@ def roi_traces(data, axis: int, index: tuple, masks: list[np.ndarray], chunk: in
     Reads each chunk of frames once (only the union bounding box of all masks)
     however many ROIs there are. ``progress(done, total)`` may return False to cancel.
     """
-    axis = axis % data.ndim
+    is_rgb = (
+        bool(masks)
+        and data.ndim >= 4
+        and data.shape[-1] in (3, 4)
+        and np.asarray(masks[0]).shape == data.shape[-3:-1]
+    )
+    eff_ndim = data.ndim - 1 if is_rgb else data.ndim
+    axis = axis % eff_ndim
     n_t = data.shape[axis]
     out = np.full((len(masks), n_t), np.nan)
     if not masks:
@@ -590,13 +632,25 @@ def roi_traces(data, axis: int, index: tuple, masks: list[np.ndarray], chunk: in
         return out
     ys, xs = slice(rows[0], rows[-1] + 1), slice(cols[0], cols[-1] + 1)
     flat_idx = [np.flatnonzero(m[ys, xs].ravel()) for m in masks]
+    spatial_sl = (ys, xs, slice(0, 3)) if is_rgb else (ys, xs)
     for t0 in range(0, n_t, chunk):
         t1 = min(t0 + chunk, n_t)
-        block = np.asarray(data[_lead_slices(data.ndim, axis, index, t0, t1) + (ys, xs)], dtype=np.float64)
+        block = np.asarray(data[_lead_slices(eff_ndim, axis, index, t0, t1) + spatial_sl], dtype=np.float64)
+        if is_rgb:
+            block = np.where(np.isfinite(block), block, np.nan)
+            with np.errstate(invalid='ignore'):
+                block = np.nanmean(block, axis=-1)
         block = block.reshape(t1 - t0, -1)
+        all_fin = bool(np.isfinite(block).all())
+        if not all_fin:
+            block = np.where(np.isfinite(block), block, np.nan)
         for i, idx in enumerate(flat_idx):
             if idx.size:
-                out[i, t0:t1] = block[:, idx].mean(axis=1)
+                if all_fin:
+                    out[i, t0:t1] = block[:, idx].mean(axis=1)
+                else:
+                    with np.errstate(invalid='ignore'):
+                        out[i, t0:t1] = np.nanmean(block[:, idx], axis=1)
         if progress is not None and progress(t1, n_t) is False:
             break
     return out
@@ -604,8 +658,10 @@ def roi_traces(data, axis: int, index: tuple, masks: list[np.ndarray], chunk: in
 
 def label_traces(data, axis: int, index: tuple, labels: np.ndarray, chunk: int = 256, progress=None):
     """Mean of every label in a 2D label image at each frame: ``(ids, (n_ids, n_frames))``."""
-    axis = axis % data.ndim
     labels = np.asarray(labels)
+    is_rgb = data.ndim >= 4 and data.shape[-1] in (3, 4) and labels.shape == data.shape[-3:-1]
+    eff_ndim = data.ndim - 1 if is_rgb else data.ndim
+    axis = axis % eff_ndim
     ids = np.unique(labels)
     ids = ids[ids > 0]
     n_t = data.shape[axis]
@@ -626,13 +682,28 @@ def label_traces(data, axis: int, index: tuple, labels: np.ndarray, chunk: int =
         lab = np.zeros(flat_labels.size, dtype=np.int64)
         lab[pos] = np.searchsorted(ids, flat_labels[pos]) + 1
     counts = np.bincount(lab, minlength=ids.size + 1)[1:].astype(np.float64)
+    tail_sl = (slice(None), slice(None), slice(0, 3)) if is_rgb else ()
     for t0 in range(0, n_t, chunk):
         t1 = min(t0 + chunk, n_t)
-        block = np.asarray(data[_lead_slices(data.ndim, axis, index, t0, t1)], dtype=np.float64)
+        block = np.asarray(data[_lead_slices(eff_ndim, axis, index, t0, t1) + tail_sl], dtype=np.float64)
+        if is_rgb:
+            block = np.where(np.isfinite(block), block, np.nan)
+            with np.errstate(invalid='ignore'):
+                block = np.nanmean(block, axis=-1)
         block = block.reshape(t1 - t0, -1)
         for j in range(t1 - t0):
-            sums = np.bincount(lab, weights=block[j], minlength=ids.size + 1)[1:]
-            out[:, t0 + j] = sums / counts
+            row_j = block[j]
+            if np.isfinite(row_j).all():
+                sums = np.bincount(lab, weights=row_j, minlength=ids.size + 1)[1:]
+                out[:, t0 + j] = sums / counts
+            else:
+                fin = np.isfinite(row_j)
+                lab_j = np.where(fin, lab, 0)
+                w_j = np.where(fin, row_j, 0.0)
+                sums = np.bincount(lab_j, weights=w_j, minlength=ids.size + 1)[1:]
+                cnts = np.bincount(lab_j, minlength=ids.size + 1)[1:].astype(np.float64)
+                with np.errstate(invalid='ignore', divide='ignore'):
+                    out[:, t0 + j] = np.where(cnts > 0, sums / cnts, np.nan)
         if progress is not None and progress(t1, n_t) is False:
             break
     return ids, out
@@ -1974,17 +2045,16 @@ def orthogonal_slices(
     - ``xz``: shape ``(Z, X[, C])`` at row ``y`` (aligns below ``xy``)
     - ``yz``: shape ``(Y, Z[, C])`` at column ``x`` (aligns right of ``xy``)
     """
-    arr = np.asarray(data)
     expected_ndim = 4 if rgb else 3
-    if arr.ndim != expected_ndim:
-        raise ValueError(f'expected {expected_ndim}D volume for orthogonal views, got {arr.ndim}D')
-    nz, ny, nx = arr.shape[:3]
+    if data.ndim != expected_ndim:
+        raise ValueError(f'expected {expected_ndim}D volume for orthogonal views, got {data.ndim}D')
+    nz, ny, nx = data.shape[:3]
     z = int(np.clip(z, 0, nz - 1))
     y = int(np.clip(y, 0, ny - 1))
     x = int(np.clip(x, 0, nx - 1))
-    xy = arr[z]
-    xz = arr[:, y, :]
-    yz_raw = arr[:, :, x]  # (Z, Y[, C])
+    xy = np.asarray(data[z])
+    xz = np.asarray(data[:, y, :])
+    yz_raw = np.asarray(data[:, :, x])  # (Z, Y[, C])
     yz = np.swapaxes(yz_raw, 0, 1)  # (Y, Z[, C])
     return xy, xz, yz
 
@@ -3095,31 +3165,42 @@ def _pearson(a: np.ndarray, b: np.ndarray) -> float:
     return float(np.dot(ac, bc) / denom)
 
 
+def _ortho_line(a: np.ndarray, b: np.ndarray) -> tuple[float, float]:
+    """Symmetric orthogonal (major-axis) regression line ``b = slope * a + intercept``."""
+    am, bm = float(a.mean()), float(b.mean())
+    ac = a - am
+    bc = b - bm
+    sxx = float(np.dot(ac, ac))
+    syy = float(np.dot(bc, bc))
+    sxy = float(np.dot(ac, bc))
+    if sxx <= 0.0:
+        return 0.0, bm
+    if abs(sxy) <= 1e-15 * max(sxx, syy, 1.0):
+        return 0.0, bm
+    slope = (syy - sxx + float(np.sqrt((syy - sxx) ** 2 + 4.0 * sxy * sxy))) / (2.0 * sxy)
+    return slope, float(bm - slope * am)
+
+
 def _costes_thresholds(a: np.ndarray, b: np.ndarray) -> tuple[float, float, float, float]:
-    """Return ``(t1, t2, slope, intercept)`` using Costes automatic regression bisection."""
+    """Return ``(t1, t2, slope, intercept)`` using Costes et al. (2004) orthogonal regression."""
     if a.size < 4:
         return 0.0, 0.0, 1.0, 0.0
-    ac = a - a.mean()
-    bc = b - b.mean()
-    var_a = float(np.dot(ac, ac))
-    if var_a <= 0.0:
+    if float(np.dot(a - a.mean(), a - a.mean())) <= 0.0:
         return float(a.min()), float(b.min()), 0.0, float(b.mean())
-    slope = float(np.dot(ac, bc) / var_a)
-    intercept = float(b.mean() - slope * a.mean())
+    slope, intercept = _ortho_line(a, b)
     if slope <= 0.0:
         return 0.0, 0.0, slope, intercept
 
-    qs = np.unique(np.quantile(a, np.linspace(0.0, 1.0, 256)))
+    grid = np.linspace(float(a.min()), float(a.max()), 256)
+    qs = np.unique(np.concatenate([np.quantile(a, np.linspace(0.0, 1.0, 256)), grid]))
     if qs.size < 2:
         return float(a.min()), float(b.min()), slope, intercept
 
     best_t1 = float(qs[0])
-    lo_idx, hi_idx = 0, len(qs) - 1
-    while lo_idx <= hi_idx:
-        mid = (lo_idx + hi_idx) // 2
-        t1 = float(qs[mid])
+    for cand in qs[::-1]:
+        t1 = float(cand)
         t2 = slope * t1 + intercept
-        below = (a <= t1) & (b <= t2)
+        below = (a <= t1) | (b <= t2)
         if int(below.sum()) < 3:
             r_sub = 0.0
         else:
@@ -3128,9 +3209,7 @@ def _costes_thresholds(a: np.ndarray, b: np.ndarray) -> tuple[float, float, floa
                 r_sub = 0.0
         if r_sub <= 0.0:
             best_t1 = t1
-            lo_idx = mid + 1
-        else:
-            hi_idx = mid - 1
+            break
     best_t2 = slope * best_t1 + intercept
     return float(best_t1), float(best_t2), slope, intercept
 

@@ -25,8 +25,10 @@ dependencies = [
     "napari[pyqt6]>=0.9",  # uses 0.9 APIs (layer units, canvas overlays); tested on 0.9.2
     "numpy",
     "tifffile",
+    "imagecodecs",
     "czifile",
     "scikit-image",
+    "pooch",
     "matplotlib",
     "roifile",
     "scipy",

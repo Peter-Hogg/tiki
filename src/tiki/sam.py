@@ -221,7 +221,7 @@ class _SamSidecar:
         self._on_status = on_status
         self._proc: subprocess.Popen | None = None
         self._tmpdir: tempfile.TemporaryDirectory | None = None
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
         self._stderr_tail: list[str] = []
 
     @property
@@ -242,6 +242,13 @@ class _SamSidecar:
         else:
             uv_bin = shutil.which('uv')
             cmd = [uv_bin, 'run', '--no-project', '--with', 'ultralytics', '--with', 'numpy', 'python', str(script)]
+        cache_base = Path(os.environ.get('XDG_CACHE_HOME') or (Path.home() / '.cache'))
+        weights_dir = cache_base / 'tiki' / 'sam'
+        try:
+            weights_dir.mkdir(parents=True, exist_ok=True)
+            proc_cwd = str(weights_dir)
+        except OSError:
+            proc_cwd = self._tmpdir.name
         if self._on_status:
             self._on_status('Starting SAM worker (first run downloads model/PyTorch)…')
         self._proc = subprocess.Popen(
@@ -251,6 +258,7 @@ class _SamSidecar:
             stderr=subprocess.PIPE,
             text=True,
             bufsize=1,
+            cwd=proc_cwd,
         )
         threading.Thread(target=self._drain_stderr, daemon=True).start()
 
@@ -293,26 +301,27 @@ class _SamSidecar:
         return Path(self._tmpdir.name)
 
     def close(self) -> None:
-        proc = self._proc
-        self._proc = None
-        if proc is not None and proc.poll() is None:
-            try:
-                if proc.stdin:
-                    proc.stdin.write(json.dumps({'cmd': 'quit'}) + '\n')
-                    proc.stdin.flush()
-                proc.wait(timeout=2)
-            except Exception:
-                proc.terminate()
+        with self._lock:
+            proc = self._proc
+            self._proc = None
+            if proc is not None and proc.poll() is None:
                 try:
+                    if proc.stdin:
+                        proc.stdin.write(json.dumps({'cmd': 'quit'}) + '\n')
+                        proc.stdin.flush()
                     proc.wait(timeout=2)
                 except Exception:
-                    proc.kill()
-        if self._tmpdir is not None:
-            try:
-                self._tmpdir.cleanup()
-            except Exception:
-                pass
-            self._tmpdir = None
+                    proc.terminate()
+                    try:
+                        proc.wait(timeout=2)
+                    except Exception:
+                        proc.kill()
+            if self._tmpdir is not None:
+                try:
+                    self._tmpdir.cleanup()
+                except Exception:
+                    pass
+                self._tmpdir = None
 
 
 class _SamCallThread(QThread):
@@ -377,6 +386,7 @@ class SamWindow(QWidget):
         self.box_btn = QPushButton('▭ Draw Box')
         for b in (self.pos_btn, self.neg_btn, self.box_btn):
             b.setCheckable(True)
+            b.clicked.connect(lambda _=False: self.tiki.set_tool('hand') if self.tiki.tool != 'hand' else None)
         self.pos_btn.setChecked(True)
         grp = QButtonGroup(self)
         grp.addButton(self.pos_btn)
@@ -571,7 +581,7 @@ class SamWindow(QWidget):
             return
         if viewer.dims.ndisplay != 2:
             return
-        if self.tiki.tool in ('rect', 'oval', 'polygon', 'freehand', 'line', 'polyline', 'brush', 'eraser'):
+        if self.tiki.tool != 'hand':
             return
         h, w = self.image.data.shape[-3:-1] if self.image.rgb else self.image.data.shape[-2:]
 
@@ -674,14 +684,19 @@ class SamWindow(QWidget):
 
     # --------------------------------------------------------- sidecar calls
 
+    def _current_plane_rgb(self) -> np.ndarray:
+        assert self.viewer is not None and self.image is not None
+        idx = roi_mod.current_index(self.viewer, self.image)
+        plane = np.asarray(self.image.data[idx[:-2]])
+        return _to_rgb_uint8(plane)
+
     def _ensure_plane_file(self) -> Path:
         assert self.viewer is not None and self.image is not None
         step = tuple(self.viewer.dims.current_step)
-        key = (id(self.image), step)
+        key = (id(self.image), id(self.image.data), tuple(self.image.data.shape), step)
         img_path = self._sidecar.workdir / 'plane.npy'
         if self._cached_plane_key != key or not img_path.exists():
-            plane = roi_mod.current_plane(self.viewer, self.image)
-            np.save(img_path, _to_rgb_uint8(plane))
+            np.save(img_path, self._current_plane_rgb())
             self._cached_plane_key = key
         return img_path
 
@@ -718,10 +733,15 @@ class SamWindow(QWidget):
         pts = [[x, y] for x, y in self._points]
         lbls = list(self._point_labels)
         bboxes = list(self._bboxes)
+        plane_rgb = self._current_plane_rgb()
+        plane_key = (id(req_image), id(req_image.data), tuple(req_image.data.shape), req_step)
         self._set_status(f'Predicting ({self.model_box.currentText()})…')
 
         def _work():
-            img_path = self._ensure_plane_file()
+            img_path = self._sidecar.workdir / 'plane.npy'
+            if self._cached_plane_key != plane_key or not img_path.exists():
+                np.save(img_path, plane_rgb)
+                self._cached_plane_key = plane_key
             out_path = self._sidecar.workdir / 'mask.npy'
             resp = self._sidecar.request({
                 'cmd': 'predict',
@@ -786,13 +806,13 @@ class SamWindow(QWidget):
         self._remove_overlays()
         self._set_status('Prompts cleared — click image to segment next object')
 
-    def _target_labels_layer(self, ndim: int = 2) -> Labels:
+    def _target_labels_layer(self, ndim: int = 2) -> tuple[Labels, bool]:
         assert self.viewer is not None and self.image is not None
         name = f'{self.image.name} sam'
         if name in self.viewer.layers and isinstance(self.viewer.layers[name], Labels):
             ly = self.viewer.layers[name]
             if ly.ndim == ndim:
-                return ly
+                return ly, True
         shape = self.image.data.shape[: self.image.ndim] if ndim == self.image.ndim else (
             self.image.data.shape[-3:-1] if self.image.rgb else self.image.data.shape[-2:]
         )
@@ -800,7 +820,7 @@ class SamWindow(QWidget):
         ly = Labels(np.zeros(shape, dtype=np.int32), name=name, opacity=0.6, **geom)
         self.viewer.add_layer(ly)
         self.tiki.push_undo_layer('Interactive SAM', self.viewer, ly)
-        return ly
+        return ly, False
 
     def _accept_object(self) -> None:
         if self.viewer is None or self.image is None or self._last_mask is None or not self._last_mask.any():
@@ -811,8 +831,10 @@ class SamWindow(QWidget):
             self._clear_prompts()
             self._set_status('Preview was from a different image or slice and was cleared.')
             return
-        ly = self._target_labels_layer(ndim=self.image.ndim)
-        arr = np.asarray(ly.data)
+        ly, existed = self._target_labels_layer(ndim=self.image.ndim)
+        if existed:
+            self.tiki.push_undo_data('Interactive SAM', self.viewer, ly)
+        arr = np.array(ly.data, copy=True)
         next_id = int(arr.max()) + 1
         if ly.ndim == 2:
             arr[self._last_mask > 0] = next_id
@@ -833,10 +855,15 @@ class SamWindow(QWidget):
         self._req_gen += 1
         gen = self._req_gen
         model_file = SAM_MODELS[self.model_box.currentText()]
+        plane_rgb = self._current_plane_rgb()
+        plane_key = (id(req_image), id(req_image.data), tuple(req_image.data.shape), req_step)
         self._set_status(f'Auto-segmenting plane ({self.model_box.currentText()})…')
 
         def _work():
-            img_path = self._ensure_plane_file()
+            img_path = self._sidecar.workdir / 'plane.npy'
+            if self._cached_plane_key != plane_key or not img_path.exists():
+                np.save(img_path, plane_rgb)
+                self._cached_plane_key = plane_key
             out_path = self._sidecar.workdir / 'auto_labels.npy'
             resp = self._sidecar.request({
                 'cmd': 'auto',
@@ -915,8 +942,10 @@ class SamWindow(QWidget):
                 or req_image not in req_viewer.layers
             ):
                 return
-            ly = self._target_labels_layer(ndim=req_image.ndim)
-            arr = np.asarray(ly.data)
+            ly, existed = self._target_labels_layer(ndim=req_image.ndim)
+            if existed:
+                self.tiki.push_undo_data('Interactive SAM', self.viewer, ly)
+            arr = np.array(ly.data, copy=True)
             next_id = int(arr.max()) + 1
             for t in range(n_frames):
                 sl = tuple(t if d == axis else int(index[d]) for d in range(lead))

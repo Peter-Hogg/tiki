@@ -107,7 +107,8 @@ def _run_stardist_local(arr: np.ndarray, params: dict) -> np.ndarray:
     prob_thresh = params.get('prob_thresh')
     nms_thresh = params.get('nms_thresh')
     model = StarDist2D.from_pretrained(model_name)
-    norm = normalize(np.asarray(arr, dtype=np.float32), 1.0, 99.8)
+    f_arr = np.asarray(arr, dtype=np.float32)
+    norm = normalize(f_arr, 1.0, 99.8, axis=(0, 1)) if f_arr.ndim == 3 else normalize(f_arr, 1.0, 99.8)
     kw: dict = {}
     if prob_thresh is not None and float(prob_thresh) > 0:
         kw['prob_thresh'] = float(prob_thresh)
@@ -119,54 +120,83 @@ def _run_stardist_local(arr: np.ndarray, params: dict) -> np.ndarray:
 
 _UV_RUNNER_SCRIPT = textwrap.dedent(
     """\
-    import json, sys
+    import json, os, sys
     import numpy as np
 
     backend, in_path, out_path, params_path = sys.argv[1:5]
-    arr = np.load(in_path)
     with open(params_path, 'r', encoding='utf-8') as f:
         params = json.load(f)
+
+    use_gpu = bool(params.get('use_gpu', True))
+    if not use_gpu:
+        os.environ['CUDA_VISIBLE_DEVICES'] = '-1'
+
+    is_batch = in_path.endswith('.npz')
+    if is_batch:
+        npz = np.load(in_path)
+        items = [npz[f'b_{i}'] for i in range(int(params.get('n_blocks', len(npz.files))))]
+    else:
+        items = [np.load(in_path)]
 
     if backend == 'Cellpose':
         from cellpose import models
         model_name = str(params.get('model') or 'cyto3')
         diameter = float(params.get('diameter') or 0.0)
         diam_arg = diameter if diameter > 0 else None
-        do_3d = bool(params.get('do_3d', False)) and arr.ndim == 3
-        use_gpu = bool(params.get('use_gpu', True))
         anisotropy = params.get('anisotropy')
         try:
             model = models.CellposeModel(gpu=use_gpu, pretrained_model=model_name)
         except Exception:
             model = models.CellposeModel(gpu=use_gpu, model_type=model_name)
-        eval_kw = {'diameter': diam_arg, 'do_3D': do_3d}
-        if do_3d and anisotropy and float(anisotropy) > 0:
-            eval_kw['anisotropy'] = float(anisotropy)
-        try:
-            res = model.eval(arr, **eval_kw)
-        except TypeError:
-            eval_kw['channels'] = [0, 0]
-            res = model.eval(arr, **eval_kw)
-        masks = res[0] if isinstance(res, tuple) else res
-        out = np.asarray(masks, dtype=np.int32)
+
+        def _eval_one(arr):
+            do_3d = bool(params.get('do_3d', False)) and arr.ndim == 3
+            eval_kw = {'diameter': diam_arg, 'do_3D': do_3d}
+            if do_3d and anisotropy and float(anisotropy) > 0:
+                eval_kw['anisotropy'] = float(anisotropy)
+            try:
+                res = model.eval(arr, **eval_kw)
+            except TypeError:
+                eval_kw['channels'] = [0, 0]
+                res = model.eval(arr, **eval_kw)
+            masks = res[0] if isinstance(res, tuple) else res
+            return np.asarray(masks, dtype=np.int32)
     elif backend == 'StarDist':
         from csbdeep.utils import normalize
         from stardist.models import StarDist2D
         model_name = str(params.get('model') or '2D_versatile_fluo')
+        prob_thresh = params.get('prob_thresh')
+        nms_thresh = params.get('nms_thresh')
         model = StarDist2D.from_pretrained(model_name)
-        norm = normalize(np.asarray(arr, dtype=np.float32), 1.0, 99.8)
-        out, _ = model.predict_instances(norm)
-        out = np.asarray(out, dtype=np.int32)
+        kw = {}
+        if prob_thresh is not None and float(prob_thresh) > 0:
+            kw['prob_thresh'] = float(prob_thresh)
+        if nms_thresh is not None and float(nms_thresh) > 0:
+            kw['nms_thresh'] = float(nms_thresh)
+
+        def _eval_one(arr):
+            f_arr = np.asarray(arr, dtype=np.float32)
+            norm = normalize(f_arr, 1.0, 99.8, axis=(0, 1)) if f_arr.ndim == 3 else normalize(f_arr, 1.0, 99.8)
+            labels, _ = model.predict_instances(norm, **kw)
+            return np.asarray(labels, dtype=np.int32)
     else:
         raise ValueError(f'Unknown backend: {backend}')
 
-    np.save(out_path, out)
+    if is_batch:
+        outs = {}
+        total = len(items)
+        for idx, item in enumerate(items):
+            print(f'TIKI_PROGRESS {idx + 1}/{total}', file=sys.stderr, flush=True)
+            outs[f'b_{idx}'] = _eval_one(item)
+        np.savez(out_path, **outs)
+    else:
+        np.save(out_path, _eval_one(items[0]))
     """
 )
 
 
-def _run_via_uv(backend: str, arr: np.ndarray, params: dict, progress=None) -> np.ndarray | None:
-    """Execute segmentation in an isolated ``uv run --with <pkg>`` subprocess."""
+def _run_uv_batch(backend: str, arrays: list[np.ndarray], params: dict, progress=None) -> list[np.ndarray] | None:
+    """Execute segmentation on one or more arrays inside a single warm ``uv run`` subprocess."""
     import threading
 
     uv_bin = shutil.which('uv')
@@ -174,14 +204,19 @@ def _run_via_uv(backend: str, arr: np.ndarray, params: dict, progress=None) -> n
         raise RuntimeError(f'uv is not on PATH and {BACKENDS[backend]["package"]} is not installed.')
 
     spec = BACKENDS[backend]
+    is_batch = len(arrays) > 1
     with tempfile.TemporaryDirectory(prefix='tiki_ai_') as td:
         tmp = Path(td)
-        in_path = tmp / 'input.npy'
-        out_path = tmp / 'output.npy'
+        in_path = tmp / ('inputs.npz' if is_batch else 'input.npy')
+        out_path = tmp / ('outputs.npz' if is_batch else 'output.npy')
         params_path = tmp / 'params.json'
         script_path = tmp / 'runner.py'
-        np.save(in_path, np.asarray(arr))
-        params_path.write_text(json.dumps(params), encoding='utf-8')
+        if is_batch:
+            np.savez(in_path, **{f'b_{i}': np.asarray(a) for i, a in enumerate(arrays)})
+        else:
+            np.save(in_path, np.asarray(arrays[0]))
+        run_params = dict(params, n_blocks=len(arrays))
+        params_path.write_text(json.dumps(run_params), encoding='utf-8')
         script_path.write_text(_UV_RUNNER_SCRIPT, encoding='utf-8')
 
         cmd = [uv_bin, 'run', '--no-project']
@@ -210,12 +245,22 @@ def _run_via_uv(backend: str, arr: np.ndarray, params: dict, progress=None) -> n
             env=env,
         )
         stderr_lines: list[str] = []
+        done_count = [0]
 
         def _drain_stderr() -> None:
             assert proc.stderr is not None
             for raw_line in proc.stderr:
                 line = raw_line.strip()
                 if not line:
+                    continue
+                if line.startswith('TIKI_PROGRESS '):
+                    try:
+                        cur_s, tot_s = line.split()[1].split('/')
+                        done_count[0] = int(cur_s)
+                        if set_label is not None:
+                            set_label(f'{backend}: slice {cur_s}/{tot_s}')
+                    except Exception:
+                        pass
                     continue
                 stderr_lines.append(line)
                 if len(stderr_lines) > 200:
@@ -227,8 +272,9 @@ def _run_via_uv(backend: str, arr: np.ndarray, params: dict, progress=None) -> n
         drainer = threading.Thread(target=_drain_stderr, daemon=True)
         drainer.start()
 
+        total_n = len(arrays) if is_batch else 0
         while proc.poll() is None:
-            if progress is not None and progress(0, 0) is False:
+            if progress is not None and progress(done_count[0], total_n) is False:
                 proc.terminate()
                 try:
                     proc.wait(timeout=3)
@@ -244,7 +290,16 @@ def _run_via_uv(backend: str, arr: np.ndarray, params: dict, progress=None) -> n
             raise RuntimeError(f'{backend} (uv) failed (exit {proc.returncode}):\n{tail}')
         if not out_path.exists():
             raise RuntimeError(f'{backend} finished without writing output labels.')
-        return np.asarray(np.load(out_path), dtype=np.int32)
+        if is_batch:
+            with np.load(out_path) as npz_out:
+                return [np.asarray(npz_out[f'b_{i}'], dtype=np.int32) for i in range(len(arrays))]
+        return [np.asarray(np.load(out_path), dtype=np.int32)]
+
+
+def _run_via_uv(backend: str, arr: np.ndarray, params: dict, progress=None) -> np.ndarray | None:
+    """Execute segmentation in an isolated ``uv run --with <pkg>`` subprocess."""
+    res = _run_uv_batch(backend, [arr], params, progress=progress)
+    return None if res is None else res[0]
 
 
 def run_segmentation(
@@ -271,7 +326,21 @@ def run_segmentation(
             progress(1, 1)
         return res
 
-    out = np.zeros(data.shape, dtype=np.int32)
+    out_shape = data.shape[:-1] if (data.ndim == len(blocks[0]) + 1 and data.shape[-1] in (3, 4)) else data.shape
+    out = np.zeros(out_shape, dtype=np.int32)
+    if mode == 'uv' and len(blocks) > 1:
+        slices = [np.asarray(data[blk]) for blk in blocks]
+        results = _run_uv_batch(backend, slices, params, progress=progress)
+        if results is None:
+            return None
+        next_id = 0
+        for blk, res in zip(blocks, results):
+            if res.max():
+                res[res > 0] += next_id
+                next_id = int(res.max())
+            out[blk] = res
+        return out
+
     next_id = 0
     for n, blk in enumerate(blocks, 1):
         res = _run_one(np.asarray(data[blk]))
@@ -289,10 +358,6 @@ def run_segmentation(
 def ai_segmentation_dialog(tiki) -> Labels | None:
     """``Process ▸ Labels ▸ AI Segmentation…`` dialog."""
     viewer, image = tiki.require_image()
-    if image.rgb and image.ndim > 2:
-        from .app import TikiError
-
-        raise TikiError('AI segmentation on RGB stacks is not supported yet; split channels or use a 2D image')
 
     dlg = QDialog(tiki)
     style.apply(dlg)
@@ -339,7 +404,7 @@ def ai_segmentation_dialog(tiki) -> Labels | None:
         scope_box.clear()
         scope_box.addItem('Current plane (2D)', nd.PLANE)
         if cur_img.ndim > 2:
-            if spec['supports_3d'] and info.index('Z') is not None:
+            if spec['supports_3d'] and info.index('Z') is not None and not cur_img.rgb:
                 scope_box.addItem('Current Z volume (3D)', nd.VOLUME)
             scope_box.addItem('Whole stack (plane-by-plane)', nd.WHOLE)
 
@@ -379,8 +444,17 @@ def ai_segmentation_dialog(tiki) -> Labels | None:
         if zr and zr > 0:
             params['anisotropy'] = float(1.0 / zr)
 
+    want_rgb = params['model'] == '2D_versatile_he'
+    if want_rgb and not target.rgb:
+        from .app import TikiError
+
+        raise TikiError('StarDist 2D_versatile_he requires an RGB image (use 2D_versatile_fluo for greyscale images)')
+
     if scope == nd.PLANE or target.ndim == 2:
-        src_arr = roi_mod.current_plane(viewer, target)
+        if want_rgb:
+            src_arr = np.asarray(target.data[index[:-2]])[..., :3]
+        else:
+            src_arr = roi_mod.current_plane(viewer, target)
         blocks = None
         total = 0
         geom = axes_mod.geometry(target, ndim=2)
@@ -393,7 +467,12 @@ def ai_segmentation_dialog(tiki) -> Labels | None:
         geom = axes_mod.geometry(target, ndim=3)
         suffix = f' {backend.lower()} 3D'
     else:
-        src_arr = target.data
+        if target.rgb and not want_rgb:
+            src_arr = np.asarray(target.data)[..., :3].mean(axis=-1)
+        elif target.rgb:
+            src_arr = np.asarray(target.data)[..., :3]
+        else:
+            src_arr = target.data
         blocks = nd.blocks(info, shape, index, nd.WHOLE, False)
         total = len(blocks)
         geom = axes_mod.geometry(target)
@@ -409,9 +488,7 @@ def ai_segmentation_dialog(tiki) -> Labels | None:
         tiki.status(f'{title} cancelled')
         return None
 
-    out_info = info if out.ndim == target.ndim else axes_mod.fit(
-        axes_mod.AxesInfo(info.axes[-out.ndim :], info.source, info.confident), out.shape
-    )
+    out_info = info if out.ndim == target.ndim else axes_mod.fit(info, out.shape)
     layer = Labels(
         out,
         name=f'{target.name}{suffix}',

@@ -18,6 +18,13 @@ def _version() -> str:
 
 
 def main(argv: list[str] | None = None) -> int:
+    import os
+
+    if sys.stdout is None:
+        sys.stdout = open(os.devnull, 'w', encoding='utf-8')  # noqa: SIM115
+    if sys.stderr is None:
+        sys.stderr = open(os.devnull, 'w', encoding='utf-8')  # noqa: SIM115
+
     parser = argparse.ArgumentParser(
         prog='tiki',
         description='TIKI Is Kinda ImageJ: an ImageJ-style toolbar for napari image windows.',

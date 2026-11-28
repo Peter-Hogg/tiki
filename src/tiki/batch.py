@@ -241,8 +241,22 @@ def batch_convert(
                 else:
                     from PIL import Image as PilImage
 
-                    plane = _flatten_to_2d(data, rgb=rgb, stack_mode=stack_mode)
-                    u8 = _to_uint8_display(plane, rgb=rgb)
+                    c_idx = info.index('C') if not rgb else None
+                    if c_idx is not None and 1 < data.shape[c_idx] <= 8:
+                        from . import channels, contrast
+
+                        arr_c = np.moveaxis(np.asarray(data), c_idx, 0)
+                        while arr_c.ndim > 3:
+                            arr_c = arr_c[:, 0] if stack_mode == 'first' else arr_c.max(axis=1)
+                        n_c = arr_c.shape[0]
+                        cmaps = channels._imagej_colormaps(meta.get('imagej_luts'), n_c) or [
+                            contrast.LUTS[name] for name in channels.DEFAULT_COLORS.get(n_c, ['gray'] * n_c)
+                        ]
+                        specs = [(arr_c[k], cmaps[k], ops.saturated_limits(arr_c[k])) for k in range(n_c)]
+                        u8 = ops.composite_rgb(specs)
+                    else:
+                        plane = _flatten_to_2d(data, rgb=rgb, stack_mode=stack_mode)
+                        u8 = _to_uint8_display(plane, rgb=rgb)
                     PilImage.fromarray(u8).save(dst)
                 wrote_any = True
             if wrote_any:
@@ -566,16 +580,25 @@ def batch_macro_dialog(tiki):
     def refresh(_=None):
         in_dir = Path(in_edit.text().strip())
         files = find_batch_files(in_dir, pat_edit.text(), rec_box.isChecked()) if in_edit.text().strip() else []
-        ok = bool(files) and bool(code_edit.toPlainText().strip())
-        count_label.setText(f'{len(files)} matching file(s)' if in_edit.text().strip() else 'Choose an input folder')
+        need_out = auto_save.isChecked() or save_csv.isChecked()
+        has_out = bool(out_edit.text().strip())
+        ok = bool(files) and bool(code_edit.toPlainText().strip()) and (not need_out or has_out)
+        if not in_edit.text().strip():
+            count_label.setText('Choose an input folder')
+        elif need_out and not has_out:
+            count_label.setText(f'{len(files)} matching file(s) — choose an Output folder for saving')
+        else:
+            count_label.setText(f'{len(files)} matching file(s)')
         buttons.button(buttons.Ok).setEnabled(ok)
         conflict_box.setEnabled(auto_save.isChecked())
 
     in_edit.textChanged.connect(refresh)
+    out_edit.textChanged.connect(refresh)
     pat_edit.textChanged.connect(refresh)
     rec_box.toggled.connect(refresh)
     code_edit.textChanged.connect(refresh)
     auto_save.toggled.connect(refresh)
+    save_csv.toggled.connect(refresh)
     refresh()
 
     if dlg.exec_() != QDialog.Accepted:
