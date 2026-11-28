@@ -29,6 +29,11 @@
   <sub><b>Mouse Kidney workflow:</b> scroll through a 3-channel Z-stack and toggle channels, LUTs, and contrast live in the <b>Channels Tool</b> (<code>Ctrl+Shift+Z</code>).</sub>
 </p>
 
+<p align="center">
+  <img src="assets/demo-sam.gif" alt="Using TIKI Interactive SAM on microscopy images with live box and point prompts" width="760"><br>
+  <sub><b>Interactive SAM &amp; AI Segmentation:</b> segment structures live with box and <code>+</code>/<code>−</code> point prompts in <b>Interactive SAM</b> (SAM 2.1 / SAM 1) or run one-click <b>Cellpose</b> and <b>StarDist</b>—all via isolated <code>uv</code> environments with zero base-install bloat.</sub>
+</p>
+
 > [!NOTE]
 > TIKI is an early prototype. The core workflow works, but interfaces and
 > shortcuts may change while it is tested on real microscopy data.
@@ -257,6 +262,17 @@ pixel value.
 - **Process ▸ Labels ▸ Watershed…** and **Fill Holes**: split touching 2D or
   anisotropic 3D objects by distance-transform watershed (with live slice
   preview) and fill interior holes
+- **Process ▸ Labels ▸ AI Segmentation…**: one-click **Cellpose** (2D and
+  anisotropic 3D) and **StarDist** segmentation straight into a calibrated
+  `Labels` layer; uses installed packages when present or runs automatically in
+  an isolated, cached `uv` environment with zero base-install bloat
+- **Process ▸ Labels ▸ Interactive SAM…**: floating promptable **SAM 2.1 / SAM 1**
+  window with direct `▭ Draw Box` dragging, `+ Include` / `− Exclude` point
+  prompts (zoom-scaled), live mask preview, **Auto-Segment Plane**, and
+  **Propagate Stack** for movies and Z-stacks
+- **Plugins ▸ Napari Plugins**: auto-discovers installed `npe2` napari plugin
+  widgets and docks them onto the active TIKI window, with a shortcut to
+  **Install / Manage Plugins…**
 
 ### Particles, ROI Manager and traces
 
