@@ -300,6 +300,8 @@ class Tiki(QMainWindow):
         self._add(m, 'Motion Correction…', lambda: self._process('motion_correct_dialog'))
         self._add(m, 'Image Calculator…', lambda: self._process('calculator_dialog'))
         labels_menu = m.addMenu('Labels')
+        self._add(labels_menu, 'AI Segmentation…', lambda: self._ai_seg('ai_segmentation_dialog'))
+        labels_menu.addSeparator()
         self._add(labels_menu, 'Watershed…', lambda: self._process('watershed_dialog'))
         self._add(labels_menu, 'Fill Holes', lambda: self._process('fill_holes_command'))
         self._add(labels_menu, 'Morphology…', lambda: self._process('morphology_dialog'))
@@ -345,6 +347,9 @@ class Tiki(QMainWindow):
         self._add(macros, 'Show Macros Folder', self.show_macros_folder)
         self._macro_fixed = len(macros.actions())
         macros.aboutToShow.connect(self._fill_macros_menu)
+        m.addSeparator()
+        self.napari_plugins_menu = m.addMenu('Napari Plugins')
+        self.napari_plugins_menu.aboutToShow.connect(self._fill_napari_plugins_menu)
 
         self.window_menu = mb.addMenu('&Window')
         self.window_menu.aboutToShow.connect(self._fill_window_menu)
@@ -719,18 +724,26 @@ class Tiki(QMainWindow):
     def open_paths(self, paths, raise_errors: bool = False) -> list:
         opened: list = []
         for path in paths:
+            p = Path(path)
             try:
-                loaded, cancelled = self.run_task(
-                    f'Opening {Path(path).name}', 1, lambda _tick, p=path: io.read_multi(p)
-                )
+                use_bg = p.is_dir() or (p.is_file() and p.stat().st_size > 16 * 2**20)
+            except OSError:
+                use_bg = False
+            try:
+                if use_bg:
+                    loaded, cancelled = self.run_task(
+                        f'Opening {p.name}', 0, lambda _tick, _p=path: io.read_multi(_p)
+                    )
+                else:
+                    loaded, cancelled = io.read_multi(path), False
             except Exception as exc:
                 if raise_errors:
                     raise
                 traceback.print_exc()
-                self.report('Open', f'Could not open {Path(path).name}:\n{exc}')
+                self.report('Open', f'Could not open {p.name}:\n{exc}')
                 continue
             if cancelled:
-                self.status(f'Cancelled opening {Path(path).name}')
+                self.status(f'Cancelled opening {p.name}')
                 continue
             for scene_idx, (data, meta) in enumerate(loaded):
                 v = self.open_scene_entry(
@@ -1704,7 +1717,8 @@ class Tiki(QMainWindow):
         from qtpy.QtWidgets import QProgressDialog
 
         cancel_event = threading.Event()
-        dialog = QProgressDialog(f'{title}…', 'Cancel', 0, max(int(total), 1), parent or self)
+        init_max = max(int(total), 0)
+        dialog = QProgressDialog(f'{title}…', 'Cancel', 0, init_max, parent or self)
         dialog.setWindowTitle(title)
         dialog.setWindowModality(Qt.ApplicationModal)
         dialog.setMinimumDuration(400)
@@ -1715,14 +1729,22 @@ class Tiki(QMainWindow):
         done_flag = [False]
 
         def _on_progress(done: int, tot: int) -> None:
-            dialog.setMaximum(max(tot, 1))
-            dialog.setValue(min(done, max(tot, 1)))
+            if tot <= 0:
+                if dialog.maximum() != 0:
+                    dialog.setMaximum(0)
+                return
+            dialog.setMaximum(tot)
+            dialog.setValue(min(done, tot))
+
+        def _on_status(text: str) -> None:
+            dialog.setLabelText(text)
 
         def _on_finished() -> None:
             done_flag[0] = True
             loop.quit()
 
         worker.progressed.connect(_on_progress, Qt.QueuedConnection)
+        worker.status_changed.connect(_on_status, Qt.QueuedConnection)
         worker.finished.connect(_on_finished, Qt.QueuedConnection)
 
         show_timer = QTimer(self)
@@ -2095,6 +2117,84 @@ class Tiki(QMainWindow):
 
         return getattr(publish, name)(self, **kwargs)
 
+    def _ai_seg(self, name: str, **kwargs):
+        from . import ai_seg
+
+        return getattr(ai_seg, name)(self, **kwargs)
+
+    def _fill_napari_plugins_menu(self) -> None:
+        menu = self.napari_plugins_menu
+        menu.clear()
+        by_plugin: dict[str, list[tuple[str, str]]] = {}
+        try:
+            import npe2
+
+            pm = npe2.PluginManager.instance()
+            pm.discover()
+            for w in pm.iter_widgets():
+                manifest = pm.get_manifest(w.plugin_name)
+                label = (getattr(manifest, 'display_name', None) or w.plugin_name) if manifest else w.plugin_name
+                by_plugin.setdefault(label, []).append((w.plugin_name, w.display_name))
+        except Exception:
+            pass
+
+        external = {k: v for k, v in by_plugin.items() if k.lower() != 'napari'}
+        shown = external or by_plugin
+        if not shown:
+            empty = menu.addAction('(No napari plugin widgets found)')
+            empty.setEnabled(False)
+        else:
+            for plugin_label in sorted(shown, key=str.lower):
+                widgets = sorted(shown[plugin_label], key=lambda item: item[1].lower())
+                if len(widgets) == 1:
+                    pname, wname = widgets[0]
+                    act = menu.addAction(f'{plugin_label}: {wname}')
+                    act.triggered.connect(lambda _c=False, p=pname, w=wname: self._open_napari_plugin_widget(p, w))
+                else:
+                    sub = menu.addMenu(plugin_label)
+                    for pname, wname in widgets:
+                        act = sub.addAction(wname)
+                        act.triggered.connect(lambda _c=False, p=pname, w=wname: self._open_napari_plugin_widget(p, w))
+
+        menu.addSeparator()
+        manage = menu.addAction('Install / Manage Plugins…')
+        manage.triggered.connect(self._manage_napari_plugins)
+
+    def _open_napari_plugin_widget(self, plugin_name: str, widget_name: str) -> None:
+        viewer = self.windows.active
+        if viewer is None:
+            viewer = self.windows.new_window(None, name='Untitled')
+        try:
+            viewer.window.add_plugin_dock_widget(plugin_name, widget_name)
+        except Exception as exc:
+            self.report('Napari Plugin', f'Could not open {plugin_name} ({widget_name}):\n{exc}')
+            return
+        qwin = getattr(viewer.window, '_qt_window', None)
+        if qwin is not None:
+            qwin.show()
+            qwin.raise_()
+            qwin.activateWindow()
+        self.status(f'Opened plugin widget: {plugin_name} — {widget_name}')
+
+    def _manage_napari_plugins(self) -> None:
+        try:
+            from napari_plugin_manager.qt_plugin_dialog import QtPluginDialog
+
+            dlg = QtPluginDialog(self)
+            dlg.exec_()
+            return
+        except Exception:
+            pass
+        QMessageBox.information(
+            self,
+            'Napari Plugins',
+            'Any napari plugin installed in TIKI\'s Python environment appears automatically under '
+            'Plugins ▸ Napari Plugins.\n\n'
+            'Install plugins from the command line, e.g.:\n'
+            '  pip install cellpose-napari\n'
+            '  pip install napari-plugin-manager',
+        )
+
     def keep_window(self, win) -> None:
         """Keep a floating plot alive until it is closed (and close it with TIKI)."""
         win.setAttribute(Qt.WA_DeleteOnClose)
@@ -2317,6 +2417,7 @@ class _TaskWorker(QThread):
     """Run a pure-Python/NumPy callable ``fn(tick)`` off the Qt GUI thread."""
 
     progressed = Signal(int, int)
+    status_changed = Signal(str)
 
     def __init__(self, fn, cancel_event: threading.Event, parent=None):
         super().__init__(parent)
@@ -2325,19 +2426,33 @@ class _TaskWorker(QThread):
         self.result = None
         self.error: BaseException | None = None
         self._last_emit = 0.0
+        self._last_label_emit = 0.0
+        self._tick_cb = self._make_tick()
 
-    def _tick(self, done: int, total: int) -> bool:
-        if self._cancel.is_set():
-            return False
-        now = time.monotonic()
-        if done >= total or (now - self._last_emit) >= 0.03:
-            self._last_emit = now
-            self.progressed.emit(int(done), max(int(total), 1))
-        return not self._cancel.is_set()
+    def _make_tick(self):
+        worker = self
+
+        class _Tick:
+            def __call__(self, done: int, total: int) -> bool:
+                if worker._cancel.is_set():
+                    return False
+                now = time.monotonic()
+                if total > 0 and (done >= total or (now - worker._last_emit) >= 0.03):
+                    worker._last_emit = now
+                    worker.progressed.emit(int(done), int(total))
+                return not worker._cancel.is_set()
+
+            def set_label(self, text: str) -> None:
+                now = time.monotonic()
+                if (now - worker._last_label_emit) >= 0.1:
+                    worker._last_label_emit = now
+                    worker.status_changed.emit(text)
+
+        return _Tick()
 
     def run(self) -> None:
         try:
-            self.result = self._fn(self._tick)
+            self.result = self._fn(self._tick_cb)
         except BaseException as exc:
             self.error = exc
 

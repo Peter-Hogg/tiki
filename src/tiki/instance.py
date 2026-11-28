@@ -84,6 +84,7 @@ def _handle_message(tiki, raw: bytes) -> None:
 
 def listen(tiki, name: str | None = None):
     """Listen for secondary ``tiki`` launches and open their files in ``tiki``."""
+    from collections import deque
     from qtpy.QtCore import QTimer
     from qtpy.QtNetwork import QLocalServer
 
@@ -93,6 +94,24 @@ def listen(tiki, name: str | None = None):
     opt = getattr(QLocalServer, 'UserAccessOption', None) or QLocalServer.SocketOption.UserAccessOption
     server.setSocketOptions(opt)
     active_conns: set = set()
+    pending_msgs: deque[bytes] = deque()
+    draining = [False]
+
+    def process_queue() -> None:
+        if draining[0]:
+            return
+        draining[0] = True
+        try:
+            while pending_msgs:
+                raw = pending_msgs.popleft()
+                _handle_message(tiki, raw)
+        finally:
+            draining[0] = False
+
+    def enqueue(raw: bytes) -> None:
+        pending_msgs.append(raw)
+        if not draining[0]:
+            QTimer.singleShot(0, process_queue)
 
     def on_connection() -> None:
         while server.hasPendingConnections():
@@ -108,7 +127,7 @@ def listen(tiki, name: str | None = None):
                     b.clear()
                     b.extend(rest)
                     if line.strip():
-                        QTimer.singleShot(0, lambda raw=bytes(line): _handle_message(tiki, raw))
+                        enqueue(bytes(line))
 
             def read(c=conn, b=buf) -> None:
                 b.extend(bytes(c.readAll()))
@@ -120,7 +139,7 @@ def listen(tiki, name: str | None = None):
                 if b.strip():
                     raw = bytes(b)
                     b.clear()
-                    QTimer.singleShot(0, lambda r=raw: _handle_message(tiki, r))
+                    enqueue(raw)
                 active_conns.discard(c)
                 c.deleteLater()
 

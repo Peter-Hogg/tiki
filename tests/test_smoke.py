@@ -460,3 +460,34 @@ def test_run_task_background_thread_and_errors(tiki):
     with pytest.raises(ValueError, match='worker boom'):
         tiki.run_task('Test Error', 1, fail)
 
+
+def test_napari_plugins_menu_and_ai_seg_bridge(tiki, monkeypatch):
+    from tiki import ai_seg
+
+    # Napari Plugins menu populates cleanly and includes Install / Manage Plugins…
+    tiki._fill_napari_plugins_menu()
+    labels = [a.text() for a in tiki.napari_plugins_menu.actions() if not a.isSeparator()]
+    assert any('Manage Plugins' in t for t in labels)
+
+    # AI segmentation backend detection reports valid mode and handles missing gracefully
+    mode, detail = ai_seg.detect_backend('Cellpose')
+    assert mode in ('local', 'uv', 'missing')
+    assert detail
+
+    # Block-wise run_segmentation preserves globally unique label IDs across slices
+    monkeypatch.setattr(ai_seg, 'detect_backend', lambda _name: ('local', 'mocked'))
+    monkeypatch.setattr(
+        ai_seg,
+        '_run_cellpose_local',
+        lambda arr, _params: np.where(arr > 0, 1, 0).astype(np.int32),
+    )
+    stack = np.zeros((3, 8, 8), dtype=np.uint16)
+    stack[0, 1:3, 1:3] = 10
+    stack[1, 2:4, 2:4] = 10
+    stack[2, 4:6, 4:6] = 10
+    blocks = [(i, slice(None), slice(None)) for i in range(3)]
+    out = ai_seg.run_segmentation('Cellpose', stack, {'model': 'cyto3'}, blocks=blocks)
+    assert out.shape == stack.shape
+    assert set(np.unique(out)) == {0, 1, 2, 3}
+
+
