@@ -431,3 +431,32 @@ def test_batch_convert_skip_multiscene(tmp_path):
     assert ok_n == 1 and not errs
     assert (out_dir / 'sample.ome_s1.tif').exists()
     assert (out_dir / 'sample.ome_s2.tif').exists()
+
+
+def test_run_task_background_thread_and_errors(tiki):
+    import threading
+    from qtpy.QtCore import QThread
+    from qtpy.QtWidgets import QApplication
+
+    main_tid = threading.get_ident()
+    seen_threads = []
+
+    def work(tick):
+        seen_threads.append(threading.get_ident())
+        assert QThread.currentThread() is not QApplication.instance().thread()
+        for i in range(1, 6):
+            assert tick(i, 5) is True
+        return 42
+
+    res, cancelled = tiki.run_task('Test Background', 5, work)
+    assert res == 42
+    assert not cancelled
+    assert seen_threads and seen_threads[0] != main_tid
+
+    # Exceptions raised on worker thread propagate cleanly to main thread
+    def fail(_tick):
+        raise ValueError('worker boom')
+
+    with pytest.raises(ValueError, match='worker boom'):
+        tiki.run_task('Test Error', 1, fail)
+

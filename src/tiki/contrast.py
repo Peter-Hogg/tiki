@@ -312,7 +312,10 @@ class BrightnessContrastWindow(QWidget):
     def refresh_histogram(self) -> None:
         if self.image is None or self.viewer is None or self.image not in self.viewer.layers:
             return
-        plane = roi_mod.current_plane(self.viewer, self.image)
+        plane = np.asarray(roi_mod.current_plane(self.viewer, self.image))
+        if plane.size > 1_000_000:
+            stride = max(1, int(np.sqrt(plane.size / 1_000_000)))
+            plane = plane[::stride, ::stride] if plane.ndim == 2 else plane.ravel()[::stride * stride]
         vals = np.asarray(plane, dtype=np.float64).ravel()
         vals = vals[np.isfinite(vals)]
         if vals.size == 0:

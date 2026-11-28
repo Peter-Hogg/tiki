@@ -42,9 +42,10 @@ def _apply_plane_op(
         if not process._confirm_size(tiki, image.data.shape, title):
             return None
         total = int(np.prod(image.data.shape[: image.ndim - 2]))
-        with tiki.progress(title, total) as tick:
-            out = ops.map_planes(fn, image.data, out_dtype=dtype_out, progress=tick)
-        if tick.cancelled:
+        out, cancelled = tiki.run_task(
+            title, total, lambda tick: ops.map_planes(fn, image.data, out_dtype=dtype_out, progress=tick)
+        )
+        if cancelled:
             return None
         lo, hi = ops.saturated_limits(out[(0,) * (out.ndim - 2)])
         layer = process._add_result(tiki, viewer, image, out, f'{image.name} {suffix}', image.colormap, (lo, hi))

@@ -886,4 +886,84 @@ def test_crop_to_box_rgb_and_z_ratio_mixed_units():
     assert axes_mod.z_ratio(info2) == pytest.approx(0.25)
 
 
+def test_parallel_ops_match_single_threaded_and_cancel():
+    rng = np.random.default_rng(7)
+    stack = rng.integers(0, 200, size=(12, 32, 32), dtype=np.uint16)
+    blocks = [(i, slice(None), slice(None)) for i in range(stack.shape[0])]
+
+    # map_planes & map_blocks match workers=1 vs workers=4
+    from scipy.ndimage import gaussian_filter
+
+    fn = lambda p: gaussian_filter(p.astype(np.float32), 1.5)
+    np.testing.assert_allclose(ops.map_planes(fn, stack, workers=1), ops.map_planes(fn, stack, workers=4))
+    np.testing.assert_allclose(ops.map_blocks(fn, stack, blocks, workers=1), ops.map_blocks(fn, stack, blocks, workers=4))
+
+    # threshold_blocks & watershed_blocks preserve identical global label IDs
+    t1 = ops.threshold_blocks(stack, 140, 200, blocks, split=True, min_size=2, workers=1)
+    t4 = ops.threshold_blocks(stack, 140, 200, blocks, split=True, min_size=2, workers=4)
+    np.testing.assert_array_equal(t1, t4)
+
+    w1 = ops.watershed_blocks(t1, blocks, min_distance=2.0, workers=1)
+    w4 = ops.watershed_blocks(t1, blocks, min_distance=2.0, workers=4)
+    np.testing.assert_array_equal(w1, w4)
+
+    # apply_shifts & image_calculator match workers=1 vs workers=4
+    shifts = rng.uniform(-2.0, 2.0, size=(stack.shape[0], 2))
+    np.testing.assert_allclose(
+        ops.apply_shifts(stack, shifts, axis=0, order=1, workers=1),
+        ops.apply_shifts(stack, shifts, axis=0, order=1, workers=4),
+    )
+    np.testing.assert_allclose(
+        ops.image_calculator(stack, stack[0], 'Subtract', workers=1),
+        ops.image_calculator(stack, stack[0], 'Subtract', workers=4),
+    )
+
+    # Early cancellation stops promptly
+    seen = []
+
+    def stop_early(done, total):
+        seen.append((done, total))
+        return done < 3
+
+    ops.map_planes(fn, stack, progress=stop_early, workers=4)
+    assert len(seen) <= 3
+
+
+def test_z_project_4d_memmap_streaming(tmp_path):
+    rng = np.random.default_rng(11)
+    arr = rng.integers(0, 1000, size=(3, 5, 16, 20), dtype=np.uint16)
+    mm_path = tmp_path / 'stack4d.npy'
+    np.save(mm_path, arr)
+    mm = np.load(mm_path, mmap_mode='r')
+
+    for method in ('max', 'min', 'sum', 'mean', 'std'):
+        got = ops.z_project(mm, method=method, axis=1)
+        expected = ops.z_project(arr, method=method, axis=1)
+        np.testing.assert_allclose(got, expected, rtol=1e-5)
+
+
+def test_tiff_zero_copy_memmap_and_lazy_zarr(tmp_path, monkeypatch):
+    import tifffile
+    from tiki import io as io_mod
+
+    # 1. Uncompressed TIFF opens via zero-copy np.memmap directly on the source file
+    raw = np.arange(8 * 16 * 16, dtype=np.uint16).reshape(8, 16, 16)
+    uncomp = tmp_path / 'uncompressed.tif'
+    tifffile.imwrite(uncomp, raw)
+    data, _meta = io_mod.read_image(uncomp)
+    assert isinstance(data, np.memmap)
+    assert data.filename == str(uncomp)
+    np.testing.assert_array_equal(np.asarray(data), raw)
+
+    # 2. Compressed TIFF above LAZY_TIFF_BYTES opens lazily via Dask and still reads cleanly
+    comp = tmp_path / 'compressed.tif'
+    tifffile.imwrite(comp, raw, compression='zlib')
+    monkeypatch.setattr(io_mod, 'LAZY_TIFF_BYTES', 1)
+    lazy_data, lazy_meta = io_mod.read_image(comp)
+    assert hasattr(lazy_data, 'compute')
+    assert 'first_plane' in lazy_meta
+    np.testing.assert_array_equal(np.asarray(lazy_data), raw)
+
+
+
 

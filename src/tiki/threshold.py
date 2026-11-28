@@ -295,7 +295,11 @@ class ThresholdWindow(QWidget):
     def refresh_histogram(self, keep_range: bool = False) -> None:
         if self.image is None:
             return
-        values = np.asarray(self._hist_values(), dtype=np.float64).ravel()
+        raw_vals = np.asarray(self._hist_values())
+        if raw_vals.size > 1_000_000:
+            step = max(1, raw_vals.size // 1_000_000)
+            raw_vals = raw_vals.ravel()[::step]
+        values = np.asarray(raw_vals, dtype=np.float64).ravel()
         values = values[np.isfinite(values)]
         if values.size == 0:
             self.vmin, self.vmax = 0.0, 1.0
@@ -474,9 +478,12 @@ class ThresholdWindow(QWidget):
         else:
             blocks = self._blocks()
             data = image.data if not image.rgb else _RgbAsGray(image.data)
-            with self.tiki.progress('Threshold', len(blocks)) as tick:
-                out = ops.threshold_blocks(data, self.lo_val, self.hi_val, blocks, split, min_size, progress=tick)
-            if tick.cancelled:
+            out, cancelled = self.tiki.run_task(
+                'Threshold',
+                len(blocks),
+                lambda tick: ops.threshold_blocks(data, self.lo_val, self.hi_val, blocks, split, min_size, progress=tick),
+            )
+            if cancelled:
                 self.tiki.status('Threshold cancelled')
                 return None
             geometry = axes_mod.geometry(image)

@@ -293,9 +293,10 @@ def run_filter(tiki, key: str, viewer, image, values: dict, whole_stack: bool = 
         else:
             func = lambda plane: spec.func(plane, **values)  # noqa: E731
             blocks = nd.blocks(info, shape, index, nd.WHOLE, False)
-        with tiki.progress(spec.title, len(blocks)) as tick:
-            result = ops.map_blocks(func, image.data, blocks, progress=tick)
-        if tick.cancelled:
+        result, cancelled = tiki.run_task(
+            spec.title, len(blocks), lambda tick: ops.map_blocks(func, image.data, blocks, progress=tick)
+        )
+        if cancelled:
             tiki.status(f'{spec.title} cancelled')
             return None
         if not whole_stack:  # only the current volume was filtered: keep just that volume

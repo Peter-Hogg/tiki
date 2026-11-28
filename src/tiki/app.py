@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 import sys
+import threading
 import time
 import traceback
 from pathlib import Path
 
 import numpy as np
 from napari.layers import Image, Labels, Points, Shapes
-from qtpy.QtCore import Qt, QTimer
+from qtpy.QtCore import QEventLoop, Qt, QThread, QTimer, Signal
 from qtpy.QtGui import QKeySequence
 from qtpy.QtWidgets import (
     QAction,
@@ -83,6 +84,7 @@ class Tiki(QMainWindow):
 
     def __init__(self):
         super().__init__()
+        io.enable_dask_cache()
         style.apply(self)
         self.setWindowTitle('TIKI')
         self.setAcceptDrops(True)
@@ -718,12 +720,17 @@ class Tiki(QMainWindow):
         opened: list = []
         for path in paths:
             try:
-                loaded = io.read_multi(path)
+                loaded, cancelled = self.run_task(
+                    f'Opening {Path(path).name}', 1, lambda _tick, p=path: io.read_multi(p)
+                )
             except Exception as exc:
                 if raise_errors:
                     raise
                 traceback.print_exc()
                 self.report('Open', f'Could not open {Path(path).name}:\n{exc}')
+                continue
+            if cancelled:
+                self.status(f'Cancelled opening {Path(path).name}')
                 continue
             for scene_idx, (data, meta) in enumerate(loaded):
                 v = self.open_scene_entry(
@@ -772,15 +779,16 @@ class Tiki(QMainWindow):
         if loader is None:
             raise TikiError(f'Sample dataset {name!r} is not available in this scikit-image version.')
         self.status(f'Loading sample: {name}…')
-        QApplication.processEvents()
         try:
-            arr = loader()
+            arr, cancelled = self.run_task(f'Loading {name}', 1, lambda _tick: loader())
         except Exception as exc:
             raise TikiError(
                 f'Could not load sample {name!r}.\n\n'
                 f'Larger scikit-image biology datasets download once from the internet (and are cached locally).\n\n'
                 f'Details: {exc}'
             ) from exc
+        if cancelled:
+            return
 
         kw: dict = {}
         # Provide physical axes / channel order for 3D & multichannel biology samples
@@ -1119,9 +1127,10 @@ class Tiki(QMainWindow):
     def invert(self):
         viewer, image = self.require_image()
         total = int(np.prod(image.data.shape[: image.ndim - 2])) if image.ndim > 2 else 1
-        with self.progress('Invert', total) as tick:
-            out = ops.invert_image(image.data, rgb=bool(image.rgb), progress=tick)
-        if tick.cancelled:
+        out, cancelled = self.run_task(
+            'Invert', total, lambda tick: ops.invert_image(image.data, rgb=bool(image.rgb), progress=tick)
+        )
+        if cancelled:
             self.status('Invert cancelled')
             return None
         info = axes_mod.fit(axes_mod.get(image), out.shape[:-1] if image.rgb else out.shape)
@@ -1175,9 +1184,12 @@ class Tiki(QMainWindow):
         if not image.rgb and target_dtype in ('uint8', 'uint16'):
             scale_range = tuple(map(float, image.contrast_limits))
         total = int(np.prod(image.data.shape[: image.ndim - 2])) if image.ndim > 2 else 1
-        with self.progress(f'Convert to {target_dtype}', total) as tick:
-            out = ops.convert_type(image.data, target_dtype, scale_range=scale_range, progress=tick)
-        if tick.cancelled:
+        out, cancelled = self.run_task(
+            f'Convert to {target_dtype}',
+            total,
+            lambda tick: ops.convert_type(image.data, target_dtype, scale_range=scale_range, progress=tick),
+        )
+        if cancelled:
             self.status('Type conversion cancelled')
             return None
         info = axes_mod.fit(axes_mod.get(image), out.shape[:-1] if image.rgb else out.shape)
@@ -1205,9 +1217,8 @@ class Tiki(QMainWindow):
             raise TikiError('split channels first before flattening to RGB', fix='split')
         total = int(np.prod(ref_shape[:-2])) if len(ref_shape) > 2 else 1
         specs = [(ly.data, ly.colormap, tuple(map(float, ly.contrast_limits))) for ly in same]
-        with self.progress('RGB Color', total) as tick:
-            rgb = ops.composite_rgb(specs, progress=tick)
-        if tick.cancelled:
+        rgb, cancelled = self.run_task('RGB Color', total, lambda tick: ops.composite_rgb(specs, progress=tick))
+        if cancelled:
             self.status('RGB conversion cancelled')
             return None
         info = axes_mod.fit(axes_mod.get(same[0]), rgb.shape[:-1])
@@ -1641,15 +1652,17 @@ class Tiki(QMainWindow):
         data = image.data
         n_t = data.shape[axis]
         t0 = time.perf_counter()
-        with self.progress('Traces', n_t) as tick:
+        def _compute_traces(tick):
             if labels is not None:
-                ids, traces = ops.label_traces(data, axis, index, labels, progress=tick)
-                names = [f'label {int(i)}' for i in ids]
-            else:
-                traces = ops.roi_traces(data, axis, index, masks, progress=tick)
-        if tick.cancelled:
+                ids, tr = ops.label_traces(data, axis, index, labels, progress=tick)
+                return [f'label {int(i)}' for i in ids], tr
+            return names, ops.roi_traces(data, axis, index, masks, progress=tick)
+
+        res, cancelled = self.run_task('Traces', n_t, _compute_traces)
+        if cancelled:
             self.status('Traces cancelled')
             return None
+        names, traces = res
         if len(names) == 0:
             raise TikiError('nothing to plot')
         info = axes_mod.get(image)
@@ -1676,6 +1689,66 @@ class Tiki(QMainWindow):
 
     def progress(self, title: str, total: int):
         return _Progress(self, title, total)
+
+    def run_task(self, title: str, total: int, fn, *, parent=None):
+        """Run pure-compute ``fn(tick)`` on a background QThread with a modal progress dialog.
+
+        Returns ``(result, cancelled)`` and re-raises any exception from ``fn`` on
+        the main thread. Eliminates ``QApplication.processEvents()`` re-entrancy
+        while keeping the UI responsive and Cancel immediate.
+        """
+        app = QApplication.instance()
+        if app is None or QThread.currentThread() is not app.thread():
+            return fn(lambda _done, _tot: True), False
+
+        from qtpy.QtWidgets import QProgressDialog
+
+        cancel_event = threading.Event()
+        dialog = QProgressDialog(f'{title}…', 'Cancel', 0, max(int(total), 1), parent or self)
+        dialog.setWindowTitle(title)
+        dialog.setWindowModality(Qt.ApplicationModal)
+        dialog.setMinimumDuration(400)
+        dialog.canceled.connect(cancel_event.set)
+
+        worker = _TaskWorker(fn, cancel_event, parent=self)
+        loop = QEventLoop(self)
+        done_flag = [False]
+
+        def _on_progress(done: int, tot: int) -> None:
+            dialog.setMaximum(max(tot, 1))
+            dialog.setValue(min(done, max(tot, 1)))
+
+        def _on_finished() -> None:
+            done_flag[0] = True
+            loop.quit()
+
+        worker.progressed.connect(_on_progress, Qt.QueuedConnection)
+        worker.finished.connect(_on_finished, Qt.QueuedConnection)
+
+        show_timer = QTimer(self)
+        show_timer.setSingleShot(True)
+        show_timer.setInterval(400)
+        show_timer.timeout.connect(lambda: dialog.show() if not done_flag[0] else None)
+        show_timer.start()
+
+        worker.start()
+        if not done_flag[0]:
+            loop.exec()
+        worker.wait()
+        was_cancelled = cancel_event.is_set()
+        show_timer.stop()
+        try:
+            dialog.canceled.disconnect(cancel_event.set)
+        except Exception:
+            pass
+        dialog.reset()
+        dialog.close()
+        dialog.deleteLater()
+        worker.deleteLater()
+
+        if worker.error is not None:
+            raise worker.error
+        return worker.result, was_cancelled
 
     # ------------------------------------------------- Analyze Particles
 
@@ -2238,6 +2311,35 @@ def install_excepthook(tiki: Tiki) -> None:
             in_hook['active'] = False
 
     sys.excepthook = hook
+
+
+class _TaskWorker(QThread):
+    """Run a pure-Python/NumPy callable ``fn(tick)`` off the Qt GUI thread."""
+
+    progressed = Signal(int, int)
+
+    def __init__(self, fn, cancel_event: threading.Event, parent=None):
+        super().__init__(parent)
+        self._fn = fn
+        self._cancel = cancel_event
+        self.result = None
+        self.error: BaseException | None = None
+        self._last_emit = 0.0
+
+    def _tick(self, done: int, total: int) -> bool:
+        if self._cancel.is_set():
+            return False
+        now = time.monotonic()
+        if done >= total or (now - self._last_emit) >= 0.03:
+            self._last_emit = now
+            self.progressed.emit(int(done), max(int(total), 1))
+        return not self._cancel.is_set()
+
+    def run(self) -> None:
+        try:
+            self.result = self._fn(self._tick)
+        except BaseException as exc:
+            self.error = exc
 
 
 class _Progress:

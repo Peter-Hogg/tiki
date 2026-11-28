@@ -248,6 +248,10 @@ class WindowManager(QObject):
                     w.removeEventFilter(self)
                 except (RuntimeError, AttributeError):
                     pass
+        try:
+            viewer.layers.clear()
+        except Exception:
+            pass
 
     def unregister(self, viewer: napari.Viewer) -> None:
         if viewer not in self.viewers:

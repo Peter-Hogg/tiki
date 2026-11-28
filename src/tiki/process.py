@@ -179,10 +179,15 @@ def dff_dialog(tiki) -> Image | None:
         return None
     m = method.currentText()
     params = {'percentile': pct.value(), 'n_first': n_first.value(), 'window': window.value()}
-    with tiki.progress('ΔF/F', 1) as tick:
-        result = ops.dff_movie(image.data, axis_box.currentData(), m, offset.value(), progress=tick,
-                               return_f0=add_f0.isChecked(), **params)
-    if tick.cancelled:
+    result, cancelled = tiki.run_task(
+        'ΔF/F',
+        1,
+        lambda tick: ops.dff_movie(
+            image.data, axis_box.currentData(), m, offset.value(), progress=tick,
+            return_f0=add_f0.isChecked(), **params,
+        ),
+    )
+    if cancelled:
         tiki.status('ΔF/F cancelled')
         return None
     dff, f0 = result if add_f0.isChecked() else (result, None)
@@ -223,9 +228,12 @@ def correlation_image(tiki):
     if image.rgb:
         _error('correlation images need a greyscale movie')
     index = roi_mod.current_index(viewer, image)
-    with tiki.progress('Correlation Image', image.data.shape[-2]) as tick:
-        cn = ops.correlation_image(image.data, axis, index, progress=tick)
-    if tick.cancelled:
+    cn, cancelled = tiki.run_task(
+        'Correlation Image',
+        image.data.shape[-2],
+        lambda tick: ops.correlation_image(image.data, axis, index, progress=tick),
+    )
+    if cancelled:
         return None
     keep = [i for i in range(len(info.axes)) if i >= image.ndim - 2]
     cn_info = axes_mod.AxesInfo([info.axes[i] for i in keep], info.source, True,
@@ -274,24 +282,29 @@ def bleach_dialog(tiki) -> Image | None:
         return None
     ax_info = axes_mod.get(image)
     ax_meta = ax_info.axes[axis]
-    with tiki.progress('Bleach Correction', image.data.shape[axis]) as tick:
-        try:
-            corrected, info = ops.bleach_correct(image.data, axis, method.currentData(), background.value(),
-                                                 progress=tick)
-        except ValueError as exc:
-            means = [float(np.mean(np.take(image.data, k, axis=axis))) for k in range(image.data.shape[axis])]
-            _plot_bleach(
-                tiki,
-                image.name,
-                {'means': np.asarray(means)},
-                ax_info.labels[axis],
-                step=ax_meta.step,
-                unit=ax_meta.unit,
-            )
-            _error(str(exc))
-    if tick.cancelled:
+    try:
+        bc_res, cancelled = tiki.run_task(
+            'Bleach Correction',
+            image.data.shape[axis],
+            lambda tick: ops.bleach_correct(
+                image.data, axis, method.currentData(), background.value(), progress=tick
+            ),
+        )
+    except ValueError as exc:
+        means = [float(np.mean(np.take(image.data, k, axis=axis))) for k in range(image.data.shape[axis])]
+        _plot_bleach(
+            tiki,
+            image.name,
+            {'means': np.asarray(means)},
+            ax_info.labels[axis],
+            step=ax_meta.step,
+            unit=ax_meta.unit,
+        )
+        _error(str(exc))
+    if cancelled:
         tiki.status('Bleach correction cancelled')
         return None
+    corrected, info = bc_res
     lo, hi = ops.saturated_limits(corrected[(0,) * (corrected.ndim - 2)])
     layer = _add_result(tiki, viewer, image, corrected, f'{image.name} bleach-corrected', image.colormap, (lo, hi))
     msg = f'Bleach correction ({method.currentText().lower()}) → "{layer.name}"'
@@ -350,9 +363,12 @@ def kymograph_dialog(tiki):
     if image.rgb:
         _error('kymographs of RGB images are not supported; split or convert first')
     n_t = data.shape[axis]
-    with tiki.progress('Kymograph', n_t) as tick:
-        kymo = ops.kymograph(data, axis, index, current[0], width.value(), progress=tick)
-    if tick.cancelled:
+    kymo, cancelled = tiki.run_task(
+        'Kymograph',
+        n_t,
+        lambda tick: ops.kymograph(data, axis, index, current[0], width.value(), progress=tick),
+    )
+    if cancelled:
         return None
     a, y, x_ax = info.axes[axis], info.axes[-2], info.axes[-1]
     rows = f'{info.labels[axis]}' + (f', 1 px = {a.step:g} {a.unit}' if a.step else '')
@@ -423,9 +439,12 @@ def calculator_dialog(tiki):
                '(same size, or one plane/volume to apply to every position)')
     if not _confirm_size(tiki, sa, 'Image Calculator'):
         return None
-    with tiki.progress('Image Calculator', int(np.prod(sa[:-2])) or 1) as tick:
-        result = ops.image_calculator(a.data, b.data, op.currentText(), progress=tick)
-    if tick.cancelled:
+    result, cancelled = tiki.run_task(
+        'Image Calculator',
+        int(np.prod(sa[:-2])) or 1,
+        lambda tick: ops.image_calculator(a.data, b.data, op.currentText(), progress=tick),
+    )
+    if cancelled:
         return None
     return tiki.open_data(result, f'Result of {a.name}', axes=axes_mod.fit(axes_mod.get(a), result.shape))
 
@@ -739,9 +758,10 @@ def bin_dialog(tiki):
     if not _confirm_size(tiki, out_shape, 'Bin'):
         return None
     method = ops.BIN_METHODS[method_box.currentText()]
-    with tiki.progress('Bin', out_shape[0]) as tick:
-        result = ops.bin_image(img.data, factors, method, progress=tick)
-    if tick.cancelled:
+    result, cancelled = tiki.run_task(
+        'Bin', out_shape[0], lambda tick: ops.bin_image(img.data, factors, method, progress=tick)
+    )
+    if cancelled:
         tiki.status('Bin cancelled')
         return None
 
@@ -926,8 +946,10 @@ def motion_correct_dialog(tiki):
 
     index = roi_mod.current_index(viewer, src)
     n_t = src.data.shape[ax]
-    with tiki.progress('Motion Correction', 2 * n_t) as tick:
-        corrected, mc_info = ops.motion_correct(
+    mc_res, cancelled = tiki.run_task(
+        'Motion Correction',
+        2 * n_t,
+        lambda tick: ops.motion_correct(
             src.data,
             axis=ax,
             template=ref_box.currentData(),
@@ -937,8 +959,10 @@ def motion_correct_dialog(tiki):
             max_shift=max_shift.value(),
             index=index,
             progress=tick,
-        )
-    if tick.cancelled or mc_info.get('cancelled'):
+        ),
+    )
+    corrected, mc_info = mc_res
+    if cancelled or mc_info.get('cancelled'):
         tiki.status('Motion correction cancelled')
         return None
 
@@ -959,9 +983,12 @@ def motion_correct_dialog(tiki):
     other = other_box.currentData()
     if other is not None:
         other_v, other_ly, o_ax = other
-        with tiki.progress(f'Applying shifts to {other_ly.name}', n_t) as tick2:
-            other_reg = ops.apply_shifts(other_ly.data, shifts, axis=o_ax, progress=tick2)
-        if not tick2.cancelled:
+        other_reg, cancelled2 = tiki.run_task(
+            f'Applying shifts to {other_ly.name}',
+            n_t,
+            lambda tick2: ops.apply_shifts(other_ly.data, shifts, axis=o_ax, progress=tick2),
+        )
+        if not cancelled2:
             o_lo, o_hi = ops.saturated_limits(other_reg[(0,) * (other_reg.ndim - 2)])
             _add_result(tiki, other_v, other_ly, other_reg, f'{other_ly.name} registered', other_ly.colormap, (o_lo, o_hi))
 
@@ -1200,10 +1227,14 @@ def watershed_dialog(tiki):
         geometry = axes_mod.geometry(layer, ndim=3)
     else:
         blocks = nd.blocks(info, shape, index, nd.WHOLE, by_volume)
-        with tiki.progress('Watershed', len(blocks)) as tick:
-            out = ops.watershed_blocks(layer.data, blocks, min_distance=min_dist, z_ratio=zr,
-                                       fill_holes=fill, progress=tick)
-        if tick.cancelled:
+        out, cancelled = tiki.run_task(
+            'Watershed',
+            len(blocks),
+            lambda tick: ops.watershed_blocks(
+                layer.data, blocks, min_distance=min_dist, z_ratio=zr, fill_holes=fill, progress=tick
+            ),
+        )
+        if cancelled:
             tiki.status('Watershed cancelled')
             return None
         geometry = axes_mod.geometry(layer)
@@ -1231,9 +1262,10 @@ def fill_holes_command(tiki):
         out = ops.fill_holes_labels(np.asarray(layer.data))
     else:
         total = int(np.prod(layer.data.shape[:-2]))
-        with tiki.progress('Fill Holes', total) as tick:
-            out = ops.map_planes(ops.fill_holes_labels, layer.data, progress=tick)
-        if tick.cancelled:
+        out, cancelled = tiki.run_task(
+            'Fill Holes', total, lambda tick: ops.map_planes(ops.fill_holes_labels, layer.data, progress=tick)
+        )
+        if cancelled:
             tiki.status('Fill Holes cancelled')
             return None
     new_layer = Labels(out, name=f'{layer.name} filled', opacity=0.6,
@@ -1340,8 +1372,10 @@ def clear_selection(tiki, outside: bool = False):
     if whole and not _confirm_size(tiki, image.data.shape, 'Clear Outside' if outside else 'Clear'):
         return None
     total = int(np.prod(image.data.shape[: image.ndim - 2])) if whole else 1
-    with tiki.progress('Clear Outside' if outside else 'Clear', total) as tick:
-        out = ops.clear_mask(
+    out, cancelled = tiki.run_task(
+        'Clear Outside' if outside else 'Clear',
+        total,
+        lambda tick: ops.clear_mask(
             image.data,
             mask,
             outside=outside,
@@ -1350,8 +1384,9 @@ def clear_selection(tiki, outside: bool = False):
             whole_stack=whole,
             rgb=bool(image.rgb),
             progress=tick,
-        )
-    if tick.cancelled:
+        ),
+    )
+    if cancelled:
         tiki.status('Clear cancelled')
         return None
     suffix = 'cleared outside' if outside else 'cleared'
@@ -1377,10 +1412,14 @@ def rotate_dialog(tiki):
     if not _confirm_size(tiki, image.data.shape, 'Rotate'):
         return None
     total = int(np.prod(image.data.shape[: image.ndim - 2])) if image.ndim > 2 else 1
-    with tiki.progress('Rotate', total) as tick:
-        out = ops.rotate_angle(image.data, angle.value(), resize=enlarge.isChecked(),
-                               rgb=bool(image.rgb), progress=tick)
-    if tick.cancelled:
+    out, cancelled = tiki.run_task(
+        'Rotate',
+        total,
+        lambda tick: ops.rotate_angle(
+            image.data, angle.value(), resize=enlarge.isChecked(), rgb=bool(image.rgb), progress=tick
+        ),
+    )
+    if cancelled:
         tiki.status('Rotate cancelled')
         return None
     info = axes_mod.fit(axes_mod.get(image), out.shape[:-1] if image.rgb else out.shape)
@@ -1542,9 +1581,10 @@ def run_math(tiki, viewer, img: Image, op_name: str, value: float = 0.0, whole_s
         if not _confirm_size(tiki, img.data.shape, f'Math ({op_name})'):
             return None
         total = int(np.prod(img.data.shape[: img.ndim - 2]))
-        with tiki.progress(f'Math ({op_name})', total) as tick:
-            out = ops.math_op(img.data, op_name, val, progress=tick)
-        if tick.cancelled:
+        out, cancelled = tiki.run_task(
+            f'Math ({op_name})', total, lambda tick: ops.math_op(img.data, op_name, val, progress=tick)
+        )
+        if cancelled:
             return None
         axes_out = axes_mod.fit(axes_mod.get(img), out.shape)
     else:
@@ -1638,9 +1678,12 @@ def run_resize(tiki, viewer, img: Image, height: int, width: int, order: int = 1
         return None
 
     total = int(np.prod(lead)) if lead else 1
-    with tiki.progress('Resize', total) as tick:
-        out = ops.resize_image(img.data, (new_h, new_w), order=order_val, rgb=bool(img.rgb), progress=tick)
-    if tick.cancelled:
+    out, cancelled = tiki.run_task(
+        'Resize',
+        total,
+        lambda tick: ops.resize_image(img.data, (new_h, new_w), order=order_val, rgb=bool(img.rgb), progress=tick),
+    )
+    if cancelled:
         return None
 
     src_info = axes_mod.get(img)
@@ -1781,25 +1824,42 @@ def run_morphology_labels(
         (block,) = nd.blocks(info, shape, index, nd.VOLUME, False)
         vol = np.asarray(ly.data[block])
         if by_volume:
-            out = ops.morphology_labels(vol, op=op_key, radius=rad, z_ratio=zr)
+            out, cancelled = tiki.run_task(
+                f'Morphology ({op_key})',
+                1,
+                lambda _tick: ops.morphology_labels(vol, op=op_key, radius=rad, z_ratio=zr),
+            )
+            if cancelled:
+                return None
         else:
-            out = np.zeros(vol.shape, dtype=np.int32)
-            with tiki.progress(f'Morphology ({op_key})', vol.shape[0]) as tick:
-                for k in range(vol.shape[0]):
-                    out[k] = ops.morphology_labels(vol[k], op=op_key, radius=rad, z_ratio=1.0)
-                    if tick(k + 1, vol.shape[0]) is False:
-                        return None
+            out, cancelled = tiki.run_task(
+                f'Morphology ({op_key})',
+                vol.shape[0],
+                lambda tick: ops.map_planes(
+                    lambda pl: ops.morphology_labels(pl, op=op_key, radius=rad, z_ratio=1.0),
+                    vol,
+                    out_dtype=np.int32,
+                    progress=tick,
+                ),
+            )
+            if cancelled:
+                return None
         geom = axes_mod.geometry(ly, ndim=3)
     else:
         blocks = nd.blocks(info, shape, index, eff_scope, by_volume)
-        out_arr = np.zeros(shape, dtype=np.int32)
-        with tiki.progress(f'Morphology ({op_key})', len(blocks)) as tick:
-            for n, b in enumerate(blocks, 1):
-                blk = np.asarray(ly.data[b])
-                out_arr[b] = ops.morphology_labels(blk, op=op_key, radius=rad, z_ratio=zr if blk.ndim == 3 else 1.0)
-                if tick(n, len(blocks)) is False:
-                    return None
-        out = out_arr
+        out, cancelled = tiki.run_task(
+            f'Morphology ({op_key})',
+            len(blocks),
+            lambda tick: ops.map_blocks(
+                lambda blk: ops.morphology_labels(blk, op=op_key, radius=rad, z_ratio=zr if blk.ndim == 3 else 1.0),
+                ly.data,
+                blocks,
+                out_dtype=np.int32,
+                progress=tick,
+            ),
+        )
+        if cancelled:
+            return None
         geom = axes_mod.geometry(ly)
 
     out_info = info if out.ndim == ly.ndim else axes_mod.fit(
@@ -2076,9 +2136,10 @@ def _plane_filter_command(tiki, title: str, suffix: str, func):
         if not _confirm_size(tiki, image.data.shape, title):
             return None
         total = int(np.prod(image.data.shape[: image.ndim - 2]))
-        with tiki.progress(title, total) as tick:
-            out = ops.map_planes(func, image.data, out_dtype=np.float32, progress=tick)
-        if tick.cancelled:
+        out, cancelled = tiki.run_task(
+            title, total, lambda tick: ops.map_planes(func, image.data, out_dtype=np.float32, progress=tick)
+        )
+        if cancelled:
             return None
     else:
         out = func(image.data)
@@ -2266,9 +2327,10 @@ def run_convolve(
         if not _confirm_size(tiki, img.data.shape, 'Convolve'):
             return None
         total = int(np.prod(img.data.shape[: img.ndim - 2]))
-        with tiki.progress('Convolve', total) as tick:
-            out = ops.map_planes(fn, img.data, out_dtype=np.float32, progress=tick)
-        if tick.cancelled:
+        out, cancelled = tiki.run_task(
+            'Convolve', total, lambda tick: ops.map_planes(fn, img.data, out_dtype=np.float32, progress=tick)
+        )
+        if cancelled:
             return None
     else:
         out = fn(roi_mod.current_plane(viewer, img))
@@ -2528,16 +2590,22 @@ def run_find_maxima(
     if output == 'Single Points':
         if use_stack:
             blocks = nd.blocks(info, shape, index, nd.WHOLE, False)
-            out = np.zeros(shape, dtype=np.int32)
-            total_pts = 0
-            with tiki.progress('Find Maxima', len(blocks)) as tick:
-                for n, block in enumerate(blocks, 1):
-                    coords, _ = ops.find_maxima(np.asarray(img.data[block]), mask=roi_mask, **opts)
-                    if len(coords):
-                        out[block][coords[:, 0], coords[:, 1]] = np.arange(1, len(coords) + 1, dtype=np.int32)
-                        total_pts += len(coords)
-                    if tick(n, len(blocks)) is False:
-                        return None
+
+            def _single_pts_plane(pl):
+                coords, _ = ops.find_maxima(pl, mask=roi_mask, **opts)
+                res = np.zeros(pl.shape, dtype=np.int32)
+                if len(coords):
+                    res[coords[:, 0], coords[:, 1]] = np.arange(1, len(coords) + 1, dtype=np.int32)
+                return res
+
+            out, cancelled = tiki.run_task(
+                'Find Maxima',
+                len(blocks),
+                lambda tick: ops.map_blocks(_single_pts_plane, img.data, blocks, out_dtype=np.int32, progress=tick),
+            )
+            if cancelled:
+                return None
+            total_pts = int(np.count_nonzero(out))
             geom = axes_mod.geometry(img)
             meta = {'axes': info.to_dict()}
         else:
@@ -2560,18 +2628,23 @@ def run_find_maxima(
     if output == 'Segmented Particles':
         if use_stack:
             blocks = nd.blocks(info, shape, index, nd.WHOLE, False)
-            out = np.zeros(shape, dtype=np.int32)
-            total_pts = 0
-            with tiki.progress('Find Maxima (Segmented)', len(blocks)) as tick:
-                for n, block in enumerate(blocks, 1):
-                    pl = np.asarray(img.data[block])
-                    coords, _ = ops.find_maxima(pl, mask=roi_mask, **opts)
-                    out[block] = ops.segment_maxima(
-                        pl, coords, light_background=opts['light_background'], mask=roi_mask
-                    )
-                    total_pts += len(coords)
-                    if tick(n, len(blocks)) is False:
-                        return None
+            counts: list[int] = []
+
+            def _seg_maxima_plane(pl):
+                coords, _ = ops.find_maxima(pl, mask=roi_mask, **opts)
+                counts.append(len(coords))
+                return ops.segment_maxima(
+                    pl, coords, light_background=opts['light_background'], mask=roi_mask
+                )
+
+            out, cancelled = tiki.run_task(
+                'Find Maxima (Segmented)',
+                len(blocks),
+                lambda tick: ops.map_blocks(_seg_maxima_plane, img.data, blocks, out_dtype=np.int32, progress=tick),
+            )
+            if cancelled:
+                return None
+            total_pts = int(sum(counts))
             geom = axes_mod.geometry(img)
             meta = {'axes': info.to_dict()}
         else:
@@ -3346,15 +3419,18 @@ def run_edge_detection(
             blocks = nd.blocks(info, shape, index, nd.WHOLE, False)
         if not _confirm_size(tiki, shape, f'Edge Detection ({m})'):
             return None
-        with tiki.progress(f'Edge Detection ({m})', len(blocks)) as tick:
-            out = ops.map_blocks(
+        out, cancelled = tiki.run_task(
+            f'Edge Detection ({m})',
+            len(blocks),
+            lambda tick: ops.map_blocks(
                 fn,
                 img.data,
                 blocks,
                 out_dtype=np.uint8 if m == 'canny' else np.float32,
                 progress=tick,
-            )
-        if tick.cancelled:
+            ),
+        )
+        if cancelled:
             return None
         if not use_stack:
             out = out[blocks[0]]

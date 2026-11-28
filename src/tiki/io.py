@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import fnmatch
 import logging
+import os
 import re
 from pathlib import Path
 
@@ -11,6 +12,37 @@ import numpy as np
 import tifffile
 
 from . import axes as axes_mod
+
+_DASK_CACHE = None
+
+
+def enable_dask_cache(max_mb: int | None = None):
+    """Register a bounded in-memory Dask cache for smooth scrubbing of lazy stacks.
+
+    Size defaults to 1024 MiB (override with ``TIKI_CACHE_MB``; set to ``0`` to
+    disable). Idempotent and safe to call even if ``dask.cache``/``cachey`` is
+    not installed.
+    """
+    global _DASK_CACHE
+    if _DASK_CACHE is not None:
+        return _DASK_CACHE
+    if max_mb is None:
+        env = os.environ.get('TIKI_CACHE_MB', '1024')
+        try:
+            max_mb = int(env)
+        except ValueError:
+            max_mb = 1024
+    if max_mb <= 0:
+        return None
+    try:
+        from dask.cache import Cache
+
+        cache = Cache(max_mb * 2**20)
+        cache.register()
+        _DASK_CACHE = cache
+        return cache
+    except Exception:
+        return None
 
 OPEN_FILTER = 'Images (*.tif *.tiff *.czi *.nd2 *.lif *.h5 *.hdf5 *.mat *.npy *.png *.jpg);;All files (*)'
 IMAGE_SUFFIXES = {'.tif', '.tiff', '.czi', '.nd2', '.lif', '.zarr', '.h5', '.hdf5', '.mat', '.npy', '.png', '.jpg', '.jpeg'}
@@ -821,6 +853,84 @@ def extract_tiff_metadata(tf, series_index: int = 0) -> dict:
     return out
 
 
+LAZY_TIFF_BYTES = 256 * 2**20
+
+
+def _open_tiff_series(path: Path, tf: tifffile.TiffFile, series, idx: int, multi: bool):
+    """Open a TIFF series with zero-copy memmap, fast RAM read, or lazy Dask-Zarr.
+
+    1. Uncompressed, contiguous single-series TIFF -> zero-copy ``tifffile.memmap``
+       (instant open, zero RAM copy, zero ``/tmp`` disk writes).
+    2. Small TIFF (<= 64 MiB) -> direct RAM ``asarray()`` (avoids temp-file churn
+       and is immediately eligible for multi-core ThreadPoolExecutor ops).
+    3. Large compressed/tiled/multi-series TIFF (> 64 MiB) -> lazy ``da.from_zarr``
+       backed by ``tifffile.imread(..., series=idx, aszarr=True)`` so slices
+       decompress on demand without upfront full-file decode.
+    4. Fallback -> ``asarray(out='memmap')`` or ``asarray()``.
+    """
+    expected = tuple(series.shape)
+    nbytes = int(np.prod(expected)) * int(np.dtype(series.dtype).itemsize) if expected else 0
+
+    if not multi and idx == 0:
+        try:
+            mm = tifffile.memmap(path, mode='r')
+            if mm.shape == expected:
+                return mm, None
+        except Exception:
+            pass
+
+    if 0 < nbytes <= LAZY_TIFF_BYTES:
+        try:
+            arr = tf.asarray() if (not multi and idx == 0) else series.asarray()
+            return arr, None
+        except Exception:
+            pass
+
+    if nbytes > LAZY_TIFF_BYTES:
+        try:
+            import dask
+            import dask.array as da
+
+            try:
+                store = tifffile.imread(path, series=idx, aszarr=True)
+                arr = da.from_zarr(store)
+                if arr.shape == expected:
+                    lead = arr.ndim - (3 if (arr.ndim >= 3 and arr.shape[-1] in (3, 4)) else 2)
+                    first_plane = np.asarray(arr[(0,) * max(0, lead)])
+                    return arr, first_plane
+                store.close()
+            except Exception:
+                pass
+
+            pages = series.pages
+            if len(expected) >= 3 and len(pages) == int(np.prod(expected[:-2])):
+                p_str = str(path)
+                plane_shape = expected[-2:]
+                dtype = np.dtype(series.dtype)
+                first_plane = np.asarray(pages[0].asarray(), dtype=dtype)
+
+                def _read_page(page_idx: int) -> np.ndarray:
+                    with tifffile.TiffFile(p_str) as _tf:
+                        return np.asarray(_tf.series[idx].pages[page_idx].asarray(), dtype=dtype)
+
+                delayed_pages = [
+                    da.from_delayed(dask.delayed(_read_page)(i), shape=plane_shape, dtype=dtype)
+                    for i in range(len(pages))
+                ]
+                arr = da.stack(delayed_pages, axis=0)
+                if len(expected) > 3:
+                    arr = arr.reshape(expected)
+                return arr, first_plane
+        except Exception:
+            pass
+
+    try:
+        arr = tf.asarray(out='memmap') if (not multi and idx == 0) else series.asarray(out='memmap')
+    except Exception:
+        arr = tf.asarray() if (not multi and idx == 0) else series.asarray()
+    return arr, None
+
+
 def read_tiff_scenes(path: str | Path) -> list[tuple[object, dict]]:
     """Open a ``.tif`` / ``.tiff`` / ``.ome.tif`` file, returning one entry per series."""
     path = Path(path)
@@ -841,10 +951,7 @@ def read_tiff_scenes(path: str | Path) -> list[tuple[object, dict]]:
             for idx in indices:
                 series = tf.series[idx]
                 expected = series.shape
-                try:
-                    data = tf.asarray(out='memmap') if (not multi and idx == 0) else series.asarray(out='memmap')
-                except Exception:
-                    data = tf.asarray() if (not multi and idx == 0) else series.asarray()
+                data, first_plane = _open_tiff_series(path, tf, series, idx, multi)
                 try:
                     info = axes_mod.from_tiff(tf, data.shape) if idx == 0 else axes_mod.from_tiff(
                         tf, data.shape, series_index=idx
@@ -859,6 +966,8 @@ def read_tiff_scenes(path: str | Path) -> list[tuple[object, dict]]:
                 series_name = extra.pop('series_name', None)
                 title = f'{path.name} [{series_name or f"S{idx}"}]' if multi else path.name
                 meta: dict = {'name': title, 'path': str(path), 'axes': info}
+                if first_plane is not None:
+                    meta['first_plane'] = first_plane
                 meta.update(extra)
                 if data.shape != tuple(expected):
                     meta['warning'] = (

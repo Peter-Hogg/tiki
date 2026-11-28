@@ -7,6 +7,10 @@ chunks so they work on movies larger than RAM.
 
 from __future__ import annotations
 
+import os
+import threading
+from concurrent.futures import ThreadPoolExecutor
+
 import numpy as np
 
 PROJECTIONS = {
@@ -19,11 +23,87 @@ PROJECTIONS = {
 }
 
 CHUNK_BYTES = 256 * 2**20
+MAX_DEFAULT_WORKERS = 8
+
+
+def _worker_count(data, n_items: int, workers: int | None = None) -> int:
+    """Thread count for parallel plane/block ops.
+
+    Lazy/Dask arrays stay single-threaded here so non-thread-safe file readers
+    (e.g. readlif, h5py) are not hit concurrently; in-memory arrays and memmaps
+    scale across CPU cores via GIL-releasing NumPy/SciPy/skimage calls.
+    """
+    if n_items <= 1:
+        return 1
+    if workers is not None:
+        return max(1, min(int(workers), n_items))
+    if hasattr(data, 'compute'):
+        return 1
+    env = os.environ.get('TIKI_WORKERS')
+    if env is not None:
+        try:
+            return max(1, min(int(env), n_items))
+        except ValueError:
+            pass
+    cpus = os.cpu_count() or 1
+    return max(1, min(cpus, MAX_DEFAULT_WORKERS, n_items))
+
+
+def _iter_parallel(items, fn, workers: int, progress=None, total: int | None = None, start: int = 0):
+    """Yield ``(item, result)`` in input order, running ``fn`` across ``workers`` threads.
+
+    Submits tasks in bounded windows so memory stays bounded and cancellation
+    via ``progress(done, total) -> False`` stops promptly. ``progress`` is
+    always invoked on the calling thread.
+    """
+    seq = list(items)
+    n_total = len(seq) if total is None else total
+    if not seq:
+        return
+    if workers <= 1 or len(seq) <= 1:
+        for i, item in enumerate(seq):
+            res = fn(item)
+            yield item, res
+            if progress is not None and progress(start + i + 1, n_total) is False:
+                break
+        return
+
+    cancel = threading.Event()
+    window = max(workers * 2, 4)
+
+    def _guarded(item):
+        if cancel.is_set():
+            return None
+        return fn(item)
+
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        pending = []
+        it = iter(seq)
+        for _ in range(min(window, len(seq))):
+            item = next(it)
+            pending.append((item, pool.submit(_guarded, item)))
+        done = 0
+        while pending:
+            item, fut = pending.pop(0)
+            res = fut.result()
+            if cancel.is_set():
+                break
+            done += 1
+            yield item, res
+            if progress is not None and progress(start + done, n_total) is False:
+                cancel.set()
+                for _, rem_fut in pending:
+                    rem_fut.cancel()
+                break
+            nxt = next(it, None)
+            if nxt is not None:
+                pending.append((nxt, pool.submit(_guarded, nxt)))
 
 
 def _rows_per_chunk(data: np.ndarray, axis: int) -> int:
     """Rows (second-last axis) per chunk so one chunk stays under CHUNK_BYTES."""
-    row_bytes = data.dtype.itemsize * data.shape[-1] * data.shape[axis]
+    lead_elems = int(np.prod(data.shape[:-2])) if data.ndim > 2 else 1
+    row_bytes = data.dtype.itemsize * data.shape[-1] * lead_elems
     return max(1, CHUNK_BYTES // max(row_bytes, 1))
 
 
@@ -46,9 +126,40 @@ def z_project(data: np.ndarray, method: str = 'max', axis: int = 0) -> np.ndarra
     axis = axis % data.ndim
     if axis >= data.ndim - 2:
         raise ValueError('can only project along a non-spatial axis')
-    func = funcs[method]
     out_dtype = data.dtype if method in ('max', 'min') else np.float32
     out_shape = data.shape[:axis] + data.shape[axis + 1 :]
+
+    # Stream plane-by-plane for associative ops on disk-backed/lazy arrays
+    # to get sequential I/O and avoid re-decompressing frames per row chunk.
+    if method in ('max', 'min', 'sum', 'mean') and _is_lazy_backing(data):
+        out = np.empty(out_shape, dtype=out_dtype)
+        lead = data.ndim - 2
+        other_axes = [d for d in range(lead) if d != axis]
+        other_shape = tuple(data.shape[d] for d in other_axes)
+        n_axis = data.shape[axis]
+        for other_idx in (np.ndindex(*other_shape) if other_shape else [()]):
+            pos = dict(zip(other_axes, other_idx))
+            def _plane(k):
+                sl = tuple(k if d == axis else pos[d] for d in range(lead))
+                return np.asarray(data[sl])
+
+            first = _plane(0)
+            if method in ('max', 'min'):
+                acc = first.copy()
+                ufunc = np.maximum if method == 'max' else np.minimum
+                for k in range(1, n_axis):
+                    ufunc(acc, _plane(k), out=acc)
+                out[other_idx] = acc
+            else:
+                acc = first.astype(np.float64, copy=True)
+                for k in range(1, n_axis):
+                    acc += _plane(k)
+                if method == 'mean':
+                    acc /= n_axis
+                out[other_idx] = acc.astype(out_dtype, copy=False)
+        return out
+
+    func = funcs[method]
     out = np.empty(out_shape, dtype=out_dtype)
     step = _rows_per_chunk(data, axis)
     for r0 in range(0, data.shape[-2], step):
@@ -348,22 +459,25 @@ def segment(block: np.ndarray, lower: float, upper: float, split: bool = True, m
 
 
 def threshold_blocks(data, lower: float, upper: float, blocks: list[tuple], split: bool = True,
-                     min_size: int = 0, progress=None) -> np.ndarray:
+                     min_size: int = 0, progress=None, workers: int | None = None) -> np.ndarray:
     """Threshold ``data`` block by block (planes or Z-volumes, see ``tiki.nd``).
 
     Returns an array the shape of ``data``; with ``split`` every object id is
     unique across all blocks. Blocks are read one at a time (memmap friendly).
     """
     out = np.zeros(data.shape, dtype=np.int32 if split else np.uint8)
+    n_workers = _worker_count(data, len(blocks), workers)
     next_id = 0
-    for n, b in enumerate(blocks):
-        result = segment(np.asarray(data[b]), lower, upper, split, min_size)
+    for b, result in _iter_parallel(
+        blocks,
+        lambda blk: segment(np.asarray(data[blk]), lower, upper, split, min_size),
+        n_workers,
+        progress=progress,
+    ):
         if split and result.max():
             result[result > 0] += next_id
             next_id = int(result.max())
         out[b] = result
-        if progress is not None and progress(n + 1, len(blocks)) is False:
-            break
     return out
 
 def threshold_stack(
@@ -670,28 +784,53 @@ def median_3d(volume: np.ndarray, radius: float, z_ratio: float) -> np.ndarray:
     return _median(np.asarray(volume), footprint=footprint)
 
 
-def map_blocks(func, data, blocks: list[tuple], out_dtype=None, progress=None) -> np.ndarray:
+def map_blocks(func, data, blocks: list[tuple], out_dtype=None, progress=None,
+               workers: int | None = None) -> np.ndarray:
     """Apply ``func`` to each block (2D plane or 3D volume) of ``data``."""
     first = func(np.asarray(data[blocks[0]]))
     out = np.empty(data.shape, dtype=out_dtype or first.dtype)
     out[blocks[0]] = first
-    for n, b in enumerate(blocks[1:], start=2):
-        out[b] = func(np.asarray(data[b]))
-        if progress is not None and progress(n, len(blocks)) is False:
-            break
+    if progress is not None and len(blocks) == 1:
+        progress(1, 1)
+        return out
+    if len(blocks) > 1:
+        if progress is not None and progress(1, len(blocks)) is False:
+            return out
+        n_workers = _worker_count(data, len(blocks) - 1, workers)
+        for b, res in _iter_parallel(
+            blocks[1:],
+            lambda blk: func(np.asarray(data[blk])),
+            n_workers,
+            progress=progress,
+            total=len(blocks),
+            start=1,
+        ):
+            out[b] = res
     return out
 
 
-def map_planes(func, data, out_dtype=None, progress=None) -> np.ndarray:
+def map_planes(func, data, out_dtype=None, progress=None,
+               workers: int | None = None) -> np.ndarray:
     """Apply a 2D ``func`` to every plane of ``data`` (chunk-safe for memmaps)."""
     lead = data.shape[:-2]
-    first = func(np.asarray(data[(0,) * len(lead)]))
+    indices = list(np.ndindex(*lead)) if lead else [()]
+    total = len(indices)
+    first = func(np.asarray(data[indices[0]]))
     out = np.empty(lead + first.shape, dtype=out_dtype or first.dtype)
-    total = int(np.prod(lead)) if lead else 1
-    for n, idx in enumerate(np.ndindex(*lead) if lead else [()]):
-        out[idx] = first if n == 0 else func(np.asarray(data[idx]))
-        if progress is not None and progress(n + 1, total) is False:
-            break
+    out[indices[0]] = first
+    if progress is not None and progress(1, total) is False:
+        return out
+    if total > 1:
+        n_workers = _worker_count(data, total - 1, workers)
+        for idx, res in _iter_parallel(
+            indices[1:],
+            lambda i: func(np.asarray(data[i])),
+            n_workers,
+            progress=progress,
+            total=total,
+            start=1,
+        ):
+            out[idx] = res
     return out
 
 
@@ -744,17 +883,24 @@ def dff_movie(data, axis: int, method: str = 'median', offset: float = 0.0, prog
     if method != 'sliding percentile':
         f0_shape[axis] = 1
     f0_all = np.empty(f0_shape, dtype=np.float32) if return_f0 else None
-    rows = list(_rows_over_axis(data, axis))
-    for n, rs in enumerate(rows):
+    h = data.shape[-2]
+    n_workers = _worker_count(data, h)
+    step = _rows_per_chunk(data, axis)
+    if n_workers > 1 and step >= h:
+        step = max(1, (h + n_workers - 1) // n_workers)
+    rows = [slice(r0, min(r0 + step, h)) for r0 in range(0, h, step)]
+
+    def _dff_chunk(rs):
         chunk = np.asarray(data[..., rs, :], dtype=np.float32) - np.float32(offset)
         f0 = baseline_f0(chunk, axis, method, **params).astype(np.float32)
         with np.errstate(divide='ignore', invalid='ignore'):
             d = np.where(f0 > 0, (chunk - f0) / f0, np.nan)
+        return d, (f0 if return_f0 else None)
+
+    for rs, (d, f0) in _iter_parallel(rows, _dff_chunk, _worker_count(data, len(rows)), progress=progress):
         out[..., rs, :] = d
         if return_f0:
             f0_all[..., rs, :] = f0
-        if progress is not None and progress(n + 1, len(rows)) is False:
-            break
     return (out, f0_all) if return_f0 else out
 
 
@@ -768,8 +914,15 @@ def bleach_correct(data, axis: int, method: str = 'ratio', background: float = 0
     axis = axis % data.ndim
     n = data.shape[axis]
     means = np.empty(n)
-    for t in range(n):
-        means[t] = float(np.mean(np.take(data, t, axis=axis), dtype=np.float64)) - background
+    n_workers = _worker_count(data, n)
+
+    def _frame_mean(t: int) -> float:
+        idx = [slice(None)] * data.ndim
+        idx[axis] = t
+        return float(np.mean(np.asarray(data[tuple(idx)]), dtype=np.float64)) - background
+
+    for t, m in _iter_parallel(range(n), _frame_mean, n_workers):
+        means[t] = m
     info: dict = {'means': means}
     if method == 'ratio':
         if means[0] <= 0:
@@ -805,13 +958,17 @@ def bleach_correct(data, axis: int, method: str = 'ratio', background: float = 0
         raise ValueError(f'unknown bleach method {method!r}')
     factors = np.nan_to_num(factors, nan=1.0, posinf=1.0, neginf=1.0)
     out = np.empty(data.shape, dtype=np.float32)
-    for t in range(n):
+    bg32 = np.float32(background)
+
+    def _scale_frame(t: int):
         idx = [slice(None)] * data.ndim
         idx[axis] = t
-        frame = np.asarray(data[tuple(idx)], dtype=np.float32) - np.float32(background)
-        out[tuple(idx)] = frame * np.float32(factors[t]) + np.float32(background)
-        if progress is not None and progress(t + 1, n) is False:
-            break
+        sl = tuple(idx)
+        frame = np.asarray(data[sl], dtype=np.float32) - bg32
+        return sl, frame * np.float32(factors[t]) + bg32
+
+    for _t, (sl, scaled) in _iter_parallel(range(n), _scale_frame, n_workers, progress=progress):
+        out[sl] = scaled
     info['factors'] = factors
     return out, info
 
@@ -885,7 +1042,7 @@ CALC_OPS = {
 }
 
 
-def image_calculator(a, b, op: str, progress=None) -> np.ndarray:
+def image_calculator(a, b, op: str, progress=None, workers: int | None = None) -> np.ndarray:
     """``a <op> b`` as float32, plane by plane. ``b`` may have fewer leading axes
     than ``a`` (e.g. one flat-field frame applied to a whole movie)."""
     if op not in CALC_OPS:
@@ -897,16 +1054,19 @@ def image_calculator(a, b, op: str, progress=None) -> np.ndarray:
     lead = a.shape[:-2]
     planes = list(np.ndindex(*lead)) if lead else [()]
     nb = b.ndim - 2
-    for n, idx in enumerate(planes):
+
+    def _calc(idx):
         pa = np.asarray(a[idx], dtype=np.float32)
         pb = np.asarray(b[idx[len(idx) - nb:] if nb else ()], dtype=np.float32)
         with np.errstate(divide='ignore', invalid='ignore'):
             r = func(pa, pb)
         if op == 'Divide':
             r[~np.isfinite(r)] = np.nan
+        return r
+
+    n_workers = 1 if hasattr(b, 'compute') else _worker_count(a, len(planes), workers)
+    for idx, r in _iter_parallel(planes, _calc, n_workers, progress=progress):
         out[idx] = r
-        if progress is not None and progress(n + 1, len(planes)) is False:
-            break
     return out
 
 
@@ -1255,22 +1415,30 @@ def estimate_shifts(
     else:
         raise ValueError(f'unknown template mode {template!r}')
 
+    from scipy.fft import fftn
+
     hann = window('hann', (h, w)).astype(np.float32)
     ref_prep = _prep_for_correlation(ref_img, hann)
+    ref_fft = fftn(ref_prep)
     shifts = np.zeros((n_t, 2), dtype=np.float64)
     up = max(1, int(upsample))
-    for t in range(n_t):
+    max_s = float(max_shift) if (max_shift is not None and max_shift > 0) else None
+
+    def _shift_one(t: int) -> np.ndarray:
         s, _, _ = phase_cross_correlation(
-            ref_prep,
-            _prep_for_correlation(frame2d(t), hann),
+            ref_fft,
+            fftn(_prep_for_correlation(frame2d(t), hann)),
             upsample_factor=up,
+            space='fourier',
             normalization=None,
         )
-        if max_shift is not None and max_shift > 0:
-            s = np.clip(s, -float(max_shift), float(max_shift))
+        if max_s is not None:
+            s = np.clip(s, -max_s, max_s)
+        return s
+
+    n_workers = _worker_count(data, n_t)
+    for t, s in _iter_parallel(range(n_t), _shift_one, n_workers, progress=progress):
         shifts[t] = s
-        if progress is not None and progress(t + 1, n_t) is False:
-            break
     return shifts, ref_img
 
 
@@ -1281,6 +1449,7 @@ def apply_shifts(
     order: int = 1,
     mode: str = 'nearest',
     progress=None,
+    workers: int | None = None,
 ) -> np.ndarray:
     """Apply ``(n_t, 2)`` ``(dy, dx)`` shifts to every 2D plane along ``axis``."""
     import itertools
@@ -1302,18 +1471,23 @@ def apply_shifts(
     other_ranges = [range(data.shape[d]) for d in other_axes]
     other_combos = list(itertools.product(*other_ranges)) if other_axes else [()]
 
-    for t in range(n_t):
+    def _apply_one(t: int) -> list[tuple[tuple, np.ndarray]]:
         dy, dx = shifts[t]
+        planes = []
         for combo in other_combos:
             pos = dict(zip(other_axes, combo))
             sl = tuple(t if d == axis else pos[d] for d in range(lead))
             plane = np.asarray(data[sl], dtype=np.float32 if order > 0 else data.dtype)
             if abs(dy) < 1e-6 and abs(dx) < 1e-6:
-                out[sl] = plane
+                planes.append((sl, plane))
             else:
-                out[sl] = nd_shift(plane, (dy, dx), order=order, mode=mode)
-        if progress is not None and progress(t + 1, n_t) is False:
-            break
+                planes.append((sl, nd_shift(plane, (dy, dx), order=order, mode=mode)))
+        return planes
+
+    n_workers = _worker_count(data, n_t, workers)
+    for _t, planes in _iter_parallel(range(n_t), _apply_one, n_workers, progress=progress):
+        for sl, shifted in planes:
+            out[sl] = shifted
     return out
 
 
@@ -1456,18 +1630,24 @@ def watershed_blocks(
     z_ratio: float = 1.0,
     fill_holes: bool = True,
     progress=None,
+    workers: int | None = None,
 ) -> np.ndarray:
     """Apply distance-transform watershed block by block with globally unique label IDs."""
     out = np.zeros(data.shape, dtype=np.int32)
+    n_workers = _worker_count(data, len(blocks), workers)
     next_id = 0
-    for n, b in enumerate(blocks):
-        result = watershed_labels(np.asarray(data[b]), min_distance=min_distance, z_ratio=z_ratio, fill_holes=fill_holes)
+    for b, result in _iter_parallel(
+        blocks,
+        lambda blk: watershed_labels(
+            np.asarray(data[blk]), min_distance=min_distance, z_ratio=z_ratio, fill_holes=fill_holes
+        ),
+        n_workers,
+        progress=progress,
+    ):
         if result.max():
             result[result > 0] += next_id
             next_id = int(result.max())
         out[b] = result
-        if progress is not None and progress(n + 1, len(blocks)) is False:
-            break
     return out
 
 
@@ -1634,10 +1814,19 @@ def rotate_angle(
     first = _rot_plane(np.asarray(data[combos[0]]))
     out = np.empty(lead_shape + first.shape, dtype=np.float32)
     out[combos[0]] = first
-    for n, idx in enumerate(combos[1:], start=2):
-        out[idx] = _rot_plane(np.asarray(data[idx]))
-        if progress is not None and progress(n, len(combos)) is False:
-            break
+    if progress is not None and progress(1, len(combos)) is False:
+        return out
+    if len(combos) > 1:
+        n_workers = _worker_count(data, len(combos) - 1)
+        for idx, res in _iter_parallel(
+            combos[1:],
+            lambda i: _rot_plane(np.asarray(data[i])),
+            n_workers,
+            progress=progress,
+            total=len(combos),
+            start=1,
+        ):
+            out[idx] = res
     return out
 
 
@@ -2027,10 +2216,14 @@ def resize_image(
 
     combos = list(np.ndindex(*lead_shape))
     out = np.empty(lead_shape + tail_shape, dtype=out_dtype)
-    for n, idx in enumerate(combos):
-        out[idx] = _resize_plane(np.asarray(data[idx]))
-        if progress is not None and progress(n + 1, len(combos)) is False:
-            break
+    n_workers = _worker_count(data, len(combos))
+    for idx, res in _iter_parallel(
+        combos,
+        lambda i: _resize_plane(np.asarray(data[i])),
+        n_workers,
+        progress=progress,
+    ):
+        out[idx] = res
     return out
 
 
