@@ -185,6 +185,7 @@ def _run_via_uv(backend: str, arr: np.ndarray, params: dict, progress=None) -> n
         cmd = [
             uv_bin,
             'run',
+            '--no-project',
             '--with',
             pkg_spec,
             '--with',
