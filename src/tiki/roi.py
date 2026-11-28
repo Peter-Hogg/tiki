@@ -19,7 +19,7 @@ ROI_NAME = 'ROI'
 POINTS_NAME = 'Points'
 ROI_COLOR = 'yellow'
 # temporary layers that must never count as "the image"
-PREVIEW_NAMES = {'filter preview', 'threshold preview', 'watershed preview', 'maxima preview'}
+PREVIEW_NAMES = {'filter preview', 'threshold preview', 'watershed preview', 'maxima preview', 'sam preview', 'sam prompts', 'sam box'}
 
 
 def target_image(viewer) -> Image | None:

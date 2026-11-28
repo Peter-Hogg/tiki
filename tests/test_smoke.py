@@ -491,3 +491,25 @@ def test_napari_plugins_menu_and_ai_seg_bridge(tiki, monkeypatch):
     assert set(np.unique(out)) == {0, 1, 2, 3}
 
 
+def test_sam_window_ui_and_commit(tiki):
+    from tiki import sam as sam_mod
+
+    img = np.zeros((32, 32), dtype=np.uint16)
+    img[8:20, 8:20] = 500
+    rgb = sam_mod._to_rgb_uint8(img)
+    assert rgb.shape == (32, 32, 3) and rgb.dtype == np.uint8
+
+    v = tiki.open_data(img, 'sam_test.tif')
+    win = tiki.show_sam_window()
+    assert win.image is not None
+    # Simulate a preview mask returned by the sidecar and commit it as object #1
+    mask = np.zeros((32, 32), dtype=np.uint8)
+    mask[8:20, 8:20] = 1
+    win._show_preview_mask(mask)
+    win._accept_object()
+    assert 'sam_test.tif sam' in v.layers
+    assert int(np.asarray(v.layers['sam_test.tif sam'].data).max()) == 1
+    win.close()
+
+
+

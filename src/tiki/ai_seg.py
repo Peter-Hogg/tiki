@@ -39,14 +39,16 @@ from .layer_select import LayerCombo
 BACKENDS: dict[str, dict] = {
     'Cellpose': {
         'package': 'cellpose',
-        'uv_spec': 'cellpose',
+        'uv_pkgs': ['cellpose', 'numpy'],
+        'uv_env': {},
         'models': ['cyto3', 'nuclei', 'cyto2', 'cpsam'],
         'supports_3d': True,
         'description': 'Cellpose generalist cell & nucleus segmentation (PyTorch)',
     },
     'StarDist': {
         'package': 'stardist',
-        'uv_spec': 'stardist',
+        'uv_pkgs': ['stardist', 'tensorflow', 'tf-keras', 'numpy'],
+        'uv_env': {'TF_USE_LEGACY_KERAS': '1'},
         'models': ['2D_versatile_fluo', '2D_versatile_he', '2D_paper_dsb2018'],
         'supports_3d': False,
         'description': 'StarDist star-convex nucleus segmentation (TensorFlow)',
@@ -171,7 +173,7 @@ def _run_via_uv(backend: str, arr: np.ndarray, params: dict, progress=None) -> n
     if not uv_bin:
         raise RuntimeError(f'uv is not on PATH and {BACKENDS[backend]["package"]} is not installed.')
 
-    pkg_spec = BACKENDS[backend]['uv_spec']
+    spec = BACKENDS[backend]
     with tempfile.TemporaryDirectory(prefix='tiki_ai_') as td:
         tmp = Path(td)
         in_path = tmp / 'input.npy'
@@ -182,24 +184,22 @@ def _run_via_uv(backend: str, arr: np.ndarray, params: dict, progress=None) -> n
         params_path.write_text(json.dumps(params), encoding='utf-8')
         script_path.write_text(_UV_RUNNER_SCRIPT, encoding='utf-8')
 
-        cmd = [
-            uv_bin,
-            'run',
-            '--no-project',
-            '--with',
-            pkg_spec,
-            '--with',
-            'numpy',
+        cmd = [uv_bin, 'run', '--no-project']
+        for pkg in spec['uv_pkgs']:
+            cmd.extend(['--with', pkg])
+        cmd.extend([
             'python',
             str(script_path),
             backend,
             str(in_path),
             str(out_path),
             str(params_path),
-        ]
+        ])
+        env = os.environ.copy()
+        env.update(spec.get('uv_env') or {})
         set_label = getattr(progress, 'set_label', None)
         if set_label is not None:
-            set_label(f'Starting {backend} in isolated uv environment…\n(First run downloads PyTorch/weights)')
+            set_label(f'Starting {backend} in isolated uv environment…\n(First run downloads dependencies & weights)')
 
         proc = subprocess.Popen(
             cmd,
@@ -207,6 +207,7 @@ def _run_via_uv(backend: str, arr: np.ndarray, params: dict, progress=None) -> n
             stderr=subprocess.PIPE,
             text=True,
             bufsize=1,
+            env=env,
         )
         stderr_lines: list[str] = []
 

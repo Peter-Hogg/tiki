@@ -301,6 +301,7 @@ class Tiki(QMainWindow):
         self._add(m, 'Image Calculator…', lambda: self._process('calculator_dialog'))
         labels_menu = m.addMenu('Labels')
         self._add(labels_menu, 'AI Segmentation…', lambda: self._ai_seg('ai_segmentation_dialog'))
+        self._add(labels_menu, 'Interactive SAM…', self.show_sam_window)
         labels_menu.addSeparator()
         self._add(labels_menu, 'Watershed…', lambda: self._process('watershed_dialog'))
         self._add(labels_menu, 'Fill Holes', lambda: self._process('fill_holes_command'))
@@ -2122,6 +2123,19 @@ class Tiki(QMainWindow):
 
         return getattr(ai_seg, name)(self, **kwargs)
 
+    def show_sam_window(self):
+        from .sam import SamWindow
+
+        win = getattr(self, 'sam_window', None)
+        if win is None:
+            win = SamWindow(self)
+            self.sam_window = win
+        win.attach(self.windows.active)
+        win.show()
+        win.raise_()
+        win.activateWindow()
+        return win
+
     def _fill_napari_plugins_menu(self) -> None:
         menu = self.napari_plugins_menu
         menu.clear()
@@ -2351,6 +2365,7 @@ class Tiki(QMainWindow):
         self.results.close()
         for w in (self.contrast_window, self.threshold_window, self.roi_manager, self.console_window,
                   self.recorder_window, getattr(self, 'channels_window', None),
+                  getattr(self, 'sam_window', None),
                   getattr(self, 'log_window', None), getattr(self.results, '_summary_win', None)):
             if w is not None:
                 w.close()
