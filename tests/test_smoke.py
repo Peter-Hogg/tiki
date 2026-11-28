@@ -509,6 +509,17 @@ def test_sam_window_ui_and_commit(tiki):
     win._accept_object()
     assert 'sam_test.tif sam' in v.layers
     assert int(np.asarray(v.layers['sam_test.tif sam'].data).max()) == 1
+
+    # Scrolling to a different slice clears preview and never commits into the wrong frame
+    stack = np.zeros((4, 32, 32), dtype=np.uint16)
+    v3 = tiki.open_data(stack, 'sam_stack.tif')
+    win.attach(v3)
+    v3.dims.current_step = (0, 0, 0)
+    win._show_preview_mask(mask)
+    v3.dims.current_step = (2, 0, 0)
+    assert win._last_mask is None
+    win._accept_object()
+    assert 'sam_stack.tif sam' not in v3.layers
     win.close()
 
 

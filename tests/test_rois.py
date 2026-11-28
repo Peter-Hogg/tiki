@@ -35,3 +35,33 @@ def test_labels_roundtrip():
     for i, lid in enumerate([5, 9], start=1):
         orig, new = labels == lid, back == i
         assert (orig ^ new).sum() <= 0.1 * orig.sum(), lid
+
+
+def test_imagej_hyperstack_position_preserved(tmp_path):
+    from roifile import ROI_TYPE, ImagejRoi, roiwrite
+
+    ij = ImagejRoi(
+        roitype=ROI_TYPE.RECT,
+        left=4,
+        top=6,
+        right=14,
+        bottom=16,
+        name='czt',
+        c_position=2,
+        z_position=4,
+        t_position=7,
+    )
+    src = tmp_path / 'czt.roi'
+    roiwrite(src, ij)
+    loaded, skipped = R.load_imagej(src)
+    assert skipped == 0 and len(loaded) == 1
+    r = loaded[0]
+    assert r.meta['hyperstack_pos'] == {'T': 6, 'Z': 3, 'C': 1}
+    assert r.position == (6, 3, 1)
+
+    # Roundtrip back to ImageJ .roi preserves C, Z, T coordinates
+    dst = tmp_path / 'czt_out.roi'
+    R.save_imagej(dst, [r])
+    back, _ = R.load_imagej(dst)
+    assert back[0].meta['hyperstack_pos'] == {'T': 6, 'Z': 3, 'C': 1}
+

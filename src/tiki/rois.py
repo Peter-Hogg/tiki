@@ -85,7 +85,15 @@ def to_imagej(roi: Roi):
             'point': ROI_TYPE.POINT,
         }[roi.kind]
     ij.name = roi.name
-    if position is not None:
+    hpos = roi.meta.get('hyperstack_pos') if isinstance(roi.meta, dict) else None
+    if isinstance(hpos, dict) and hpos:
+        if 'C' in hpos:
+            ij.c_position = int(hpos['C']) + 1
+        if 'Z' in hpos:
+            ij.z_position = int(hpos['Z']) + 1
+        if 'T' in hpos:
+            ij.t_position = int(hpos['T']) + 1
+    elif position is not None:
         ij.position = position
     return ij
 
@@ -96,16 +104,25 @@ def from_imagej(ij, fallback_name: str = 'roi') -> Roi | None:
 
     t = ij.roitype
     name = ij.name or fallback_name
-    pos = ij.position or ij.t_position or ij.z_position
-    position = (int(pos) - 1,) if pos else None
+    hpos: dict[str, int] = {}
+    for role, val in (('T', getattr(ij, 't_position', 0)), ('Z', getattr(ij, 'z_position', 0)), ('C', getattr(ij, 'c_position', 0))):
+        if val and int(val) > 0:
+            hpos[role] = int(val) - 1
+    meta: dict = {'hyperstack_pos': hpos} if hpos else {}
+    if hpos:
+        position: tuple[int, ...] | None = tuple(hpos[r] for r in ('T', 'Z', 'C') if r in hpos)
+    elif ij.position:
+        position = (int(ij.position) - 1,)
+    else:
+        position = None
     if t in (ROI_TYPE.RECT, ROI_TYPE.OVAL) and not ij.composite:
         x0, y0, x1, y1 = ij.left, ij.top, ij.right, ij.bottom
         corners_xy = np.array([[x0, y0], [x1, y0], [x1, y1], [x0, y1]], float)
         yx = corners_xy[:, ::-1] - IJ_OFFSET
-        return Roi(name, 'rectangle' if t == ROI_TYPE.RECT else 'ellipse', yx, position)
+        return Roi(name, 'rectangle' if t == ROI_TYPE.RECT else 'ellipse', yx, position, meta=meta)
     if t == ROI_TYPE.LINE:
         yx = np.array([[ij.y1, ij.x1], [ij.y2, ij.x2]], float) - IJ_OFFSET
-        return Roi(name, 'line', yx, position)
+        return Roi(name, 'line', yx, position, meta=meta)
     kind = {
         ROI_TYPE.POLYGON: 'polygon',
         ROI_TYPE.FREEHAND: 'polygon',
@@ -120,7 +137,7 @@ def from_imagej(ij, fallback_name: str = 'roi') -> Roi | None:
     xy = np.asarray(ij.coordinates(), float)
     if xy.ndim != 2 or len(xy) == 0:
         return None
-    return Roi(name, kind, xy[:, ::-1] - IJ_OFFSET, position)
+    return Roi(name, kind, xy[:, ::-1] - IJ_OFFSET, position, meta=meta)
 
 
 def save_imagej(path: str | Path, rois: list[Roi]) -> None:
@@ -133,7 +150,8 @@ def save_imagej(path: str | Path, rois: list[Roi]) -> None:
     ij_rois = [to_imagej(r) for r in rois]
     if path.exists():
         path.unlink()  # roiwrite appends to existing zips
-    roiwrite(path, ij_rois, mode='w')
+    payload = ij_rois[0] if (path.suffix.lower() == '.roi' and len(ij_rois) == 1) else ij_rois
+    roiwrite(path, payload, mode='w')
 
 
 def load_imagej(path: str | Path) -> tuple[list[Roi], int]:

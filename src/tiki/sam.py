@@ -348,6 +348,8 @@ class SamWindow(QWidget):
         self._point_labels: list[int] = []  # 1 = positive, 0 = negative
         self._bboxes: list[list[float]] = []  # [[x1, y1, x2, y2], ...]
         self._last_mask: np.ndarray | None = None
+        self._last_mask_context: tuple | None = None  # (viewer, image, step_tuple)
+        self._req_gen = 0
         self._cached_plane_key: tuple | None = None
         self._worker_thread: _SamCallThread | None = None
         self._busy = False
@@ -482,18 +484,29 @@ class SamWindow(QWidget):
         self.image = None
 
     def _set_image(self, image: Image | None) -> None:
+        self._req_gen += 1
         self._remove_overlays()
         self.image = image
         self._points.clear()
         self._point_labels.clear()
         self._bboxes.clear()
         self._last_mask = None
+        self._last_mask_context = None
         self._cached_plane_key = None
         self.setWindowTitle(f'Interactive SAM — {image.name}' if image is not None else 'Interactive SAM')
         self._set_busy(self._busy)
 
     def _on_slice_changed(self, _event=None) -> None:
+        self._req_gen += 1
         self._cached_plane_key = None
+        if self._last_mask is not None or self._points or self._bboxes:
+            self._points.clear()
+            self._point_labels.clear()
+            self._bboxes.clear()
+            self._last_mask = None
+            self._last_mask_context = None
+            self._remove_overlays()
+            self._set_status('Slice changed — prompts and preview cleared')
 
     def _remove_overlays(self) -> None:
         if self.viewer is None:
@@ -640,10 +653,15 @@ class SamWindow(QWidget):
             self.viewer.add_layer(self.prompts_layer)
             self.viewer.layers.selection.active = self.image
 
-    def _show_preview_mask(self, mask: np.ndarray) -> None:
+    def _show_preview_mask(self, mask: np.ndarray, context: tuple | None = None) -> None:
         if self.viewer is None or self.image is None:
             return
         self._last_mask = mask.astype(np.uint8, copy=False)
+        self._last_mask_context = context if context is not None else (
+            self.viewer,
+            self.image,
+            tuple(self.viewer.dims.current_step),
+        )
         cmap = DirectLabelColormap(color_dict={None: 'transparent', 0: 'transparent', 1: 'cyan'})
         if self.preview is not None and self.preview in self.viewer.layers:
             self.preview.data = self._last_mask
@@ -689,8 +707,13 @@ class SamWindow(QWidget):
         t.start()
 
     def _run_predict(self) -> None:
-        if self.image is None or (not self._points and not self._bboxes):
+        if self.viewer is None or self.image is None or (not self._points and not self._bboxes):
             return
+        req_viewer = self.viewer
+        req_image = self.image
+        req_step = tuple(req_viewer.dims.current_step)
+        self._req_gen += 1
+        gen = self._req_gen
         model_file = SAM_MODELS[self.model_box.currentText()]
         pts = [[x, y] for x, y in self._points]
         lbls = list(self._point_labels)
@@ -712,8 +735,16 @@ class SamWindow(QWidget):
             return np.load(out_path), resp
 
         def _done(res):
+            if (
+                gen != self._req_gen
+                or self.viewer is not req_viewer
+                or self.image is not req_image
+                or req_image not in req_viewer.layers
+                or tuple(req_viewer.dims.current_step) != req_step
+            ):
+                return
             mask, resp = res
-            self._show_preview_mask(mask)
+            self._show_preview_mask(mask, context=(req_viewer, req_image, req_step))
             self._set_status(f'Preview ready: {resp.get("pixels", 0):,} px — click Accept Object or refine')
 
         self._run_async(_work, _done)
@@ -746,10 +777,12 @@ class SamWindow(QWidget):
                 self._clear_prompts()
 
     def _clear_prompts(self) -> None:
+        self._req_gen += 1
         self._points.clear()
         self._point_labels.clear()
         self._bboxes.clear()
         self._last_mask = None
+        self._last_mask_context = None
         self._remove_overlays()
         self._set_status('Prompts cleared — click image to segment next object')
 
@@ -773,6 +806,11 @@ class SamWindow(QWidget):
         if self.viewer is None or self.image is None or self._last_mask is None or not self._last_mask.any():
             self._set_status('No preview mask to accept yet.')
             return
+        cur_ctx = (self.viewer, self.image, tuple(self.viewer.dims.current_step))
+        if self._last_mask_context != cur_ctx:
+            self._clear_prompts()
+            self._set_status('Preview was from a different image or slice and was cleared.')
+            return
         ly = self._target_labels_layer(ndim=self.image.ndim)
         arr = np.asarray(ly.data)
         next_id = int(arr.max()) + 1
@@ -789,6 +827,11 @@ class SamWindow(QWidget):
     def _auto_segment(self) -> None:
         if self.viewer is None or self.image is None:
             return
+        req_viewer = self.viewer
+        req_image = self.image
+        req_step = tuple(req_viewer.dims.current_step)
+        self._req_gen += 1
+        gen = self._req_gen
         model_file = SAM_MODELS[self.model_box.currentText()]
         self._set_status(f'Auto-segmenting plane ({self.model_box.currentText()})…')
 
@@ -805,12 +848,18 @@ class SamWindow(QWidget):
 
         def _done(res):
             labels, resp = res
-            if self.viewer is None or self.image is None or self.image not in self.viewer.layers:
+            if (
+                gen != self._req_gen
+                or self.viewer is not req_viewer
+                or self.image is not req_image
+                or req_image not in req_viewer.layers
+                or tuple(req_viewer.dims.current_step) != req_step
+            ):
                 return
-            geom = axes_mod.geometry(self.image, ndim=2)
-            ly = Labels(labels, name=f'{self.image.name} sam auto', opacity=0.6, **geom)
-            self.viewer.add_layer(ly)
-            self.tiki.push_undo_layer('SAM Auto-Segment', self.viewer, ly)
+            geom = axes_mod.geometry(req_image, ndim=2)
+            ly = Labels(labels, name=f'{req_image.name} sam auto', opacity=0.6, **geom)
+            req_viewer.add_layer(ly)
+            self.tiki.push_undo_layer('SAM Auto-Segment', req_viewer, ly)
             self._set_status(f'Auto-segmented {resp.get("n_objects", 0)} objects → "{ly.name}"')
 
         self._run_async(_work, _done)
@@ -821,16 +870,20 @@ class SamWindow(QWidget):
         if not self._points and not self._bboxes:
             self._set_status('Click at least one point or use a Box ROI on the current slice first.')
             return
+        req_viewer = self.viewer
+        req_image = self.image
+        self._req_gen += 1
+        gen = self._req_gen
         model_file = SAM_MODELS[self.model_box.currentText()]
-        axis = self.tiki._stack_axis(self.viewer, self.image)
-        index = roi_mod.current_index(self.viewer, self.image)
+        axis = self.tiki._stack_axis(req_viewer, req_image)
+        index = roi_mod.current_index(req_viewer, req_image)
         start_frame = int(index[axis])
-        n_frames = self.image.data.shape[axis]
+        n_frames = req_image.data.shape[axis]
         pts = [[x, y] for x, y in self._points]
         lbls = list(self._point_labels)
         bboxes = list(self._bboxes)
-        data = self.image.data
-        lead = self.image.ndim - 2
+        data = req_image.data
+        lead = req_image.ndim - 2
         self._set_status(f'Propagating across {n_frames} slices ({self.model_box.currentText()})…')
 
         def _work():
@@ -855,9 +908,14 @@ class SamWindow(QWidget):
 
         def _done(res):
             masks, resp = res
-            if self.viewer is None or self.image is None or self.image not in self.viewer.layers:
+            if (
+                gen != self._req_gen
+                or self.viewer is not req_viewer
+                or self.image is not req_image
+                or req_image not in req_viewer.layers
+            ):
                 return
-            ly = self._target_labels_layer(ndim=self.image.ndim)
+            ly = self._target_labels_layer(ndim=req_image.ndim)
             arr = np.asarray(ly.data)
             next_id = int(arr.max()) + 1
             for t in range(n_frames):
