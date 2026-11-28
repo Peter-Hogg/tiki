@@ -251,23 +251,39 @@ class RoiManager(QWidget):
             return
         rows = sorted(i.row() for i in self.list.selectedIndexes())
         viewer = self.tiki.windows.active
-        if len(rows) == 1 and viewer is not None and roi_mod.target_image(viewer) is not None:
+        img = roi_mod.target_image(viewer) if viewer is not None else None
+        if len(rows) == 1 and viewer is not None and img is not None:
             roi = self.rois[rows[0]]
             if roi.kind != 'point':
                 layer = self.tiki.roi_layer(viewer)
                 layer.data = []
                 layer.add(roi.yx, shape_type=roi.kind)
-            if roi.position is not None:
+            hpos = roi.meta.get('hyperstack_pos') if isinstance(roi.meta, dict) else None
+            step = list(viewer.dims.current_step)
+            nsteps = viewer.dims.nsteps
+            changed = False
+            if isinstance(hpos, dict) and hpos:
+                info = axes_mod.get(img)
+                dim_offset = viewer.dims.ndim - img.ndim
+                for role, pos_val in hpos.items():
+                    ax_idx = info.index(role)
+                    if ax_idx is not None and ax_idx < img.ndim - 2:
+                        d = dim_offset + ax_idx
+                        if 0 <= d < len(step):
+                            hi = max(int(nsteps[d]) - 1, 0) if d < len(nsteps) else max(int(pos_val), 0)
+                            step[d] = int(np.clip(int(pos_val), 0, hi))
+                            changed = True
+            elif roi.position is not None:
                 lead = viewer.dims.ndim - 2
                 if len(roi.position) <= lead:
-                    step = list(viewer.dims.current_step)
-                    nsteps = viewer.dims.nsteps
                     offset = lead - len(roi.position)
                     for i, pos_val in enumerate(roi.position):
                         d = offset + i
                         hi = max(int(nsteps[d]) - 1, 0) if d < len(nsteps) else max(int(pos_val), 0)
                         step[d] = int(np.clip(int(pos_val), 0, hi))
-                    viewer.dims.current_step = tuple(step)
+                    changed = True
+            if changed:
+                viewer.dims.current_step = tuple(step)
         self.refresh_overlay()
 
     # ---------------------------------------------------------- overlay

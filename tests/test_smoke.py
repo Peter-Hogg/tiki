@@ -414,6 +414,31 @@ def test_filter_rgb_zstack_crop_zproject_cursor_undo_channels_roimanager(tiki):
     mgr.list.setCurrentRow(0)
     assert v.dims.current_step[0] == 3
 
+    # RoiManager navigates hyperstack_pos by axis role name (T=7 on TZCYX -> T=6, Z=0, C=0)
+    from tiki import axes as axes_mod
+
+    tzc = np.zeros((10, 5, 3, 16, 16), dtype=np.uint8)
+    tzc_axes = axes_mod.AxesInfo(
+        [axes_mod.Axis('T', 10), axes_mod.Axis('Z', 5), axes_mod.Axis('C', 3), axes_mod.Axis('Y', 16), axes_mod.Axis('X', 16)],
+        'test',
+        True,
+    )
+    v_tzc = tiki.open_data(tzc, 'tzc.tif', axes=tzc_axes)
+    v_tzc.dims.current_step = (0, 0, 0, 0, 0)
+    mgr.rois.clear()
+    mgr.list.clear()
+    t_roi = rois_mod.Roi(
+        't7',
+        'rectangle',
+        np.array([[1, 1], [1, 5], [5, 5], [5, 1]], float),
+        position=(6,),
+        meta={'hyperstack_pos': {'T': 6}},
+    )
+    mgr.rois.append(t_roi)
+    mgr.list.addItem('t7')
+    mgr.list.setCurrentRow(0)
+    assert v_tzc.dims.current_step[:3] == (6, 0, 0)
+
 
 def test_batch_convert_skip_multiscene(tmp_path):
     in_dir = tmp_path / 'in'
